@@ -71,9 +71,12 @@ const authRoutes = require("./routes/authRoutes");
 const eventRoutes = require("./routes/eventRoutes");
 const searchRoutes = require("./routes/searchRoutes");
 
+// 👇 NUEVO: router de usuarios (incluye GET /api/users/me/attending)
+const userRoutes = require("./routes/userRoutes");
+
 app.use("/api/auth", authRoutes);
-// (en tu proyecto montas también authRoutes como /api/users)
-app.use("/api/users", authRoutes);
+// Antes montabas authRoutes en /api/users; ahora montamos userRoutes:
+app.use("/api/users", userRoutes);
 app.use("/api/events", eventRoutes);
 app.use("/search", searchRoutes);
 
