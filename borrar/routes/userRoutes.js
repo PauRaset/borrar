@@ -1,21 +1,17 @@
-// routes/userRoutes.js
 const express = require("express");
 const jwt = require("jsonwebtoken");
+const mongoose = require("mongoose");
 const router = express.Router();
 
 const User = require("../models/User");
 const Event = require("../models/Event");
+const { verifyFirebaseIdToken } = require("../middlewares/firebaseAdmin"); // ya lo tienes
 
-// Verificador de ID Token de Firebase (ya inicializado en middlewares/firebaseAdmin)
-const { verifyFirebaseIdToken } = require("../middlewares/firebaseAdmin");
-
-// ----------------- helpers -----------------
+// -------- helpers --------
 const makeAbs = (p) => {
   if (!p) return null;
-  // si ya es absoluto, lo dejamos
   if (typeof p === "string" && (p.startsWith("http://") || p.startsWith("https://"))) return p;
-  const base = process.env.BACKEND_URL?.replace(/\/+$/, "") || "";
-  // si te llega "uploads/..." desde el modelo, antepón "/"
+  const base = (process.env.BACKEND_URL || "").replace(/\/+$/, "");
   return `${base}${p.startsWith("/") ? "" : "/"}${p}`;
 };
 
@@ -24,9 +20,8 @@ const authenticateToken = (req, res, next) => {
   const token = req.header("Authorization")?.split(" ")[1];
   if (!token) return res.status(401).json({ message: "No autorizado" });
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded; // { id, role }
-    return next();
+    req.user = jwt.verify(token, process.env.JWT_SECRET); // { id, role }
+    next();
   } catch {
     return res.status(403).json({ message: "Token no válido" });
   }
@@ -40,29 +35,21 @@ function anyAuth(req, res, next) {
     hdr.startsWith("Firebase ") ||
     req.headers["x-firebase-id-token"] ||
     (req.body && req.body.firebaseIdToken);
-
-  if (hasFirebase) {
-    // verifyFirebaseIdToken pondrá req.firebaseUser = { uid, phone }
-    return verifyFirebaseIdToken(req, res, next);
-  }
-  return authenticateToken(req, res, next);
+  return hasFirebase ? verifyFirebaseIdToken(req, res, next) : authenticateToken(req, res, next);
 }
 
-// Normaliza para que siempre tengamos req.user.id (ObjectId de User)
+// Normaliza: siempre deja req.user.id (ObjectId de User)
 async function ensureUserId(req, res, next) {
   if (req.user?.id) return next();
 
   if (req.firebaseUser?.uid) {
     try {
       const { uid, phone } = req.firebaseUser;
-
-      // Busca por firebaseUid o phoneNumber
       let user =
         (await User.findOne({ firebaseUid: uid })) ||
         (phone ? await User.findOne({ phoneNumber: phone }) : null);
 
       if (!user) {
-        // crea mínimo si no existe
         user = await User.findOneAndUpdate(
           { firebaseUid: uid },
           {
@@ -88,19 +75,20 @@ async function ensureUserId(req, res, next) {
   return res.status(401).json({ message: "Usuario no autenticado" });
 }
 
-// ================== RUTAS ==================
-
-/**
- * Devuelve los eventos a los que asiste el usuario autenticado
- * GET /api/users/me/attending
- * Respuesta: { items: [{eventId, eventTitle, eventDate, eventImageUrl}], count }
- */
+// ===================================================================
+// GET /api/users/me/attending  -> eventos a los que asiste el usuario
+// ===================================================================
 router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // Buscar eventos donde attendees contenga userId
-    const events = await Event.find({ attendees: userId })
+    // Soporta que attendees sea String o ObjectId
+    const cond = [{ attendees: userId }];
+    if (mongoose.Types.ObjectId.isValid(userId)) {
+      cond.push({ attendees: new mongoose.Types.ObjectId(userId) });
+    }
+
+    const events = await Event.find({ $or: cond })
       .sort({ date: -1 })
       .limit(100)
       .select("title date image");
@@ -114,19 +102,23 @@ router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
 
     res.json({ items, count: items.length });
   } catch (err) {
-    console.error("GET /me/attending error:", err);
+    console.error("GET /users/me/attending error:", err);
     res.status(500).json({ message: "Error al obtener tus asistencias" });
   }
 });
 
-/**
- * Devuelve info pública de un usuario por _id (para hidratar asistentes)
- * GET /api/users/:userId
- * Respuesta: { user: { _id, username, profilePicture } }
- */
+// ===================================================================
+// GET /api/users/:userId  -> info pública (para hidratar asistentes)
+// ===================================================================
 router.get("/:userId", async (req, res) => {
   try {
-    const user = await User.findById(req.params.userId).select("username profilePicture");
+    const { userId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(404).json({ message: "Usuario no encontrado" });
+    }
+
+    const user = await User.findById(userId).select("username profilePicture");
     if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
 
     res.json({
