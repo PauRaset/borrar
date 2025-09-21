@@ -1,8 +1,10 @@
+// routes/eventRoutes.js
 const express = require("express");
 const multer = require("multer");
 const path = require("path");
 const sharp = require("sharp");
 const fs = require("fs");
+const mongoose = require("mongoose");
 
 const router = express.Router();
 
@@ -16,6 +18,34 @@ const authenticateToken = require("../middlewares/authMiddleware");
 require("../middlewares/firebaseAdmin");
 const admin = require("firebase-admin");
 
+/* -------------------------------------------------------------
+   Helpers
+------------------------------------------------------------- */
+function extractIdToken(req) {
+  const h = req.headers || {};
+  const auth = h.authorization || h.Authorization || "";
+
+  if (auth.startsWith("Bearer ")) return auth.slice(7).trim();
+  if (auth.startsWith("Firebase ")) return auth.slice(8).trim();
+
+  return (
+    h["x-firebase-id-token"] ||
+    h["firebase-id-token"] ||
+    h["firebase_token"] ||
+    h["idtoken"] ||
+    (req.body && (req.body.firebaseIdToken || req.body.idToken)) ||
+    null
+  );
+}
+
+function joinUrl(base, rel) {
+  if (!base) return rel || null;
+  if (!rel) return null;
+  const b = base.replace(/\/+$/, "");
+  const r = rel.replace(/^\/+/, "");
+  return `${b}/${r}`;
+}
+
 /* ------------------------------------------------------------------
    AUTH BRIDGE
    - anyAuth: acepta Firebase o tu JWT.
@@ -24,30 +54,24 @@ const admin = require("firebase-admin");
 ------------------------------------------------------------------- */
 
 // decide en tiempo real si verificar Firebase o JWT
-function anyAuth(req, res, next) {
-  const auth = req.headers.authorization || "";
-  const token =
-    auth.startsWith("Bearer ") || auth.startsWith("Firebase ")
-      ? auth.split(" ")[1]
-      : null;
+async function anyAuth(req, res, next) {
+  const token = extractIdToken(req);
+  if (!token) {
+    // no hubo token Firebase -> probamos tu JWT clásico
+    return authenticateToken(req, res, next);
+  }
 
-  if (!token) return authenticateToken(req, res, next);
-
-  // 1) Intentar como Firebase ID token
-  admin
-    .auth()
-    .verifyIdToken(token)
-    .then((decoded) => {
-      req.firebaseUser = {
-        uid: decoded.uid,
-        phone: decoded.phone_number || decoded.phoneNumber || null,
-      };
-      next();
-    })
-    .catch(() => {
-      // 2) No era Firebase -> probar tu JWT clásico
-      authenticateToken(req, res, next);
-    });
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.firebaseUser = {
+      uid: decoded.uid,
+      phone: decoded.phone_number || decoded.phoneNumber || null,
+    };
+    return next();
+  } catch (_) {
+    // No era (o no válido) como Firebase -> usar tu JWT clásico
+    return authenticateToken(req, res, next);
+  }
 }
 
 // a partir de lo que haya puesto anyAuth, garantizamos req.user.id
@@ -220,28 +244,84 @@ router.delete("/:id", anyAuth, ensureUserId, async (req, res) => {
 
 /* ------------------------------------------------------------------
    ALTERNAR ASISTENCIA (requiere usuario)
+   - Alterna en Mongo (campo attendees)
+   - Escribe/borra doc en Firestore: attendances/{uid}_{eventId}
 ------------------------------------------------------------------- */
 router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
+  const eventId = req.params.id;
+
   try {
-    const event = await Event.findById(req.params.id);
+    // 1) Recuperar evento
+    if (!mongoose.isValidObjectId(eventId)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+    const event = await Event.findById(eventId);
     if (!event) return res.status(404).json({ message: "Evento no encontrado" });
 
+    event.attendees = Array.isArray(event.attendees) ? event.attendees : [];
+
+    // 2) Usuario (Mongo id ya garantizado)
     const userId = req.user.id;
 
-    // Igualdad por string para evitar problemas de ObjectId
-    const userIndex = event.attendees.findIndex((a) => a.toString() === userId);
+    // 3) Alternar asistencia en Mongo (comparando como string)
+    const idx = event.attendees.findIndex((a) => a?.toString?.() === userId);
+    let attendedNow = false;
 
-    if (userIndex !== -1) {
-      event.attendees.splice(userIndex, 1); // quitar
+    if (idx !== -1) {
+      event.attendees.splice(idx, 1); // quitar
+      attendedNow = false;
     } else {
       event.attendees.push(userId); // añadir
+      attendedNow = true;
     }
 
     await event.save();
-    res.json(event);
+
+    // 4) Si viene además como Firebase (teléfono), refleja en Firestore
+    //    (la pantalla Perfil lee de Firestore con el uid de Firebase)
+    const firebaseToken = extractIdToken(req);
+    if (firebaseToken) {
+      try {
+        const decoded = await admin.auth().verifyIdToken(firebaseToken);
+        const uid = decoded.uid;
+        const phone = decoded.phone_number || decoded.phoneNumber || null;
+
+        const db = admin.firestore();
+        const docId = `${uid}_${eventId}`;
+        const docRef = db.collection("attendances").doc(docId);
+
+        if (attendedNow) {
+          await docRef.set(
+            {
+              userId: uid,
+              userPhone: phone || null,
+              eventId,
+              eventTitle: event.title || "",
+              eventDate: event.date ? new Date(event.date) : null,
+              eventImageUrl: event.image
+                ? joinUrl(process.env.BACKEND_URL || "", event.image)
+                : null,
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+        } else {
+          await docRef.delete().catch(() => {});
+        }
+      } catch (e) {
+        // No rompemos si el token no era Firebase: el toggle en Mongo ya funcionó.
+        console.warn("[attend] No se pudo reflejar en Firestore:", e?.message || e);
+      }
+    }
+
+    // 5) Responder (el front acepta objeto completo o {attendees})
+    return res.json({
+      _id: event._id,
+      attendees: event.attendees,
+    });
   } catch (error) {
     console.error("Error al alternar asistencia:", error);
-    res.status(500).json({ message: "Error interno del servidor", error });
+    res.status(500).json({ message: "Error interno del servidor", error: error.message });
   }
 });
 
