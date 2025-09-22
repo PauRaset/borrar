@@ -1,25 +1,36 @@
 // middlewares/firebaseAdmin.js
 const admin = require("firebase-admin");
-const path = require("path");
-
-// Cambia el nombre si tu archivo se llama distinto
-const SA_FILE =
-  process.env.FIREBASE_SA_FILE ||
-  "nightvibe-62942-firebase-adminsdk-fbsvc-2727b3d3c0.json";
 
 if (!admin.apps.length) {
-  const serviceAccountPath = path.isAbsolute(SA_FILE)
-    ? SA_FILE
-    : path.join(process.cwd(), SA_FILE);
+  try {
+    let serviceAccount;
 
-  const serviceAccount = require(serviceAccountPath);
+    // Opción A: variable FIREBASE_SERVICE_ACCOUNT con el JSON completo
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    }
 
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
+    // Opción B: ruta a JSON en disco (GOOGLE_APPLICATION_CREDENTIALS)
+    if (!serviceAccount && process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+      // eslint-disable-next-line import/no-dynamic-require, global-require
+      serviceAccount = require(process.env.GOOGLE_APPLICATION_CREDENTIALS);
+    }
 
-  console.log("[firebase-admin] Inicializado con archivo:", serviceAccountPath);
+    if (!serviceAccount) {
+      throw new Error(
+        "No hay credenciales de Firebase. Define FIREBASE_SERVICE_ACCOUNT o GOOGLE_APPLICATION_CREDENTIALS."
+      );
+    }
+
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+
+    console.log("✅ firebase-admin inicializado");
+  } catch (err) {
+    console.error("❌ Error inicializando firebase-admin:", err);
+    throw err;
+  }
 }
 
-// (Exportar admin por si se quiere usar directo)
 module.exports = admin;
