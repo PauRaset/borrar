@@ -2,30 +2,33 @@
 const express = require("express");
 const router = express.Router();
 const admin = require("../middlewares/firebaseAdmin");
-const mongoose = require("mongoose");
 const User = require("../models/User");
 const Event = require("../models/Event");
 
-const PUBLIC_BASE =
-  process.env.BACKEND_URL ||
-  process.env.BACKEND_PUBLIC_URL ||
-  "https://api.nightvibe.life";
+// --- helpers ---
+function absUrlFromUpload(req, p) {
+  if (!p) return null;
+  const base = process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
 
-// --- Auth con Firebase ID token (Bearer|Firebase <token>) ---
+  // si ya es http(s) y contiene /uploads/, reengancha al dominio actual
+  if (p.startsWith("http")) {
+    const idx = p.indexOf("/uploads/");
+    if (idx !== -1) return `${base}${p.substring(idx)}`;
+    return p; // no es de /uploads, devuélvela tal cual
+  }
+  const clean = p.startsWith("/") ? p : `/${p}`;
+  return `${base}${clean}`;
+}
+
+// Permite "Bearer <firebaseIdToken>" o "Firebase <firebaseIdToken>"
 async function authFirebase(req, res, next) {
   try {
     const auth = req.headers.authorization || "";
-    const [scheme, tokenMaybe] = auth.split(" ");
-    const token = tokenMaybe || auth; // por si te mandan solo el token
-
+    const token = auth.split(" ")[1];
     if (!token) return res.status(401).json({ message: "Falta Authorization" });
 
-    // No hace falta validar el scheme; si viene token, probamos a verificarlo
     const decoded = await admin.auth().verifyIdToken(token);
-    req.firebase = {
-      uid: decoded.uid,
-      phone: decoded.phone_number || decoded.phoneNumber || null,
-    };
+    req.firebase = { uid: decoded.uid, phone: decoded.phone_number || decoded.phoneNumber || null };
     next();
   } catch (err) {
     console.error("[authFirebase] error:", err);
@@ -33,27 +36,22 @@ async function authFirebase(req, res, next) {
   }
 }
 
-// --- Asegura usuario de Mongo a partir del uid de Firebase ---
+// Mapea el uid de Firebase a un User de Mongo (crea si no existe)
 async function ensureMongoUser(req, res, next) {
   try {
     const { uid, phone } = req.firebase || {};
     if (!uid) return res.status(401).json({ message: "Sin UID" });
 
-    // 1º por firebaseUid; 2º por phoneNumber (por si ya existía)
     let user = await User.findOne({ firebaseUid: uid });
-    if (!user && phone) {
-      user = await User.findOne({ phoneNumber: phone });
-    }
-
     if (!user) {
-      user = await User.create({
+      user = new User({
         firebaseUid: uid,
-        username: phone ? phone.replace(/\+/g, "") : `user_${uid.slice(0, 6)}`,
+        username: phone ? phone.replace("+", "") : `user_${uid.slice(0, 6)}`,
         phoneNumber: phone || null,
         role: "spectator",
       });
+      await user.save();
     }
-
     req.userMongo = user;
     next();
   } catch (err) {
@@ -62,32 +60,23 @@ async function ensureMongoUser(req, res, next) {
   }
 }
 
-const toAbs = (p) => {
-  if (!p) return null;
-  if (/^https?:\/\//i.test(p)) return p;
-  const clean = p.startsWith("/") ? p.slice(1) : p;
-  return `${PUBLIC_BASE}/${clean}`;
-};
-
 /**
  * GET /api/users/me/attending
- * Devuelve eventos donde el usuario está en Event.attendees
  */
 router.get("/me/attending", authFirebase, ensureMongoUser, async (req, res) => {
   try {
-    const userId = new mongoose.Types.ObjectId(req.userMongo._id);
+    const userId = req.userMongo._id;
 
     const events = await Event.find({ attendees: userId })
-      .select("_id title date image createdBy")
+      .select("title date image")
       .sort({ date: -1 })
       .lean();
 
     const out = events.map((e) => ({
-      _id: e._id,
-      id: e._id?.toString(),
+      id: e._id.toString(),
       title: e.title,
       date: e.date,
-      image: toAbs(e.image), // devolver absoluta
+      imageUrl: absUrlFromUpload(req, e.image), // 👈 siempre absoluta
     }));
 
     res.json(out);
