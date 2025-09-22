@@ -191,7 +191,27 @@ router.get("/", async (req, res) => {
     res.status(500).json({ message: "Error al obtener los eventos", error });
   }
 });
+// Devuelve asistentes con username y profilePicture listos para pintar
+router.get("/:id/attendees", async (req, res) => {
+  try {
+    const event = await Event.findById(req.params.id)
+      .populate("attendees", "username profilePicture phoneNumber")
+      .lean();
 
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    const attendees = (event.attendees || []).map((u) => ({
+      id: u._id,
+      username: u.username || (u.phoneNumber ? u.phoneNumber.replace("+", "") : "Usuario"),
+      profilePicture: u.profilePicture || null, // relativa: "/uploads/..."
+    }));
+
+    res.json(attendees);
+  } catch (err) {
+    console.error("[GET /events/:id/attendees] error:", err);
+    res.status(500).json({ message: "Error obteniendo asistentes" });
+  }
+});
 /* ------------------------------------------------------------------
    DETALLE DE EVENTO (público; calcula isOwner si hay usuario)
 ------------------------------------------------------------------- */
