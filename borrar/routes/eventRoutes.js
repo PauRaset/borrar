@@ -38,6 +38,30 @@ function extractIdToken(req) {
   );
 }
 
+function backendBase(req) {
+  return process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
+}
+
+/**
+ * Devuelve URL absoluta para cualquier path/URL de /uploads.
+ * - Si ya es http(s) y contiene /uploads/, lo re-mapea al dominio actual.
+ * - Si ya es http(s) y no es de /uploads, lo deja tal cual.
+ * - Si es relativo (p.ej. "uploads/..." o "/uploads/..."), lo normaliza.
+ */
+function absUrlFromUpload(req, p) {
+  if (!p) return null;
+  const base = backendBase(req);
+  if (typeof p !== "string") p = String(p);
+
+  if (p.startsWith("http")) {
+    const idx = p.indexOf("/uploads/");
+    if (idx !== -1) return `${base}${p.substring(idx)}`;
+    return p; // URL externa ajena a /uploads
+  }
+  const clean = p.startsWith("/") ? p : `/${p}`;
+  return `${base}${clean}`;
+}
+
 function joinUrl(base, rel) {
   if (!base) return rel || null;
   if (!rel) return null;
@@ -174,10 +198,17 @@ router.post("/", anyAuth, ensureUserId, upload.single("image"), async (req, res)
 ------------------------------------------------------------------- */
 router.get("/", async (req, res) => {
   try {
-    const events = await Event.find().populate("createdBy", "username email profilePicture");
+    const events = await Event.find().populate("createdBy", "username email profilePicture").lean();
 
     const formattedEvents = events.map((event) => ({
-      ...event.toObject(),
+      ...event,
+      imageUrl: absUrlFromUpload(req, event.image),
+      createdBy: event.createdBy
+        ? {
+            ...event.createdBy,
+            profilePictureUrl: absUrlFromUpload(req, event.createdBy.profilePicture),
+          }
+        : null,
       categories: Array.isArray(event.categories)
         ? event.categories
         : typeof event.categories === "string"
@@ -191,7 +222,10 @@ router.get("/", async (req, res) => {
     res.status(500).json({ message: "Error al obtener los eventos", error });
   }
 });
-// Devuelve asistentes con username y profilePicture listos para pintar
+
+/* ------------------------------------------------------------------
+   Devuelve asistentes con username y avatar listos para pintar
+------------------------------------------------------------------- */
 router.get("/:id/attendees", async (req, res) => {
   try {
     const event = await Event.findById(req.params.id)
@@ -201,17 +235,18 @@ router.get("/:id/attendees", async (req, res) => {
     if (!event) return res.status(404).json({ message: "Evento no encontrado" });
 
     const attendees = (event.attendees || []).map((u) => ({
-      id: u._id,
+      id: u._id.toString(),
       username: u.username || (u.phoneNumber ? u.phoneNumber.replace("+", "") : "Usuario"),
-      profilePicture: u.profilePicture || null, // relativa: "/uploads/..."
+      profilePictureUrl: absUrlFromUpload(req, u.profilePicture),
     }));
 
-    res.json(attendees);
+    res.json({ attendees });
   } catch (err) {
     console.error("[GET /events/:id/attendees] error:", err);
     res.status(500).json({ message: "Error obteniendo asistentes" });
   }
 });
+
 /* ------------------------------------------------------------------
    DETALLE DE EVENTO (público; calcula isOwner si hay usuario)
 ------------------------------------------------------------------- */
@@ -223,17 +258,24 @@ router.get("/:id", async (req, res) => {
     );
     if (!event) return res.status(404).json({ message: "Evento no encontrado" });
 
+    const obj = event.toObject();
+
     const formattedEvent = {
-      ...event.toObject(),
-      categories: Array.isArray(event.categories)
-        ? event.categories
-        : (event.categories || []).map((cat) =>
-            typeof cat === "string" ? cat : String(cat)
-          ),
+      ...obj,
+      imageUrl: absUrlFromUpload(req, obj.image),
+      createdBy: obj.createdBy
+        ? {
+            ...obj.createdBy,
+            profilePictureUrl: absUrlFromUpload(req, obj.createdBy.profilePicture),
+          }
+        : null,
+      categories: Array.isArray(obj.categories)
+        ? obj.categories
+        : (obj.categories || []).map((cat) => (typeof cat === "string" ? cat : String(cat))),
     };
 
     const userId = req.user ? req.user.id : null; // si algún middleware previo lo puso
-    const isOwner = userId && event.createdBy?._id?.toString() === userId;
+    const isOwner = userId && obj.createdBy?._id?.toString() === userId;
 
     res.json({ ...formattedEvent, isOwner });
   } catch (error) {
@@ -318,9 +360,7 @@ router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
               eventId,
               eventTitle: event.title || "",
               eventDate: event.date ? new Date(event.date) : null,
-              eventImageUrl: event.image
-                ? joinUrl(process.env.BACKEND_URL || "", event.image)
-                : null,
+              eventImageUrl: absUrlFromUpload(req, event.image), // 👈 normalizada
               createdAt: admin.firestore.FieldValue.serverTimestamp(),
             },
             { merge: true }
@@ -334,7 +374,7 @@ router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
       }
     }
 
-    // 5) Responder (el front acepta objeto completo o {attendees})
+    // 5) Responder
     return res.json({
       _id: event._id,
       attendees: event.attendees,
