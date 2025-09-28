@@ -7,6 +7,47 @@ const eventSchema = new mongoose.Schema({
   city: String,
   street: String,
   postalCode: String,
+
+  // Imagen principal (ruta relativa a /uploads o URL absoluta)
+  image: String,
+
+  // Galería de fotos del evento (rutas relativas a /uploads o URLs absolutas)
+  photos: {
+    type: [String],
+    default: [],
+  },
+
+  // Categorías (múltiples)
+  categories: {
+    type: [String],
+    default: [],
+  },
+
+  age: String,
+  dressCode: String,   // Dress Code
+  price: String,       // Precio de la entrada
+
+  attendees: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+
+  createdBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    required: true,
+  },
+});
+
+module.exports = mongoose.model("Event", eventSchema);
+
+
+/*const mongoose = require("mongoose");
+
+const eventSchema = new mongoose.Schema({
+  title: String,
+  description: String,
+  date: Date,
+  city: String,
+  street: String,
+  postalCode: String,
   image: String,
 
   // Galería de fotos del evento (rutas relativas a /uploads o URLs absolutas)
@@ -27,4 +68,4 @@ const eventSchema = new mongoose.Schema({
   },
 });
 
-module.exports = mongoose.model("Event", eventSchema);
+module.exports = mongoose.model("Event", eventSchema);*/
