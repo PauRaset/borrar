@@ -1,4 +1,4 @@
-const express = require("express");
+/*const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const session = require("express-session"); // si lo usas para passport
@@ -11,7 +11,7 @@ require("./middlewares/firebaseAdmin");
 
 const app = express();
 
-/* ======================= CORS ======================= */
+// ======================= CORS ======================= 
 const FRONTEND_URL = (process.env.FRONTEND_URL || "").replace(/\/+$/, "");
 const allowedOrigins = new Set([
   FRONTEND_URL,
@@ -31,14 +31,14 @@ app.use(
   })
 );
 
-/* ================= Parsers & estáticos ============== */
+// ================= Parsers & estáticos ============== 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // servir /uploads
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
-/* ==================== Sesiones ====================== */
+// ==================== Sesiones ====================== 
 app.use(
   session({
     secret: process.env.SESSION_SECRET || "mysecretkey",
@@ -52,12 +52,12 @@ app.use(
   })
 );
 
-/* ================ Passport (si lo usas) ============= */
+// ================ Passport (si lo usas) ============= 
 app.use(passport.initialize());
 app.use(passport.session());
 require("./passportConfig");
 
-/* ============== MongoDB (como ya lo tienes) ========= */
+// ============== MongoDB (como ya lo tienes) ========= 
 mongoose
   .connect(process.env.MONGO_URI, {
     useNewUrlParser: true,
@@ -66,7 +66,7 @@ mongoose
   .then(() => console.log("✅ Conectado a MongoDB"))
   .catch((err) => console.error("❌ Error al conectar a MongoDB:", err));
 
-/* =============== Rutas de prueba ===================== */
+// =============== Rutas de prueba ===================== 
 app.get("/", (req, res) => {
   res.send("¡Servidor funcionando correctamente!");
 });
@@ -77,7 +77,7 @@ app.get("/test-image", (req, res) => {
   res.send(`<img src="${base}/uploads/test.jpg" alt="Test Image" />`);
 });
 
-/* ================== Rutas reales ===================== */
+// ================== Rutas reales ===================== 
 const authRoutes = require("./routes/authRoutes");
 const eventRoutes = require("./routes/eventRoutes");
 const searchRoutes = require("./routes/searchRoutes");
@@ -90,15 +90,15 @@ app.use("/api/users", userRoutes);
 app.use("/api/events", eventRoutes);
 app.use("/search", searchRoutes);
 
-/* ============= 404 catch-all ========================= */
+// ============= 404 catch-all ========================= 
 app.use((req, res) => {
   res.status(404).send("Ruta no encontrada");
 });
 
-/* ================== Server =========================== */
+// ================== Server =========================== 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`✨ Servidor corriendo en el puerto ${PORT}`);
 });
 
-module.exports = app;
+module.exports = app;*/
