@@ -7,8 +7,6 @@ const eventSchema = new mongoose.Schema({
   city: String,
   street: String,
   postalCode: String,
-
-  // Imagen principal (ruta relativa a /uploads o URL absoluta)
   image: String,
 
   // Galería de fotos del evento (rutas relativas a /uploads o URLs absolutas)
@@ -17,18 +15,11 @@ const eventSchema = new mongoose.Schema({
     default: [],
   },
 
-  // Categorías (múltiples)
-  categories: {
-    type: [String],
-    default: [],
-  },
-
+  categories: [String], // múltiples categorías
   age: String,
-  dressCode: String,   // Dress Code
-  price: String,       // Precio de la entrada
-
+  dressCode: String,     // dress code
+  price: String,         // precio de la entrada
   attendees: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
-
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "User",
