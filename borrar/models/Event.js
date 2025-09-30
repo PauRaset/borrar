@@ -1,5 +1,10 @@
 const mongoose = require("mongoose");
 
+/**
+ * Importante:
+ * - Para no romper datos antiguos (que eran strings),
+ *   declaramos photos como "Mixed" para permitir string u objeto.
+ */
 const eventSchema = new mongoose.Schema({
   title: String,
   description: String,
@@ -7,25 +12,28 @@ const eventSchema = new mongoose.Schema({
   city: String,
   street: String,
   postalCode: String,
+
   image: String,
 
-  // Galería de fotos del evento (rutas relativas a /uploads o URLs absolutas)
+  // Galería: acepta strings antiguos o nuevos objetos { url, by, byUsername, uploadedAt }
   photos: {
-    type: [String],
+    type: [mongoose.Schema.Types.Mixed],
     default: [],
   },
 
-  categories: [String], // múltiples categorías
+  categories: [String],
   age: String,
-  dressCode: String,     // dress code
-  price: String,         // precio de la entrada
+  dressCode: String,
+  price: String,
+
   attendees: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "User",
     required: true,
   },
-});
+}, { timestamps: true });
 
 module.exports = mongoose.model("Event", eventSchema);
 
@@ -47,10 +55,10 @@ const eventSchema = new mongoose.Schema({
     default: [],
   },
 
-  categories: [String], // Ahora admite múltiples categorías
+  categories: [String], // múltiples categorías
   age: String,
-  dressCode: String,     // Nuevo campo para Dress Code
-  price: String,         // Nuevo campo para el precio de la entrada
+  dressCode: String,     // dress code
+  price: String,         // precio de la entrada
   attendees: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
