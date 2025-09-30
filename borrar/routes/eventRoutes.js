@@ -42,55 +42,23 @@ function backendBase(req) {
   return process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
 }
 
-// Comprobaciones simples
-const IMG_EXT_RE = /\.(png|jpe?g|webp|gif|heic)$/i;
-
 /**
- * Devuelve URL absoluta para cualquier path/URL de /uploads y arregla
- * casos “raros” como:
- *   - "nombre.jpg"                     -> /uploads/event-photos/nombre.jpg
- *   - "https://nombre.jpg"             -> /uploads/event-photos/nombre.jpg
- *   - "uploads/..." o "/uploads/..."   -> base + ese path
- *   - "https://.../uploads/..."        -> re-mapeado al dominio actual
- *   - http(s) externo ajeno a /uploads -> se deja tal cual
+ * Devuelve URL absoluta para cualquier path/URL de /uploads.
+ * - Si ya es http(s) y contiene /uploads/, lo re-mapea al dominio actual.
+ * - Si ya es http(s) y no es de /uploads, lo deja tal cual.
+ * - Si es relativo (p.ej. "uploads/..." o "/uploads/..."), lo normaliza.
  */
 function absUrlFromUpload(req, p) {
   if (!p) return null;
   const base = backendBase(req);
-  let s = String(p).trim();
+  if (typeof p !== "string") p = String(p);
 
-  // 1) Si ya es http(s)…
-  if (s.startsWith("http://") || s.startsWith("https://")) {
-    try {
-      const u = new URL(s);
-      // Caso “host es el nombre del fichero”: https://nombre.jpg
-      if ((u.pathname === "" || u.pathname === "/") && IMG_EXT_RE.test(u.hostname)) {
-        s = `/uploads/event-photos/${u.hostname}`;
-      } else {
-        // Si contiene /uploads/, re-mapeamos al dominio actual
-        const idx = s.indexOf("/uploads/");
-        if (idx !== -1) return `${base}${s.substring(idx)}`;
-        // Si es otra URL externa “normal”, dejarla tal cual
-        return s;
-      }
-    } catch {
-      // Si no parsea como URL válida, lo tratamos como relativo más abajo
-    }
+  if (p.startsWith("http")) {
+    const idx = p.indexOf("/uploads/");
+    if (idx !== -1) return `${base}${p.substring(idx)}`;
+    return p; // URL externa ajena a /uploads
   }
-
-  // 2) “uploads/...” o “/uploads/...”
-  if (/^\/?uploads\//i.test(s)) {
-    const clean = s.startsWith("/") ? s : `/${s}`;
-    return `${base}${clean}`;
-  }
-
-  // 3) Nombre suelto de imagen: “archivo.jpg”
-  if (/^[a-z0-9._-]+\.(png|jpe?g|webp|gif|heic)$/i.test(s)) {
-    return `${base}/uploads/event-photos/${s}`;
-  }
-
-  // 4) Cualquier otro relativo → aseguro barra inicial
-  const clean = s.startsWith("/") ? s : `/${s}`;
+  const clean = p.startsWith("/") ? p : `/${p}`;
   return `${base}${clean}`;
 }
 
@@ -110,12 +78,16 @@ function ensureDir(dir) {
 
 /* ------------------------------------------------------------------
    AUTH BRIDGE
+   - anyAuth: acepta Firebase o tu JWT.
+   - ensureUserId: si viene de Firebase, resuelve/crea un User y setea
+     req.user.id con el ObjectId que usa tu base de datos.
 ------------------------------------------------------------------- */
 
 // decide en tiempo real si verificar Firebase o JWT
 async function anyAuth(req, res, next) {
   const token = extractIdToken(req);
   if (!token) {
+    // no hubo token Firebase -> probamos tu JWT clásico
     return authenticateToken(req, res, next);
   }
 
@@ -127,13 +99,14 @@ async function anyAuth(req, res, next) {
     };
     return next();
   } catch (_) {
+    // No era (o no válido) como Firebase -> usar tu JWT clásico
     return authenticateToken(req, res, next);
   }
 }
 
 // a partir de lo que haya puesto anyAuth, garantizamos req.user.id
 async function ensureUserId(req, res, next) {
-  if (req.user && req.user.id) return next();
+  if (req.user && req.user.id) return next(); // ya viene de tu JWT
 
   if (req.firebaseUser && req.firebaseUser.uid) {
     try {
@@ -150,6 +123,7 @@ async function ensureUserId(req, res, next) {
     }
   }
 
+  // No hubo ni JWT ni Firebase
   return res.status(401).json({ message: "Usuario no autenticado" });
 }
 
@@ -179,13 +153,51 @@ async function processImageToJpg(srcPath, outDir, baseName) {
       .toFile(outPath);
     return outPath;
   } catch (e) {
-    // fallback: copia tal cual si sharp falla
+    // fallback: copia tal cual si sharp falla (p.ej., formato raro)
     const fallback = path.join(outDir, `${baseName}${path.extname(srcPath) || ""}`);
     fs.copyFileSync(srcPath, fallback);
     return fallback;
   } finally {
     try { fs.unlinkSync(srcPath); } catch {}
   }
+}
+
+/* -------------------------------------------------------------
+   Helpers de normalización de fotos con metadatos
+------------------------------------------------------------- */
+function usernameFromUserDoc(u) {
+  if (!u) return null;
+  return (
+    u.username ||
+    (u.phoneNumber ? u.phoneNumber.replace("+", "") : null) ||
+    null
+  );
+}
+
+function toPhotoTileAbs(req, entry) {
+  // Acepta string o objeto y devuelve objeto { url, byUsername?, uploadedAt? } con URL absoluta
+  if (!entry) return null;
+
+  if (typeof entry === "string") {
+    return { url: absUrlFromUpload(req, entry) };
+  }
+  if (typeof entry === "object") {
+    const url =
+      absUrlFromUpload(req, entry.url || entry.path || entry.href || entry.secure_url || entry.photo || entry.image);
+    const byUsername =
+      entry.byUsername ||
+      (entry.byUser && entry.byUser.username) ||
+      (entry.user && entry.user.username) ||
+      entry.username ||
+      null;
+
+    return {
+      url,
+      ...(byUsername ? { byUsername } : {}),
+      ...(entry.uploadedAt ? { uploadedAt: entry.uploadedAt } : {}),
+    };
+  }
+  return null;
 }
 
 /* ------------------------------------------------------------------
@@ -263,24 +275,31 @@ router.get("/", async (req, res) => {
   try {
     const events = await Event.find().populate("createdBy", "username email profilePicture").lean();
 
-    const formattedEvents = events.map((event) => ({
-      ...event,
-      imageUrl: absUrlFromUpload(req, event.image),
-      photos: Array.isArray(event.photos)
-        ? event.photos.map((p) => absUrlFromUpload(req, p))
-        : [],
-      createdBy: event.createdBy
-        ? {
-            ...event.createdBy,
-            profilePictureUrl: absUrlFromUpload(req, event.createdBy.profilePicture),
-          }
-        : null,
-      categories: Array.isArray(event.categories)
-        ? event.categories
-        : typeof event.categories === "string"
-        ? JSON.parse(event.categories)
-        : [],
-    }));
+    const formattedEvents = events.map((event) => {
+      // normaliza fotos a objetos con url absoluta (manteniendo compatibilidad)
+      const photos = Array.isArray(event.photos)
+        ? event.photos
+            .map((p) => toPhotoTileAbs(req, p))
+            .filter(Boolean)
+        : [];
+
+      return {
+        ...event,
+        imageUrl: absUrlFromUpload(req, event.image),
+        photos,
+        createdBy: event.createdBy
+          ? {
+              ...event.createdBy,
+              profilePictureUrl: absUrlFromUpload(req, event.createdBy.profilePicture),
+            }
+          : null,
+        categories: Array.isArray(event.categories)
+          ? event.categories
+          : typeof event.categories === "string"
+          ? JSON.parse(event.categories)
+          : [],
+      };
+    });
 
     res.json(formattedEvents);
   } catch (error) {
@@ -329,7 +348,9 @@ router.get("/:id", async (req, res) => {
     const formattedEvent = {
       ...obj,
       imageUrl: absUrlFromUpload(req, obj.image),
-      photos: Array.isArray(obj.photos) ? obj.photos.map((p) => absUrlFromUpload(req, p)) : [],
+      photos: Array.isArray(obj.photos)
+        ? obj.photos.map((p) => toPhotoTileAbs(req, p)).filter(Boolean)
+        : [],
       createdBy: obj.createdBy
         ? {
             ...obj.createdBy,
@@ -341,13 +362,33 @@ router.get("/:id", async (req, res) => {
         : (obj.categories || []).map((cat) => (typeof cat === "string" ? cat : String(cat))),
     };
 
-    const userId = req.user ? req.user.id : null;
+    const userId = req.user ? req.user.id : null; // si algún middleware previo lo puso
     const isOwner = userId && obj.createdBy?._id?.toString() === userId;
 
     res.json({ ...formattedEvent, isOwner });
   } catch (error) {
     console.error("Error al obtener el evento:", error);
     res.status(500).json({ message: "Error al obtener el evento", error });
+  }
+});
+
+/* ------------------------------------------------------------------
+   ELIMINAR EVENTO (requiere usuario y ser owner)
+------------------------------------------------------------------- */
+router.delete("/:id", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const event = await Event.findById(req.params.id);
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    if (event.createdBy.toString() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para eliminar este evento" });
+    }
+
+    await Event.findByIdAndDelete(req.params.id);
+    res.json({ message: "Evento eliminado correctamente" });
+  } catch (error) {
+    console.error("Error al eliminar el evento:", error);
+    res.status(500).json({ message: "Error interno del servidor" });
   }
 });
 
@@ -363,8 +404,10 @@ async function getPhotosHandler(req, res) {
     const event = await Event.findById(id).lean();
     if (!event) return res.status(404).json({ message: "Evento no encontrado" });
 
-    // Normalizamos cualquier forma rara
-    const photos = (event.photos || []).map((p) => absUrlFromUpload(req, p));
+    const photos = (event.photos || [])
+      .map((p) => toPhotoTileAbs(req, p))
+      .filter(Boolean);
+
     return res.json({ photos });
   } catch (e) {
     console.error("[GET photos] error:", e);
@@ -380,7 +423,7 @@ router.get("/:id/media", getPhotosHandler);
 /* ------------------------------------------------------------------
    GALERÍA: POST subir fotos (y alias)
    - Acepta múltiples campos: file/files/files[]/photo/photos/photos[]/image/images/images[]
-   - Requiere usuario (cualquier autenticado puede subir; ajusta si quieres owner/attendee)
+   - Requiere usuario
 ------------------------------------------------------------------- */
 async function postPhotosHandler(req, res) {
   try {
@@ -399,31 +442,55 @@ async function postPhotosHandler(req, res) {
       return res.status(400).json({ message: "No se recibieron archivos" });
     }
 
+    // Datos del usuario que sube
+    let byUsername = "usuario";
+    try {
+      const userDoc = await User.findById(req.user.id).lean();
+      const u = usernameFromUserDoc(userDoc);
+      if (u) byUsername = u;
+    } catch (_) {}
+
     // Carpeta para fotos de evento
     const eventPhotosDir = path.join(ROOT_UPLOADS_DIR, "event-photos");
     ensureDir(eventPhotosDir);
 
-    const savedRelPaths = [];
+    const savedMeta = [];
     for (const f of files) {
       const base = `event-${id}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const processed = await processImageToJpg(f.path, eventPhotosDir, base);
       const rel = path
         .relative(path.join(__dirname, ".."), processed)
         .replace(/\\/g, "/"); // ej: "uploads/event-photos/event-xxx.jpg"
-      savedRelPaths.push(rel);
+
+      const meta = {
+        url: rel,
+        by: req.user.id,
+        byUsername,
+        uploadedAt: new Date(),
+      };
 
       event.photos = Array.isArray(event.photos) ? event.photos : [];
-      event.photos.push(rel);
+      event.photos.push(meta);
+      savedMeta.push(meta);
     }
 
     await event.save();
 
-    const uploaded = savedRelPaths.map((p) => absUrlFromUpload(req, p));
-    const allPhotos = (event.photos || []).map((p) => absUrlFromUpload(req, p));
+    // Respuesta: objetos con url absoluta + byUsername
+    const uploaded = savedMeta.map((m) => ({
+      url: absUrlFromUpload(req, m.url),
+      byUsername: m.byUsername,
+      uploadedAt: m.uploadedAt,
+    }));
+
+    const allPhotos = (event.photos || [])
+      .map((p) => toPhotoTileAbs(req, p))
+      .filter(Boolean);
 
     return res.status(201).json({
-      uploaded,         // urls recién subidas (absolutas y correctas)
-      photos: allPhotos // estado completo de galería (absolutas y correctas)
+      uploaded,        // recién subidas (con autor)
+      photos: allPhotos, // estado completo de galería (con autor cuando exista)
+      count: uploaded.length,
     });
   } catch (e) {
     console.error("[POST photos] error:", e);
@@ -438,11 +505,14 @@ router.post("/:id/upload-photo", anyAuth, ensureUserId, uploadAny.any(), postPho
 
 /* ------------------------------------------------------------------
    ALTERNAR ASISTENCIA (requiere usuario)
+   - Alterna en Mongo (campo attendees)
+   - Escribe/borra doc en Firestore: attendances/{uid}_{eventId}
 ------------------------------------------------------------------- */
 router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
   const eventId = req.params.id;
 
   try {
+    // 1) Recuperar evento
     if (!mongoose.isValidObjectId(eventId)) {
       return res.status(400).json({ message: "ID de evento inválido" });
     }
@@ -451,21 +521,24 @@ router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
 
     event.attendees = Array.isArray(event.attendees) ? event.attendees : [];
 
+    // 2) Usuario (Mongo id ya garantizado)
     const userId = req.user.id;
 
+    // 3) Alternar asistencia en Mongo (comparando como string)
     const idx = event.attendees.findIndex((a) => a?.toString?.() === userId);
     let attendedNow = false;
 
     if (idx !== -1) {
-      event.attendees.splice(idx, 1);
+      event.attendees.splice(idx, 1); // quitar
       attendedNow = false;
     } else {
-      event.attendees.push(userId);
+      event.attendees.push(userId); // añadir
       attendedNow = true;
     }
 
     await event.save();
 
+    // 4) Si viene además como Firebase (teléfono), refleja en Firestore
     const firebaseToken = extractIdToken(req);
     if (firebaseToken) {
       try {
@@ -498,6 +571,7 @@ router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
       }
     }
 
+    // 5) Responder
     return res.json({
       _id: event._id,
       attendees: event.attendees,
@@ -509,7 +583,6 @@ router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
 });
 
 module.exports = router;
-
 
 /*// routes/eventRoutes.js
 const express = require("express");
@@ -555,18 +628,47 @@ function backendBase(req) {
   return process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
 }
 
+// Comprobaciones simples
+const IMG_EXT_RE = /\.(png|jpe?g|webp|gif|heic)$/i;
+
 
 function absUrlFromUpload(req, p) {
   if (!p) return null;
   const base = backendBase(req);
-  if (typeof p !== "string") p = String(p);
+  let s = String(p).trim();
 
-  if (p.startsWith("http")) {
-    const idx = p.indexOf("/uploads/");
-    if (idx !== -1) return `${base}${p.substring(idx)}`;
-    return p; // URL externa ajena a /uploads
+  // 1) Si ya es http(s)…
+  if (s.startsWith("http://") || s.startsWith("https://")) {
+    try {
+      const u = new URL(s);
+      // Caso “host es el nombre del fichero”: https://nombre.jpg
+      if ((u.pathname === "" || u.pathname === "/") && IMG_EXT_RE.test(u.hostname)) {
+        s = `/uploads/event-photos/${u.hostname}`;
+      } else {
+        // Si contiene /uploads/, re-mapeamos al dominio actual
+        const idx = s.indexOf("/uploads/");
+        if (idx !== -1) return `${base}${s.substring(idx)}`;
+        // Si es otra URL externa “normal”, dejarla tal cual
+        return s;
+      }
+    } catch {
+      // Si no parsea como URL válida, lo tratamos como relativo más abajo
+    }
   }
-  const clean = p.startsWith("/") ? p : `/${p}`;
+
+  // 2) “uploads/...” o “/uploads/...”
+  if (/^\/?uploads\//i.test(s)) {
+    const clean = s.startsWith("/") ? s : `/${s}`;
+    return `${base}${clean}`;
+  }
+
+  // 3) Nombre suelto de imagen: “archivo.jpg”
+  if (/^[a-z0-9._-]+\.(png|jpe?g|webp|gif|heic)$/i.test(s)) {
+    return `${base}/uploads/event-photos/${s}`;
+  }
+
+  // 4) Cualquier otro relativo → aseguro barra inicial
+  const clean = s.startsWith("/") ? s : `/${s}`;
   return `${base}${clean}`;
 }
 
@@ -586,16 +688,12 @@ function ensureDir(dir) {
 
 // ------------------------------------------------------------------
 //   AUTH BRIDGE
- //  - anyAuth: acepta Firebase o tu JWT.
-//   - ensureUserId: si viene de Firebase, resuelve/crea un User y setea
-//     req.user.id con el ObjectId que usa tu base de datos.
 //------------------------------------------------------------------- 
 
 // decide en tiempo real si verificar Firebase o JWT
 async function anyAuth(req, res, next) {
   const token = extractIdToken(req);
   if (!token) {
-    // no hubo token Firebase -> probamos tu JWT clásico
     return authenticateToken(req, res, next);
   }
 
@@ -607,14 +705,13 @@ async function anyAuth(req, res, next) {
     };
     return next();
   } catch (_) {
-    // No era (o no válido) como Firebase -> usar tu JWT clásico
     return authenticateToken(req, res, next);
   }
 }
 
 // a partir de lo que haya puesto anyAuth, garantizamos req.user.id
 async function ensureUserId(req, res, next) {
-  if (req.user && req.user.id) return next(); // ya viene de tu JWT
+  if (req.user && req.user.id) return next();
 
   if (req.firebaseUser && req.firebaseUser.uid) {
     try {
@@ -631,12 +728,11 @@ async function ensureUserId(req, res, next) {
     }
   }
 
-  // No hubo ni JWT ni Firebase
   return res.status(401).json({ message: "Usuario no autenticado" });
 }
 
 // ------------------------------------------------------------------
-//   Configuración de multer (igual que ya tenías)
+//   Configuración de multer
 //------------------------------------------------------------------- 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -661,18 +757,17 @@ async function processImageToJpg(srcPath, outDir, baseName) {
       .toFile(outPath);
     return outPath;
   } catch (e) {
-    // fallback: copia tal cual si sharp falla (p.ej., formato raro)
+    // fallback: copia tal cual si sharp falla
     const fallback = path.join(outDir, `${baseName}${path.extname(srcPath) || ""}`);
     fs.copyFileSync(srcPath, fallback);
     return fallback;
   } finally {
-    // elimina el temporal original subido por multer
     try { fs.unlinkSync(srcPath); } catch {}
   }
 }
 
 // ------------------------------------------------------------------
-//CREAR EVENTO  (requiere usuario)
+//   CREAR EVENTO  (requiere usuario)
 //------------------------------------------------------------------- 
 router.post("/", anyAuth, ensureUserId, upload.single("image"), async (req, res) => {
   try {
@@ -740,7 +835,7 @@ router.post("/", anyAuth, ensureUserId, upload.single("image"), async (req, res)
 });
 
 // ------------------------------------------------------------------
- //  LISTAR EVENTOS (público)
+//   LISTAR EVENTOS (público)
 //------------------------------------------------------------------- 
 router.get("/", async (req, res) => {
   try {
@@ -824,33 +919,13 @@ router.get("/:id", async (req, res) => {
         : (obj.categories || []).map((cat) => (typeof cat === "string" ? cat : String(cat))),
     };
 
-    const userId = req.user ? req.user.id : null; // si algún middleware previo lo puso
+    const userId = req.user ? req.user.id : null;
     const isOwner = userId && obj.createdBy?._id?.toString() === userId;
 
     res.json({ ...formattedEvent, isOwner });
   } catch (error) {
     console.error("Error al obtener el evento:", error);
     res.status(500).json({ message: "Error al obtener el evento", error });
-  }
-});
-
-// ------------------------------------------------------------------
-//   ELIMINAR EVENTO (requiere usuario y ser owner)
-//------------------------------------------------------------------- 
-router.delete("/:id", anyAuth, ensureUserId, async (req, res) => {
-  try {
-    const event = await Event.findById(req.params.id);
-    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
-
-    if (event.createdBy.toString() !== req.user.id) {
-      return res.status(403).json({ message: "No tienes permiso para eliminar este evento" });
-    }
-
-    await Event.findByIdAndDelete(req.params.id);
-    res.json({ message: "Evento eliminado correctamente" });
-  } catch (error) {
-    console.error("Error al eliminar el evento:", error);
-    res.status(500).json({ message: "Error interno del servidor" });
   }
 });
 
@@ -866,6 +941,7 @@ async function getPhotosHandler(req, res) {
     const event = await Event.findById(id).lean();
     if (!event) return res.status(404).json({ message: "Evento no encontrado" });
 
+    // Normalizamos cualquier forma rara
     const photos = (event.photos || []).map((p) => absUrlFromUpload(req, p));
     return res.json({ photos });
   } catch (e) {
@@ -913,6 +989,7 @@ async function postPhotosHandler(req, res) {
         .relative(path.join(__dirname, ".."), processed)
         .replace(/\\/g, "/"); // ej: "uploads/event-photos/event-xxx.jpg"
       savedRelPaths.push(rel);
+
       event.photos = Array.isArray(event.photos) ? event.photos : [];
       event.photos.push(rel);
     }
@@ -923,9 +1000,8 @@ async function postPhotosHandler(req, res) {
     const allPhotos = (event.photos || []).map((p) => absUrlFromUpload(req, p));
 
     return res.status(201).json({
-      uploaded,   // urls recién subidas
-      photos: allPhotos, // estado completo de galería
-      count: uploaded.length,
+      uploaded,         // urls recién subidas (absolutas y correctas)
+      photos: allPhotos // estado completo de galería (absolutas y correctas)
     });
   } catch (e) {
     console.error("[POST photos] error:", e);
@@ -940,14 +1016,11 @@ router.post("/:id/upload-photo", anyAuth, ensureUserId, uploadAny.any(), postPho
 
 // ------------------------------------------------------------------
 //   ALTERNAR ASISTENCIA (requiere usuario)
-//   - Alterna en Mongo (campo attendees)
-//   - Escribe/borra doc en Firestore: attendances/{uid}_{eventId}
 //------------------------------------------------------------------- 
 router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
   const eventId = req.params.id;
 
   try {
-    // 1) Recuperar evento
     if (!mongoose.isValidObjectId(eventId)) {
       return res.status(400).json({ message: "ID de evento inválido" });
     }
@@ -956,25 +1029,21 @@ router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
 
     event.attendees = Array.isArray(event.attendees) ? event.attendees : [];
 
-    // 2) Usuario (Mongo id ya garantizado)
     const userId = req.user.id;
 
-    // 3) Alternar asistencia en Mongo (comparando como string)
     const idx = event.attendees.findIndex((a) => a?.toString?.() === userId);
     let attendedNow = false;
 
     if (idx !== -1) {
-      event.attendees.splice(idx, 1); // quitar
+      event.attendees.splice(idx, 1);
       attendedNow = false;
     } else {
-      event.attendees.push(userId); // añadir
+      event.attendees.push(userId);
       attendedNow = true;
     }
 
     await event.save();
 
-    // 4) Si viene además como Firebase (teléfono), refleja en Firestore
-    //    (la pantalla Perfil lee de Firestore con el uid de Firebase)
     const firebaseToken = extractIdToken(req);
     if (firebaseToken) {
       try {
@@ -994,7 +1063,7 @@ router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
               eventId,
               eventTitle: event.title || "",
               eventDate: event.date ? new Date(event.date) : null,
-              eventImageUrl: absUrlFromUpload(req, event.image), // 👈 normalizada
+              eventImageUrl: absUrlFromUpload(req, event.image),
               createdAt: admin.firestore.FieldValue.serverTimestamp(),
             },
             { merge: true }
@@ -1003,12 +1072,10 @@ router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
           await docRef.delete().catch(() => {});
         }
       } catch (e) {
-        // No rompemos si el token no era Firebase: el toggle en Mongo ya funcionó.
         console.warn("[attend] No se pudo reflejar en Firestore:", e?.message || e);
       }
     }
 
-    // 5) Responder
     return res.json({
       _id: event._id,
       attendees: event.attendees,
