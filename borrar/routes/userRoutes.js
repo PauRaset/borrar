@@ -8,7 +8,8 @@ const Event = require("../models/Event");
 // --- helpers ---
 function absUrlFromUpload(req, p) {
   if (!p) return null;
-  const base = process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
+  const base =
+    process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
 
   // si ya es http(s) y contiene /uploads/, reengancha al dominio actual
   if (p.startsWith("http")) {
@@ -28,7 +29,10 @@ async function authFirebase(req, res, next) {
     if (!token) return res.status(401).json({ message: "Falta Authorization" });
 
     const decoded = await admin.auth().verifyIdToken(token);
-    req.firebase = { uid: decoded.uid, phone: decoded.phone_number || decoded.phoneNumber || null };
+    req.firebase = {
+      uid: decoded.uid,
+      phone: decoded.phone_number || decoded.phoneNumber || null,
+    };
     next();
   } catch (err) {
     console.error("[authFirebase] error:", err);
@@ -68,7 +72,7 @@ router.get("/me/attending", authFirebase, ensureMongoUser, async (req, res) => {
     const userId = req.userMongo._id;
 
     const events = await Event.find({ attendees: userId })
-      .select("title date image")
+      .select("title date image createdBy")
       .sort({ date: -1 })
       .lean();
 
@@ -83,6 +87,32 @@ router.get("/me/attending", authFirebase, ensureMongoUser, async (req, res) => {
   } catch (err) {
     console.error("[/me/attending] error:", err);
     res.status(500).json({ message: "Error obteniendo tus eventos" });
+  }
+});
+
+/**
+ * GET /api/users/me
+ * Devuelve el usuario de Mongo asociado al token de Firebase (o lo crea si no existe).
+ * Respuesta mínima con _id (también como id) + username + phoneNumber + avatar absoluto.
+ */
+router.get("/me", authFirebase, ensureMongoUser, async (req, res) => {
+  try {
+    const u = req.userMongo;
+    const avatarRaw = u.profilePicture || u.avatar || null;
+
+    return res.json({
+      _id: u._id,
+      id: u._id, // comodidad para clientes
+      username: u.username,
+      phoneNumber: u.phoneNumber || null,
+      profilePictureUrl: absUrlFromUpload(req, avatarRaw),
+      role: u.role || null,
+    });
+  } catch (err) {
+    console.error("[GET /api/users/me] error:", err);
+    return res
+      .status(500)
+      .json({ message: "No se pudo obtener el usuario actual" });
   }
 });
 
