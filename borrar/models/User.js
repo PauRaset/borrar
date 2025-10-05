@@ -10,8 +10,10 @@ const userSchema = new mongoose.Schema(
     password: { type: String }, // opcional si el usuario entra por Firebase
 
     // Campos existentes en tu app (según capturas)
-    entName:        { type: String, default: "" }, // si lo usas
-    wUser:          { type: String, default: "" }, // si lo usas
+    // Back-compat: antes usabas "entName"; el frontend muestra "entityName".
+    entName:     { type: String, default: "" }, // legado / compat
+    entityName:  { type: String, default: "" }, // nombre visible actual
+    wUser:       { type: String, default: "" }, // si lo usas
     profilePicture: { type: String, default: "" },
 
     role: { type: String, enum: ["club", "spectator"], default: "club" },
@@ -33,8 +35,29 @@ const userSchema = new mongoose.Schema(
       sparse: true,
     },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    toJSON: {
+      virtuals: true,
+      transform: (_doc, ret) => {
+        // Exponer siempre entityName para el frontend
+        if (!ret.entityName && ret.entName) ret.entityName = ret.entName;
+        return ret;
+      },
+    },
+  }
 );
+
+/* ----------------------------- Hooks & helpers ---------------------------- */
+
+// Sincroniza entityName <-> entName para mantener compatibilidad
+userSchema.pre("save", function (next) {
+  // Si sólo está rellenado entName, propagar a entityName
+  if (!this.entityName && this.entName) this.entityName = this.entName;
+  // Si sólo está entityName y entName está vacío, lo mantenemos sincronizado
+  if (this.entityName && !this.entName) this.entName = this.entityName;
+  next();
+});
 
 // Encripta la contraseña SOLO si existe y cambió
 userSchema.pre("save", async function (next) {
