@@ -1,77 +1,111 @@
+// routes/eventsCompat.js
 const express = require('express');
 const router = express.Router();
 
-// Ajusta si tu controller tiene otro nombre/ruta:
+// Ajusta si el nombre del controlador es otro:
 const events = require('../controllers/eventController');
 
-/**
- * Devuelve la 1ª función existente entre varios nombres candidatos.
- * Si no hay ninguna, devuelve un handler 501 que además avisa por consola.
- */
-const pick = (...names) => {
-  for (const n of names) {
-    if (typeof events[n] === 'function') return events[n];
+/* ---------------- utils de resolución ---------------- */
+
+const keys = Object.keys(events || {});
+
+const firstExisting = (...names) =>
+  names.find((n) => typeof events[n] === 'function') || null;
+
+const findByRegex = (...regexes) => {
+  for (const k of keys) {
+    for (const r of regexes) {
+      if (r.test(k) && typeof events[k] === 'function') return k;
+    }
   }
-  return (req, res) => {
-    console.warn('[eventsCompat] No handler for any of:', names);
-    res.status(501).json({ error: `No handler found for: ${names.join(' | ')}` });
-  };
+  return null;
 };
 
-/**
- * Alias MUY amplios (EN + ES + variantes comunes).
- * Añade aquí los nombres reales si los conoces.
- */
+const pick = (label, fallbacks, regexes) => {
+  let name = firstExisting(...fallbacks);
+  if (!name && regexes?.length) name = findByRegex(...regexes);
+  if (!name) {
+    console.warn(`[eventsCompat] No handler for ${label}. Tried:`,
+      fallbacks, 'and regexes:', regexes?.map(r => r.toString()));
+    return (req, res) =>
+      res.status(501).json({ error: `No handler found for ${label}` });
+  }
+  console.log(`[eventsCompat] ${label} ->`, name);
+  return events[name];
+};
+
+/* ---------- intentar casar NOMBRES (EN/ES) + REGEX ---------- */
+
+// listar
 const list = pick(
-  // EN habituales
-  'listEvents','getAllEvents','getEvents','index','list','getAll','findAll',
-  // ES habituales
-  'listarEventos','obtenerEventos','getEventos','listar','obtenerTodos'
+  'list',
+  [
+    'listEvents','getAllEvents','getEvents','index','list','getAll','findAll',
+    'listarEventos','obtenerEventos','getEventos','listar','obtenerTodos'
+  ],
+  [/list/i, /get.*all/i, /find.*all/i, /obtener.*event/i, /listar/i]
 );
 
+// detalle
 const getOne = pick(
-  // EN
-  'getEvent','getById','findOne','show','detail','get',
-  // ES
-  'obtenerEvento','getEvento','buscarPorId','detalle','mostrar'
+  'getOne',
+  [
+    'getEvent','getById','findOne','show','detail','get',
+    'obtenerEvento','getEvento','buscarPorId','detalle','mostrar'
+  ],
+  [/get.*event/i, /get.*by.*id/i, /detail/i, /detalle/i, /find.*id/i]
 );
 
+// crear
 const create = pick(
-  // EN
-  'createEvent','create','store','add',
-  // ES
-  'crearEvento','crear','guardar','nuevo','alta'
+  'create',
+  [
+    'createEvent','create','store','add',
+    'crearEvento','crear','guardar','nuevo','alta'
+  ],
+  [/crea/i, /store/i, /add/i, /alta/i, /guardar/i]
 );
 
+// actualizar
 const update = pick(
-  // EN
-  'updateEvent','update','updateById','edit','patch','modify','modifyById',
-  // ES
-  'actualizarEvento','actualizar','editar','modificar','modificarEvento','patchEvento'
+  'update',
+  [
+    'updateEvent','update','updateById','edit','patch','modify','modifyById',
+    'actualizarEvento','actualizar','editar','modificar','modificarEvento','patchEvento'
+  ],
+  [/updat/i, /edit/i, /patch/i, /modif/i, /actualiz/i]
 );
 
+// borrar
 const remove = pick(
-  // EN
-  'deleteEvent','remove','destroy','del','delete',
-  // ES
-  'eliminarEvento','eliminar','borrar','baja'
+  'remove',
+  [
+    'deleteEvent','remove','destroy','del','delete',
+    'eliminarEvento','eliminar','borrar','baja'
+  ],
+  [/delet/i, /remov/i, /destroy/i, /borr/i, /elimin/i, /baja/i]
 );
 
+// imagen
 const image = pick(
-  // EN
-  'uploadImage','uploadEventImage','imageUpload','addImage',
-  // ES
-  'subirImagenEvento','subirImagen','cargarImagen'
+  'image',
+  [
+    'uploadImage','uploadEventImage','imageUpload','addImage',
+    'subirImagenEvento','subirImagen','cargarImagen'
+  ],
+  [/image/i, /imagen/i, /upload/i]
 );
 
-// ---- REST estándar
+/* ---------------------- rutas ----------------------- */
+
+// REST estándar
 router.get('/events', list);
 router.get('/events/:id', getOne);
 
 router.post('/events', create);
 router.delete('/events/:id', remove);
 
-// Actualización: acepta PUT / PATCH / POST
+// update aceptando varios verbos
 router.put('/events/:id', update);
 router.patch('/events/:id', update);
 router.post('/events/:id', update);
@@ -83,14 +117,14 @@ router.put('/event/:id', update);
 router.patch('/event/:id', update);
 router.post('/event/:id', update);
 
-// Variantes tipo edit/update
+// Variantes "edit/update"
 router.post('/events/update/:id', update);
 router.post('/events/edit/:id', update);
 router.put('/events/edit/:id', update);
 router.put('/events/:id/update', update);
 router.patch('/events/:id/update', update);
 
-// Imagen (si existe handler)
+// Imagen
 router.post('/events/:id/image', image);
 router.post('/event/:id/image', image);
 
