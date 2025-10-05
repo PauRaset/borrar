@@ -12,7 +12,7 @@ const Event = require("../models/Event");
 const User = require("../models/User");
 
 // Tu middleware JWT actual
-const authenticateToken = require("../middlewares/authMiddleware");
+const { authenticateToken } = require("../middlewares/authMiddleware");
 
 // Inicializa firebase-admin (y permite usar admin directamente)
 require("../middlewares/firebaseAdmin");
