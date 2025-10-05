@@ -76,6 +76,40 @@ function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
+/* -------------------------------------------------------------
+   Normalizadores de payload
+------------------------------------------------------------- */
+function parseDateMaybe(v) {
+  if (!v) return undefined;
+  if (v instanceof Date) return v;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? undefined : d;
+}
+
+function parseNumberMaybe(v) {
+  if (v === undefined || v === null || v === "") return undefined;
+  const n = Number(v);
+  return Number.isNaN(n) ? undefined : n;
+}
+
+function parseCategoriesMaybe(value) {
+  if (Array.isArray(value)) return value.map(String);
+  if (typeof value === "string") {
+    // Soporta JSON string o "a,b,c"
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed.map(String);
+    } catch (_) {
+      return value
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map(String);
+    }
+  }
+  return [];
+}
+
 /* ------------------------------------------------------------------
    AUTH BRIDGE
    - anyAuth: acepta Firebase o tu JWT.
@@ -208,10 +242,17 @@ router.post("/", anyAuth, ensureUserId, upload.single("image"), async (req, res)
     const {
       title,
       description,
-      date,
+      // fechas (compat: si solo viene "date", la usamos como startAt)
+      startAt: startAtRaw,
+      endAt: endAtRaw,
+      date: legacyDate,
+
+      // ubicación
       city,
       street,
       postalCode,
+
+      // extras
       categories, // puede venir string o array
       age,
       dressCode,
@@ -232,30 +273,39 @@ router.post("/", anyAuth, ensureUserId, upload.single("image"), async (req, res)
       image = path.relative(path.join(__dirname, ".."), processedImagePath).replace(/\\/g, "/");
     }
 
+    // Normalizar fechas
+    const startAt = parseDateMaybe(startAtRaw || legacyDate);
+    const endAt   = parseDateMaybe(endAtRaw);
+
     // Normalizar categorías
-    let parsedCategories = categories;
-    if (typeof parsedCategories === "string") {
-      try {
-        parsedCategories = JSON.parse(parsedCategories);
-        if (!Array.isArray(parsedCategories)) parsedCategories = [];
-      } catch (err) {
-        console.error("✸ Error al parsear categorías:", err);
-        return res.status(400).json({ message: "Formato de categorías inválido" });
-      }
-    }
+    const parsedCategories = parseCategoriesMaybe(categories);
+
+    // age/price a número (si vienen string)
+    const ageNum   = parseNumberMaybe(age);
+    const priceNum = parseNumberMaybe(price);
 
     const newEvent = new Event({
       title,
       description,
-      date,
+
+      // fechas
+      startAt,
+      endAt,
+      date: startAt || undefined, // compat con código legacy que mire "date"
+
+      // ubicación
       city,
       street,
       postalCode,
+
+      // imagen principal
       image,
-      categories: parsedCategories || [],
-      age,
+
+      // extras
+      categories: parsedCategories,
+      age: typeof ageNum === "number" ? ageNum : age,           // por si prefieres mantener string si falla
       dressCode,
-      price,
+      price: typeof priceNum === "number" ? priceNum : price,   // idem
       createdBy: userId,
       // photos se inicializa por schema ([])
     });
@@ -295,9 +345,7 @@ router.get("/", async (req, res) => {
           : null,
         categories: Array.isArray(event.categories)
           ? event.categories
-          : typeof event.categories === "string"
-          ? JSON.parse(event.categories)
-          : [],
+          : parseCategoriesMaybe(event.categories),
       };
     });
 
@@ -359,7 +407,7 @@ router.get("/:id", async (req, res) => {
         : null,
       categories: Array.isArray(obj.categories)
         ? obj.categories
-        : (obj.categories || []).map((cat) => (typeof cat === "string" ? cat : String(cat))),
+        : parseCategoriesMaybe(obj.categories),
     };
 
     const userId = req.user ? req.user.id : null; // si algún middleware previo lo puso
@@ -583,30 +631,23 @@ router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
 });
 
 /* ==================================================================
-   🚀 NUEVO: UPDATE + IMAGEN PRINCIPAL
+   🚀 UPDATE + IMAGEN PRINCIPAL
 ================================================================== */
 
 // Helpers para update
 function sanitizeUpdate(payload) {
   const clean = { ...payload };
   [
-    '_id', 'id', 'createdAt', 'updatedAt', '__v',
-    'createdBy', 'attendees', 'photos'
-  ].forEach(k => delete clean[k]);
+    "_id",
+    "id",
+    "createdAt",
+    "updatedAt",
+    "__v",
+    "createdBy",
+    "attendees",
+    "photos",
+  ].forEach((k) => delete clean[k]);
   return clean;
-}
-
-function parseCategoriesMaybe(value) {
-  if (Array.isArray(value)) return value;
-  if (typeof value === 'string') {
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return value.split(',').map(s => s.trim()).filter(Boolean);
-    }
-  }
-  return [];
 }
 
 async function updateEventHandler(req, res) {
@@ -619,17 +660,38 @@ async function updateEventHandler(req, res) {
 
     // 1) Buscar evento y verificar ownership
     const event = await Event.findById(id);
-    if (!event) return res.status(404).json({ message: 'Evento no encontrado' });
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
 
     if (event.createdBy.toString() !== req.user.id) {
-      return res.status(403).json({ message: 'No tienes permiso para editar este evento' });
+      return res.status(403).json({ message: "No tienes permiso para editar este evento" });
     }
 
     // 2) Construir update
     const update = sanitizeUpdate(req.body);
 
-    if (typeof req.body.categories !== 'undefined') {
+    // Normalizar fechas
+    const startAt = parseDateMaybe(req.body.startAt || req.body.date);
+    const endAt   = parseDateMaybe(req.body.endAt);
+    if (startAt) {
+      update.startAt = startAt;
+      // por compat, si alguien en front aún mira "date"
+      update.date = startAt;
+    }
+    if (endAt) update.endAt = endAt;
+
+    // Normalizar categorías
+    if (typeof req.body.categories !== "undefined") {
       update.categories = parseCategoriesMaybe(req.body.categories);
+    }
+
+    // age/price a número si aplica
+    if (typeof req.body.age !== "undefined") {
+      const ageNum = parseNumberMaybe(req.body.age);
+      update.age = typeof ageNum === "number" ? ageNum : req.body.age;
+    }
+    if (typeof req.body.price !== "undefined") {
+      const priceNum = parseNumberMaybe(req.body.price);
+      update.price = typeof priceNum === "number" ? priceNum : req.body.price;
     }
 
     // 3) Imagen (si viene multipart)
@@ -641,20 +703,20 @@ async function updateEventHandler(req, res) {
         `resized-${Date.now()}-${path.parse(req.file.originalname).name}`
       );
       update.image = path
-        .relative(path.join(__dirname, '..'), processedImagePath)
-        .replace(/\\/g, '/');
+        .relative(path.join(__dirname, ".."), processedImagePath)
+        .replace(/\\/g, "/");
     }
 
     // 4) Actualizar y devolver formateado
     const updated = await Event.findByIdAndUpdate(id, update, { new: true })
-      .populate('createdBy', 'username email profilePicture')
+      .populate("createdBy", "username email profilePicture")
       .lean();
 
     const formatted = {
       ...updated,
       imageUrl: absUrlFromUpload(req, updated.image),
       photos: Array.isArray(updated.photos)
-        ? updated.photos.map(p => toPhotoTileAbs(req, p)).filter(Boolean)
+        ? updated.photos.map((p) => toPhotoTileAbs(req, p)).filter(Boolean)
         : [],
       createdBy: updated.createdBy
         ? {
@@ -669,17 +731,19 @@ async function updateEventHandler(req, res) {
 
     return res.json(formatted);
   } catch (err) {
-    console.error('[UPDATE /events/:id] error:', err);
-    return res.status(500).json({ message: 'Error actualizando el evento', error: err.message });
+    console.error("[UPDATE /events/:id] error:", err);
+    return res
+      .status(500)
+      .json({ message: "Error actualizando el evento", error: err.message });
   }
 }
 
 // PATCH y PUT -> mismo handler
-router.patch('/:id', anyAuth, ensureUserId, upload.single('image'), updateEventHandler);
-router.put('/:id',   anyAuth, ensureUserId, upload.single('image'), updateEventHandler);
+router.patch("/:id", anyAuth, ensureUserId, upload.single("image"), updateEventHandler);
+router.put("/:id",   anyAuth, ensureUserId, upload.single("image"), updateEventHandler);
 
 // Subir/cambiar imagen principal
-router.post('/:id/image', anyAuth, ensureUserId, upload.single('image'), async (req, res) => {
+router.post("/:id/image", anyAuth, ensureUserId, upload.single("image"), async (req, res) => {
   try {
     const id = req.params.id;
 
@@ -688,10 +752,10 @@ router.post('/:id/image', anyAuth, ensureUserId, upload.single('image'), async (
     }
 
     const event = await Event.findById(id);
-    if (!event) return res.status(404).json({ message: 'Evento no encontrado' });
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
 
     if (event.createdBy.toString() !== req.user.id) {
-      return res.status(403).json({ message: 'No tienes permiso para cambiar la imagen' });
+      return res.status(403).json({ message: "No tienes permiso para cambiar la imagen" });
     }
 
     if (!req.file) {
@@ -706,8 +770,8 @@ router.post('/:id/image', anyAuth, ensureUserId, upload.single('image'), async (
     );
 
     const rel = path
-      .relative(path.join(__dirname, '..'), processedImagePath)
-      .replace(/\\/g, '/');
+      .relative(path.join(__dirname, ".."), processedImagePath)
+      .replace(/\\/g, "/");
 
     event.image = rel;
     await event.save();
@@ -718,8 +782,10 @@ router.post('/:id/image', anyAuth, ensureUserId, upload.single('image'), async (
       imageUrl: absUrlFromUpload(req, rel),
     });
   } catch (err) {
-    console.error('[POST /events/:id/image] error:', err);
-    return res.status(500).json({ message: 'Error subiendo imagen', error: err.message });
+    console.error("[POST /events/:id/image] error:", err);
+    return res
+      .status(500)
+      .json({ message: "Error subiendo imagen", error: err.message });
   }
 });
 
@@ -885,7 +951,7 @@ async function processImageToJpg(srcPath, outDir, baseName) {
 
 // -------------------------------------------------------------
 //   Helpers de normalización de fotos con metadatos
-//-------------------------------------------------------------
+//------------------------------------------------------------- 
 function usernameFromUserDoc(u) {
   if (!u) return null;
   return (
@@ -1030,7 +1096,7 @@ router.get("/", async (req, res) => {
 });
 
 // ------------------------------------------------------------------
-//Devuelve asistentes con username y avatar listos para pintar
+//   Devuelve asistentes con username y avatar listos para pintar
 //------------------------------------------------------------------- 
 router.get("/:id/attendees", async (req, res) => {
   try {
@@ -1142,10 +1208,10 @@ router.get("/:id/images", getPhotosHandler);
 router.get("/:id/media", getPhotosHandler);
 
 // ------------------------------------------------------------------
-////   GALERÍA: POST subir fotos (y alias)
+ //  GALERÍA: POST subir fotos (y alias)
 //   - Acepta múltiples campos: file/files/files[]/photo/photos/photos[]/image/images/images[]
 //   - Requiere usuario
-v------------------------------------------------------------------- 
+//------------------------------------------------------------------- 
 async function postPhotosHandler(req, res) {
   try {
     const { id } = req.params;
@@ -1227,7 +1293,7 @@ router.post("/:id/upload-photo", anyAuth, ensureUserId, uploadAny.any(), postPho
 // ------------------------------------------------------------------
 //   ALTERNAR ASISTENCIA (requiere usuario)
 //   - Alterna en Mongo (campo attendees)
- //  - Escribe/borra doc en Firestore: attendances/{uid}_{eventId}
+//   - Escribe/borra doc en Firestore: attendances/{uid}_{eventId}
 //------------------------------------------------------------------- 
 router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
   const eventId = req.params.id;
@@ -1300,6 +1366,147 @@ router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
   } catch (error) {
     console.error("Error al alternar asistencia:", error);
     res.status(500).json({ message: "Error interno del servidor", error: error.message });
+  }
+});
+
+// ==================================================================
+//   🚀 NUEVO: UPDATE + IMAGEN PRINCIPAL
+//================================================================== 
+
+// Helpers para update
+function sanitizeUpdate(payload) {
+  const clean = { ...payload };
+  [
+    '_id', 'id', 'createdAt', 'updatedAt', '__v',
+    'createdBy', 'attendees', 'photos'
+  ].forEach(k => delete clean[k]);
+  return clean;
+}
+
+function parseCategoriesMaybe(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return value.split(',').map(s => s.trim()).filter(Boolean);
+    }
+  }
+  return [];
+}
+
+async function updateEventHandler(req, res) {
+  try {
+    const id = req.params.id;
+
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    // 1) Buscar evento y verificar ownership
+    const event = await Event.findById(id);
+    if (!event) return res.status(404).json({ message: 'Evento no encontrado' });
+
+    if (event.createdBy.toString() !== req.user.id) {
+      return res.status(403).json({ message: 'No tienes permiso para editar este evento' });
+    }
+
+    // 2) Construir update
+    const update = sanitizeUpdate(req.body);
+
+    if (typeof req.body.categories !== 'undefined') {
+      update.categories = parseCategoriesMaybe(req.body.categories);
+    }
+
+    // 3) Imagen (si viene multipart)
+    if (req.file) {
+      const processedDir = ROOT_UPLOADS_DIR;
+      const processedImagePath = await processImageToJpg(
+        req.file.path,
+        processedDir,
+        `resized-${Date.now()}-${path.parse(req.file.originalname).name}`
+      );
+      update.image = path
+        .relative(path.join(__dirname, '..'), processedImagePath)
+        .replace(/\\/g, '/');
+    }
+
+    // 4) Actualizar y devolver formateado
+    const updated = await Event.findByIdAndUpdate(id, update, { new: true })
+      .populate('createdBy', 'username email profilePicture')
+      .lean();
+
+    const formatted = {
+      ...updated,
+      imageUrl: absUrlFromUpload(req, updated.image),
+      photos: Array.isArray(updated.photos)
+        ? updated.photos.map(p => toPhotoTileAbs(req, p)).filter(Boolean)
+        : [],
+      createdBy: updated.createdBy
+        ? {
+            ...updated.createdBy,
+            profilePictureUrl: absUrlFromUpload(req, updated.createdBy.profilePicture),
+          }
+        : null,
+      categories: Array.isArray(updated.categories)
+        ? updated.categories
+        : parseCategoriesMaybe(updated.categories),
+    };
+
+    return res.json(formatted);
+  } catch (err) {
+    console.error('[UPDATE /events/:id] error:', err);
+    return res.status(500).json({ message: 'Error actualizando el evento', error: err.message });
+  }
+}
+
+// PATCH y PUT -> mismo handler
+router.patch('/:id', anyAuth, ensureUserId, upload.single('image'), updateEventHandler);
+router.put('/:id',   anyAuth, ensureUserId, upload.single('image'), updateEventHandler);
+
+// Subir/cambiar imagen principal
+router.post('/:id/image', anyAuth, ensureUserId, upload.single('image'), async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    const event = await Event.findById(id);
+    if (!event) return res.status(404).json({ message: 'Evento no encontrado' });
+
+    if (event.createdBy.toString() !== req.user.id) {
+      return res.status(403).json({ message: 'No tienes permiso para cambiar la imagen' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ message: 'Falta el archivo "image"' });
+    }
+
+    const processedDir = ROOT_UPLOADS_DIR;
+    const processedImagePath = await processImageToJpg(
+      req.file.path,
+      processedDir,
+      `resized-${Date.now()}-${path.parse(req.file.originalname).name}`
+    );
+
+    const rel = path
+      .relative(path.join(__dirname, '..'), processedImagePath)
+      .replace(/\\/g, '/');
+
+    event.image = rel;
+    await event.save();
+
+    return res.json({
+      _id: event._id,
+      image: rel,
+      imageUrl: absUrlFromUpload(req, rel),
+    });
+  } catch (err) {
+    console.error('[POST /events/:id/image] error:', err);
+    return res.status(500).json({ message: 'Error subiendo imagen', error: err.message });
   }
 });
 
