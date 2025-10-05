@@ -47,13 +47,22 @@ const list = pick(
 );
 
 // detalle
+// detalle (regex estrictos: por id / detail / one)
 const getOne = pick(
   'getOne',
   [
     'getEvent','getById','findOne','show','detail','get',
     'obtenerEvento','getEvento','buscarPorId','detalle','mostrar'
   ],
-  [/get.*event/i, /get.*by.*id/i, /detail/i, /detalle/i, /find.*id/i]
+  [
+    /^get(Event)?$/i,          // get o getEvent (exactos)
+    /get.*by.*id/i,            // getById
+    /find.*one/i,              // findOne
+    /\bdetail\b/i,             // detail
+    /\b(show|mostrar|detalle)\b/i,
+    /(por|by).*id/i,           // ...por id
+    /obtener.*evento/i,        // obtenerEvento
+  ]
 );
 
 // crear
