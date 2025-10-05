@@ -2,42 +2,55 @@
 const express = require('express');
 const router = express.Router();
 
-// AJUSTA esta ruta si tu controlador está en otro sitio/nombre:
-const events = require('../controllers/eventsController');
-// Debe exportar algo como: listEvents, getEvent, createEvent, updateEvent, deleteEvent, uploadImage
+// Ajusta la ruta si tu archivo se llama distinto
+const events = require('../controllers/eventController');
 
-// ---- Lectura estándar
-router.get('/events', events.listEvents);
-router.get('/events/:id', events.getEvent);
+// Helper: elige la primera función existente entre varios nombres.
+// Si no existe ninguna, devuelve un handler 501 (para no romper Express).
+const pick = (...names) => {
+  for (const n of names) {
+    if (typeof events[n] === 'function') return events[n];
+  }
+  return (req, res) =>
+    res.status(501).json({ error: `No handler found for: ${names.join(' | ')}` });
+};
 
-// ---- Crear
-router.post('/events', events.createEvent);
-router.post('/event', events.createEvent); // alias
+// Intenta casar nombres típicos de cada acción
+const list   = pick('listEvents', 'getAllEvents', 'getEvents', 'index', 'list', 'getAll');
+const getOne = pick('getEvent', 'getById', 'findOne', 'show', 'detail');
+const create = pick('createEvent', 'create', 'store', 'add');
+const update = pick('updateEvent', 'update', 'updateById', 'edit', 'patch');
+const remove = pick('deleteEvent', 'remove', 'destroy', 'del', 'delete');
+const image  = pick('uploadImage', 'uploadEventImage', 'imageUpload', 'addImage');
 
-// ---- Actualizar: acepta PUT, PATCH y POST en varias variantes
-const upd = events.updateEvent;
-router.put('/events/:id', upd);
-router.patch('/events/:id', upd);
-router.post('/events/:id', upd);
+// ---- REST "estándar"
+router.get('/events', list);
+router.get('/events/:id', getOne);
 
-router.put('/event/:id', upd);    // alias singular
-router.patch('/event/:id', upd);
-router.post('/event/:id', upd);
+router.post('/events', create);
+router.delete('/events/:id', remove);
 
-// Variantes “update/edit” por si tu backend original usa esos paths
-router.post('/events/update/:id', upd);
-router.post('/events/edit/:id', upd);
-router.put('/events/edit/:id', upd);
-router.put('/events/:id/update', upd);
-router.patch('/events/:id/update', upd);
+// Acepta PUT/PATCH/POST para actualizar (según backend)
+router.put('/events/:id', update);
+router.patch('/events/:id', update);
+router.post('/events/:id', update);
 
-// ---- Eliminar
-router.delete('/events/:id', events.deleteEvent);
+// ---- Aliases comunes (singular)
+router.get('/event/:id', getOne);
+router.post('/event', create);
+router.put('/event/:id', update);
+router.patch('/event/:id', update);
+router.post('/event/:id', update);
 
-// ---- Imagen (si existe el handler en tu controller)
-if (typeof events.uploadImage === 'function') {
-  router.post('/events/:id/image', events.uploadImage);
-  router.post('/event/:id/image', events.uploadImage);
-}
+// ---- Variantes “edit/update” que usan algunos backends
+router.post('/events/update/:id', update);
+router.post('/events/edit/:id', update);
+router.put('/events/edit/:id', update);
+router.put('/events/:id/update', update);
+router.patch('/events/:id/update', update);
+
+// ---- Imagen (si existe handler)
+router.post('/events/:id/image', image);
+router.post('/event/:id/image', image);
 
 module.exports = router;
