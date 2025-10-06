@@ -11,8 +11,8 @@ const router = express.Router();
 const Event = require("../models/Event");
 const User = require("../models/User");
 
-// Tu middleware JWT actual
-const { authenticateToken } = require("../middlewares/authMiddleware");
+// Tu middleware JWT actual (export default)
+const authenticateToken = require("../middlewares/authMiddleware");
 
 // Inicializa firebase-admin (y permite usar admin directamente)
 require("../middlewares/firebaseAdmin");
@@ -303,9 +303,9 @@ router.post("/", anyAuth, ensureUserId, upload.single("image"), async (req, res)
 
       // extras
       categories: parsedCategories,
-      age: typeof ageNum === "number" ? ageNum : age,           // por si prefieres mantener string si falla
+      age: typeof ageNum === "number" ? ageNum : age,
       dressCode,
-      price: typeof priceNum === "number" ? priceNum : price,   // idem
+      price: typeof priceNum === "number" ? priceNum : price,
       createdBy: userId,
       // photos se inicializa por schema ([])
     });
@@ -552,6 +552,112 @@ router.post("/:id/photos/upload", anyAuth, ensureUserId, uploadAny.any(), postPh
 router.post("/:id/upload-photo", anyAuth, ensureUserId, uploadAny.any(), postPhotosHandler);
 
 /* ------------------------------------------------------------------
+   GALERÍA: DELETE foto(s) (solo propietario)
+   Soporta:
+     - ?idx=NUMBER
+     - ?url=...     (relativa o absoluta)
+     - /:pid        (param opcional con url/relativa)
+------------------------------------------------------------------- */
+router.delete("/:id/photos/:pid?", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    const event = await Event.findById(id);
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    // Solo el propietario puede borrar fotos
+    if (event.createdBy?.toString() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para borrar fotos de este evento" });
+    }
+
+    // Normalizar parámetros
+    const q = { ...req.query, ...req.body };
+    const pid = req.params.pid; // opcional
+    let idx = q.idx ?? undefined;
+    let url = q.url ?? undefined;
+    if (typeof idx === "string" && idx.trim() !== "") idx = Number(idx);
+
+    const photos = Array.isArray(event.photos) ? event.photos : [];
+
+    // Resolver índice a borrar
+    let targetIndex = -1;
+
+    if (Number.isInteger(idx) && idx >= 0 && idx < photos.length) {
+      targetIndex = idx;
+    } else {
+      // Por URL (soportar absoluta o relativa)
+      const search = (pid && pid !== "undefined") ? pid : url;
+      if (!search) {
+        return res.status(400).json({ message: "Debes proporcionar idx o url" });
+      }
+      const toRel = (v) => {
+        if (!v) return "";
+        if (typeof v !== "string") v = String(v);
+        if (v.startsWith("http")) {
+          const i = v.indexOf("/uploads/");
+          return i !== -1 ? v.substring(i + 1) : v; // quitar leading slash luego
+        }
+        return v.replace(/^\/+/, "");
+      };
+      const needle = toRel(search);
+      targetIndex = photos.findIndex((p) => {
+        const cand = typeof p === "string"
+          ? toRel(p)
+          : toRel(p?.url || p?.path || p?.image || p?.photo);
+        return cand === needle;
+      });
+      if (targetIndex === -1) {
+        return res.status(404).json({ message: "Foto no encontrada" });
+      }
+    }
+
+    // Extraer info de la foto a borrar
+    const removedEntry = photos[targetIndex];
+    const relPath = (typeof removedEntry === "string")
+      ? removedEntry
+      : (removedEntry?.url || removedEntry?.path || removedEntry?.image || removedEntry?.photo || "");
+
+    // Borrar archivo físico si está dentro de /uploads
+    try {
+      const ROOT = path.join(__dirname, "..");
+      const abs = path.join(ROOT, relPath.replace(/^\/+/, ""));
+      const uploadsRoot = path.join(ROOT, "uploads");
+      if (abs.startsWith(uploadsRoot) && fs.existsSync(abs)) {
+        fs.unlinkSync(abs);
+      }
+    } catch (e) {
+      console.warn("[DELETE photo] no se pudo eliminar archivo físico:", e?.message || e);
+    }
+
+    // Quitar del array y guardar
+    event.photos.splice(targetIndex, 1);
+    await event.save();
+
+    // Devolver listado normalizado
+    const outPhotos = (event.photos || [])
+      .map((p) => toPhotoTileAbs(req, p))
+      .filter(Boolean);
+
+    return res.json({
+      removed: (typeof removedEntry === "string")
+        ? { url: absUrlFromUpload(req, removedEntry) }
+        : {
+            url: absUrlFromUpload(req, removedEntry?.url || removedEntry?.path || removedEntry?.image || removedEntry?.photo),
+            byUsername: removedEntry?.byUsername || null,
+            uploadedAt: removedEntry?.uploadedAt || null,
+          },
+      photos: outPhotos,
+    });
+  } catch (e) {
+    console.error("[DELETE /events/:id/photos] error:", e);
+    return res.status(500).json({ message: "Error borrando foto", error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------
    ALTERNAR ASISTENCIA (requiere usuario)
    - Alterna en Mongo (campo attendees)
    - Escribe/borra doc en Firestore: attendances/{uid}_{eventId}
@@ -790,6 +896,7 @@ router.post("/:id/image", anyAuth, ensureUserId, upload.single("image"), async (
 });
 
 module.exports = router;
+
 
 /*// routes/eventRoutes.js
 const express = require("express");
