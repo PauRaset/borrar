@@ -1,0 +1,16 @@
+# ======== BASE DE DATOS ========
+MONGO_URI="mongodb+srv://eventappadmin:eventAppTest01@eventapp.ptp4y.mongodb.net/?retryWrites=true&w=majority&appName=eventApp"
+
+# ======== URLs DEL PROYECTO ========
+FRONTEND_URL="https://event-app-prod.vercel.app"
+BACKEND_URL="https://aa10fcfe-cd61-4e15-ba61-bc15db7cbaa1-00-bpcxo548o06d.janeway.replit.dev"
+
+# ======== JWT Y SESIONES ========
+JWT_SECRET="6bf10130730030fa3a72e4a26199239d1d0044507159f4925113f93c888964945bcae0b48376b306a2f5f32f9557ee47942cf0c2dc7de32e6e55c0a47cfa7e8"
+SESSION_SECRET="b645724857585a125d054237a2b6d6b240a5873605fa2deed5d15de903e9670ab6a228dd43947236460b37cfa2fd2d13d08c3ce4a48707c3cb0bc14a3f1d7c5d"
+
+# ======== STRIPE (Modo Test para empezar) ========
+STRIPE_SECRET_KEY="sk_test_51Qn0yxBpv8NpVyOVL7rDTDuTLX7IBc4wP7KUIZ4eUXFdas6gveXnU0K7xwhBqFdNYK6BfoQnYmoHq9C1wN65ICGq00MIkX9wGT"    # Clave secreta (test)
+#STRIPE_WEBHOOK_SECRET="whsec_xxxxxxxxxxxxxxxxxxxxxxxxx"
+QR_HMAC_KEY="cambia_esto_por_un_valor_largo_y_unico"
+APP_URL="https://event-app-prod.vercel.app"
