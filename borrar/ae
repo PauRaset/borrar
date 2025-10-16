@@ -17,3 +17,9 @@ APP_URL="https://event-app-prod.vercel.app"
 
 SENDGRID_API_KEY=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
 EMAIL_FROM="NightVibe <tickets@nightvibe.life>"
+
+
+
+FACEBOOK_CLIENT_ID="6204596870001008"
+FACEBOOK_CLIENT_SECRET="9eae3df4aaf51fecbffbf3d687ae861b"
+FACEBOOK_CALLBACK_URL="https://aa10fcfe-cd61-4e15-ba61-bc15db7cbaa1-00-bpcxo548o06d.janeway.replit.dev/api/auth/facebook/callback"
