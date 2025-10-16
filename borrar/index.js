@@ -231,47 +231,74 @@ app.get("/test-image", (req, res) => {
   res.send(`<img src="${base}/uploads/test.jpg" alt="Test Image" />`);
 });
 
-/* ===== Stripe Checkout: crear orden ===== */
+/* ===== Stripe Checkout: crear orden (con validación + logs) ===== */
 app.post("/api/orders", async (req, res) => {
   try {
     const { eventId, items, userId, phone } = req.body;
 
-    // items: [{ ticketTypeId, name, unitAmount, qty, currency }]
-    const line_items = (items || []).map((it) => ({
-      quantity: it.qty,
-      price_data: {
-        currency: it.currency || "eur",
-        unit_amount: it.unitAmount, // céntimos
-        product_data: { name: `${it.name} · ${eventId}` },
-      },
-    }));
+    // Validaciones básicas
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "missing_items", message: "No hay items en la orden." });
+    }
 
-    const successBase =
-      process.env.FRONTEND_URL || "https://event-app-prod.vercel.app";
+    // Construcción segura de line_items
+    const line_items = items.map((it, idx) => {
+      const name = (it?.name || "Entrada").toString();
+      const currency = ((it?.currency || "eur") + "").toLowerCase();
+      const qty = Number.isFinite(it?.qty) && it.qty > 0 ? Math.floor(it.qty) : 1;
+
+      // unit_amount debe ser entero en céntimos y >= 50
+      let unitAmount = Number(it?.unitAmount);
+      if (!Number.isFinite(unitAmount)) {
+        throw new Error(`items[${idx}].unitAmount inválido`);
+      }
+      unitAmount = Math.round(unitAmount);
+      if (unitAmount < 50) {
+        throw new Error(`El importe mínimo por entrada es 50 céntimos. Recibido: ${unitAmount}`);
+      }
+
+      return {
+        quantity: qty,
+        price_data: {
+          currency,
+          unit_amount: unitAmount,
+          product_data: { name: `${name} · ${eventId || ""}` },
+        },
+      };
+    });
+
+    const successBase = (process.env.FRONTEND_URL || "https://event-app-prod.vercel.app").replace(/\/+$/, "");
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       line_items,
-      success_url: `${successBase.replace(
-        /\/+$/,
-        ""
-      )}/purchase/success?sid={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${successBase.replace(/\/+$/, "")}/purchase/cancel`,
+      success_url: `${successBase}/purchase/success?sid={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${successBase}/purchase/cancel`,
       customer_creation: "always",
       metadata: {
-        eventId,
+        eventId: eventId || "",
         userId: userId || "",
         phone: phone || "",
       },
-      phone_number_collection: { enabled: true }, // opcional
+      phone_number_collection: { enabled: true },
       // allow_promotion_codes: true,
       // automatic_tax: { enabled: true },
     });
 
-    res.json({ url: session.url });
+    return res.json({ url: session.url });
   } catch (e) {
-    console.error("❌ Error creando sesión de Stripe:", e);
-    res.status(500).json({ error: "stripe_session_error" });
+    // Logs ricos para depurar rápidamente
+    console.error(
+      "❌ /api/orders error:",
+      e?.type || "",
+      e?.code || "",
+      e?.message || e,
+      e?.raw?.message || ""
+    );
+    return res.status(500).json({
+      error: "stripe_session_error",
+      message: e?.raw?.message || e?.message || "No se pudo crear la sesión de pago.",
+    });
   }
 });
 
