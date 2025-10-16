@@ -36,6 +36,7 @@ const staticAllowed = new Set([
   "https://nightvibe-six.vercel.app",
   "http://localhost:3000",
   "https://clubs.nightvibe.life",
+   "https://nvclubs.vercel.app",
   // añade aquí otros frontends fijos si los usas
 ]);
 
