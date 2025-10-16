@@ -17,32 +17,59 @@ const app = express();
 /* ===== Stripe ===== */
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-/* ===== CARGAS NUEVAS (models/utils) ===== */ // NEW
-const QRCode = require("qrcode");               // NEW
-const crypto = require("crypto");               // NEW
-const bcrypt = require("bcryptjs");             // NEW
-const Order = require("./models/Order");        // NEW
-const Ticket = require("./models/Ticket");      // NEW
-const CheckInLog = require("./models/CheckInLog"); // NEW
-const sendTicketEmail = require("./utils/sendTicketEmail"); // NEW
+/* ===== CARGAS NUEVAS (models/utils) ===== */
+const QRCode = require("qrcode");
+const crypto = require("crypto");
+const bcrypt = require("bcryptjs");
+const Order = require("./models/Order");
+const Ticket = require("./models/Ticket");
+const CheckInLog = require("./models/CheckInLog");
+const sendTicketEmail = require("./utils/sendTicketEmail");
 
-/* ===== CORS ===== */
+/* ============================================================================
+   CORS — permitir clubs.nightvibe.life, previews de Vercel y FRONTEND_URL
+   ========================================================================== */
 const FRONTEND_URL = (process.env.FRONTEND_URL || "").replace(/\/+$/, "");
-const allowedOrigins = new Set([
+
+const staticAllowed = new Set([
   FRONTEND_URL,
   "https://nightvibe-six.vercel.app",
   "http://localhost:3000",
+  "https://clubs.nightvibe.life",
+  // añade aquí otros frontends fijos si los usas
 ]);
+
+function isAllowedOrigin(origin) {
+  try {
+    // peticiones sin Origin (curl, apps nativas) -> permitir
+    if (!origin) return true;
+    if (staticAllowed.has(origin)) return true;
+
+    const { hostname } = new URL(origin);
+    // Previews de Vercel
+    if (hostname.endsWith(".vercel.app")) return true;
+    // Cualquier subdominio *.nightvibe.life
+    if (hostname.endsWith(".nightvibe.life")) return true;
+
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 app.use(
   cors({
     origin: (origin, cb) =>
-      !origin || allowedOrigins.has(origin)
+      isAllowedOrigin(origin)
         ? cb(null, true)
         : cb(new Error(`CORS no permitido para: ${origin}`)),
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     credentials: true,
   })
 );
+
+// Responder preflight explícitamente
+app.options("*", cors());
 
 /* ===== Webhook Stripe (RAW body) — debe ir ANTES de express.json() ===== */
 app.post(
@@ -63,7 +90,7 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    /* ===== EMISIÓN DE TICKETS + EMAIL ===== */ // NEW
+    /* ===== EMISIÓN DE TICKETS + EMAIL ===== */
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
       console.log(
@@ -115,7 +142,7 @@ app.post(
           { upsert: true, new: true }
         );
 
-        // (Opcional) título/fecha del evento para el email (ajústalo si guardas eventos en DB)
+        // (Opcional) título/fecha del evento para el email
         const eventTitle = `Evento ${eventId}`;
         const eventDate = "";
 
@@ -155,7 +182,7 @@ app.post(
               status: "issued",
             });
 
-            // QR PNG
+            // QR PNG (con el payload firmado)
             const qrPng = await QRCode.toBuffer(payload, {
               errorCorrectionLevel: "M",
               width: 480,
@@ -251,7 +278,7 @@ app.post("/api/orders", async (req, res) => {
       let unitAmount = Number(it?.unitAmount);
       if (!Number.isFinite(unitAmount)) {
         throw new Error(`items[${idx}].unitAmount inválido`);
-      }
+        }
       unitAmount = Math.round(unitAmount);
       if (unitAmount < 50) {
         throw new Error(`El importe mínimo por entrada es 50 céntimos. Recibido: ${unitAmount}`);
@@ -281,13 +308,10 @@ app.post("/api/orders", async (req, res) => {
         phone: phone || "",
       },
       phone_number_collection: { enabled: true },
-      // allow_promotion_codes: true,
-      // automatic_tax: { enabled: true },
     });
 
     return res.json({ url: session.url });
   } catch (e) {
-    // Logs ricos para depurar rápidamente
     console.error(
       "❌ /api/orders error:",
       e?.type || "",
@@ -302,7 +326,7 @@ app.post("/api/orders", async (req, res) => {
   }
 });
 
-/* ===== Check-in de tickets (escáner) ===== */ // NEW
+/* ===== Check-in de tickets (escáner) ===== */
 app.post("/api/checkin", async (req, res) => {
   try {
     // Seguridad básica por API key (MVP)
@@ -331,7 +355,6 @@ app.post("/api/checkin", async (req, res) => {
     }
 
     // Buscar ticket por comparación de hash (MVP)
-    // Nota: bcrypt genera hash distinto; usamos compare.
     const candidates = await Ticket.find({
       eventId,
       status: { $in: ["issued", "checked_in"] },
