@@ -14,3 +14,6 @@ STRIPE_SECRET_KEY="sk_test_51Qn0yxBpv8NpVyOVL7rDTDuTLX7IBc4wP7KUIZ4eUXFdas6gveXn
 #STRIPE_WEBHOOK_SECRET="whsec_Kdq8Yb8f66a0iRdLBSIuz4thAVHq2xVh"
 QR_HMAC_KEY="cambia_esto_por_un_valor_largo_y_unico"
 APP_URL="https://event-app-prod.vercel.app"
+
+SENDGRID_API_KEY=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
+EMAIL_FROM="NightVibe <tickets@nightvibe.life>"
