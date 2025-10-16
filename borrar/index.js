@@ -17,6 +17,15 @@ const app = express();
 /* ===== Stripe ===== */
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
+/* ===== CARGAS NUEVAS (models/utils) ===== */ // NEW
+const QRCode = require("qrcode");               // NEW
+const crypto = require("crypto");               // NEW
+const bcrypt = require("bcryptjs");             // NEW
+const Order = require("./models/Order");        // NEW
+const Ticket = require("./models/Ticket");      // NEW
+const CheckInLog = require("./models/CheckInLog"); // NEW
+const sendTicketEmail = require("./utils/sendTicketEmail"); // NEW
+
 /* ===== CORS ===== */
 const FRONTEND_URL = (process.env.FRONTEND_URL || "").replace(/\/+$/, "");
 const allowedOrigins = new Set([
@@ -54,6 +63,7 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
+    /* ===== EMISIÓN DE TICKETS + EMAIL ===== */ // NEW
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
       console.log(
@@ -63,7 +73,116 @@ app.post(
         session.customer_details?.email
       );
 
-      // 👉 Aquí, en el siguiente paso, emitimos tickets + QR + email
+      try {
+        // 1) Datos base del pago
+        const email = session.customer_details?.email || null;
+        const eventId = session.metadata?.eventId || "EVT";
+        const userId = session.metadata?.userId || null;
+        const phone = session.metadata?.phone || null;
+        const paymentIntentId = session.payment_intent || null;
+
+        // 2) Line items reales
+        const lineItems = await stripe.checkout.sessions.listLineItems(
+          session.id,
+          { limit: 100 }
+        );
+
+        // 3) Crear/actualizar Order
+        const order = await Order.findOneAndUpdate(
+          { stripeSessionId: session.id },
+          {
+            stripeSessionId: session.id,
+            paymentIntentId,
+            userId,
+            phone,
+            email,
+            eventId,
+            items: lineItems.data.map((li) => ({
+              ticketTypeId: li.price?.product || null,
+              name:
+                li.description ||
+                li.price?.nickname ||
+                li.price?.product ||
+                "Entrada",
+              unitAmount: li.amount_total
+                ? Math.floor(li.amount_total / (li.quantity || 1))
+                : li.price?.unit_amount || 0,
+              qty: li.quantity || 1,
+              currency: li.price?.currency || "eur",
+            })),
+            status: "paid",
+          },
+          { upsert: true, new: true }
+        );
+
+        // (Opcional) título/fecha del evento para el email (ajústalo si guardas eventos en DB)
+        const eventTitle = `Evento ${eventId}`;
+        const eventDate = "";
+
+        // 4) Emitir tickets: 1 por unidad
+        for (const li of lineItems.data) {
+          const qty = li.quantity || 1;
+          for (let i = 0; i < qty; i++) {
+            // token + firma HMAC
+            const token = crypto.randomBytes(16).toString("base64url"); // 128 bits
+            const hmac = crypto
+              .createHmac("sha256", process.env.QR_HMAC_KEY)
+              .update(`${token}|${eventId}`)
+              .digest("base64url");
+            const payload = `NV1:t=${token}&e=${eventId}&s=${hmac}`;
+
+            // solo guardamos hash del token
+            const tokenHash = await bcrypt.hash(token, 10);
+
+            // serial corto legible (p.ej. NV-AB12-3F)
+            const serial = `NV-${crypto
+              .randomBytes(2)
+              .toString("hex")
+              .toUpperCase()}-${crypto
+              .randomBytes(1)
+              .toString("hex")
+              .toUpperCase()}`;
+
+            // persistir ticket
+            const ticket = await Ticket.create({
+              eventId,
+              orderId: order._id,
+              ownerUserId: userId,
+              email,
+              ticketTypeId: li.price?.product || null,
+              serial,
+              tokenHash,
+              status: "issued",
+            });
+
+            // QR PNG
+            const qrPng = await QRCode.toBuffer(payload, {
+              errorCorrectionLevel: "M",
+              width: 480,
+            });
+
+            // email con la entrada (si hay email)
+            if (email) {
+              await sendTicketEmail({
+                to: email,
+                eventTitle,
+                eventDate,
+                serial: ticket.serial,
+                qrPngBuffer: qrPng,
+              });
+            } else {
+              console.log(
+                "⚠️ Ticket emitido SIN email (no disponible): serial",
+                ticket.serial
+              );
+            }
+          }
+        }
+
+        console.log("🎟️  Tickets emitidos para order", order._id.toString());
+      } catch (err) {
+        console.error("❌ Error procesando checkout.session.completed:", err);
+      }
     }
 
     res.json({ received: true });
@@ -153,6 +272,100 @@ app.post("/api/orders", async (req, res) => {
   } catch (e) {
     console.error("❌ Error creando sesión de Stripe:", e);
     res.status(500).json({ error: "stripe_session_error" });
+  }
+});
+
+/* ===== Check-in de tickets (escáner) ===== */ // NEW
+app.post("/api/checkin", async (req, res) => {
+  try {
+    // Seguridad básica por API key (MVP)
+    const key = req.headers["x-scanner-key"];
+    if (!key || key !== process.env.SCANNER_API_KEY) {
+      return res.status(401).json({ ok: false, reason: "unauthorized" });
+    }
+
+    const { token, eventId, hmac } = req.body || {};
+    if (!token || !eventId || !hmac) {
+      return res.status(400).json({ ok: false, reason: "bad_request" });
+    }
+
+    // Verificar firma HMAC
+    const expected = crypto
+      .createHmac("sha256", process.env.QR_HMAC_KEY)
+      .update(`${token}|${eventId}`)
+      .digest("base64url");
+    if (expected !== hmac) {
+      await CheckInLog.create({
+        ticketId: null,
+        eventId,
+        result: "bad_signature",
+      });
+      return res.status(400).json({ ok: false, reason: "bad_signature" });
+    }
+
+    // Buscar ticket por comparación de hash (MVP)
+    // Nota: bcrypt genera hash distinto; usamos compare.
+    const candidates = await Ticket.find({
+      eventId,
+      status: { $in: ["issued", "checked_in"] },
+    }).limit(10000);
+
+    let found = null;
+    for (const t of candidates) {
+      const ok = await bcrypt.compare(token, t.tokenHash);
+      if (ok) {
+        found = t;
+        break;
+      }
+    }
+
+    if (!found) {
+      await CheckInLog.create({ ticketId: null, eventId, result: "invalid" });
+      return res.status(404).json({ ok: false, reason: "invalid" });
+    }
+
+    if (found.status === "checked_in") {
+      await CheckInLog.create({
+        ticketId: found._id,
+        eventId,
+        result: "duplicate",
+      });
+      return res.json({
+        ok: false,
+        reason: "duplicate",
+        serial: found.serial,
+        checkedInAt: found.checkedInAt,
+      });
+    }
+
+    // Update atómico
+    const updated = await Ticket.findOneAndUpdate(
+      { _id: found._id, status: "issued" },
+      {
+        $set: {
+          status: "checked_in",
+          checkedInAt: new Date(),
+          checkedInBy: "scanner",
+        },
+      },
+      { new: true }
+    );
+
+    const result = updated ? "ok" : "duplicate";
+    await CheckInLog.create({
+      ticketId: found._id,
+      eventId,
+      result,
+    });
+
+    return res.json({
+      ok: result === "ok",
+      serial: found.serial,
+      status: updated?.status || found.status,
+    });
+  } catch (e) {
+    console.error("❌ Error en /api/checkin:", e);
+    return res.status(500).json({ ok: false, reason: "server_error" });
   }
 });
 
