@@ -11,6 +11,6 @@ SESSION_SECRET="b645724857585a125d054237a2b6d6b240a5873605fa2deed5d15de903e9670a
 
 # ======== STRIPE (Modo Test para empezar) ========
 STRIPE_SECRET_KEY="sk_test_51Qn0yxBpv8NpVyOVL7rDTDuTLX7IBc4wP7KUIZ4eUXFdas6gveXnU0K7xwhBqFdNYK6BfoQnYmoHq9C1wN65ICGq00MIkX9wGT"    # Clave secreta (test)
-#STRIPE_WEBHOOK_SECRET="whsec_xxxxxxxxxxxxxxxxxxxxxxxxx"
+#STRIPE_WEBHOOK_SECRET="whsec_Kdq8Yb8f66a0iRdLBSIuz4thAVHq2xVh"
 QR_HMAC_KEY="cambia_esto_por_un_valor_largo_y_unico"
 APP_URL="https://event-app-prod.vercel.app"
