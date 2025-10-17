@@ -7,6 +7,8 @@ const passport = require("passport");
 const path = require("path");
 const bodyParser = require("body-parser"); // <- para el webhook RAW
 const Stripe = require("stripe");          // <- Stripe SDK
+const registrationRoutes = require('./routes/registrationRoutes');
+app.use('/api/registration', registrationRoutes);
 require("dotenv").config();
 
 // ✅ Inicializa firebase-admin (solo imprime 1 línea)
