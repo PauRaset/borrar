@@ -270,16 +270,26 @@ router.post('/:id/stripe/onboarding', requireClubOwnerOrManager, async (req, res
     const club = await Club.findById(req.params.id);
     if (!club) return res.status(404).json({ error: 'club_not_found' });
 
+    // 1) Crear cuenta si no existe (pide capabilities)
     if (!club.stripeAccountId) {
       const account = await stripe.accounts.create({
         type: 'express',
-        business_type: 'company',
-        metadata: { clubId: String(club._id), clubName: club.name },
+        business_type: 'company', // o 'individual', según tu caso
+        capabilities: {
+          card_payments: { requested: true },
+          transfers:     { requested: true },
+        },
+        // country: 'ES', // opcional si quieres forzar país
+        metadata: {
+          clubId: String(club._id),
+          clubName: club.name,
+        },
       });
       club.stripeAccountId = account.id;
       await club.save();
     }
 
+    // 2) Crear Account Link
     const portalBase = (process.env.CLUBS_PORTAL_URL || process.env.FRONTEND_URL || 'https://clubs.nightvibe.life').replace(/\/+$/, '');
     const accountLink = await stripe.accountLinks.create({
       account: club.stripeAccountId,
@@ -291,6 +301,7 @@ router.post('/:id/stripe/onboarding', requireClubOwnerOrManager, async (req, res
     res.json({ url: accountLink.url, accountId: club.stripeAccountId });
   } catch (e) {
     console.error('POST /clubs/:id/stripe/onboarding error:', e);
+    // Devuelve el mensaje para verlo en el front:
     res.status(500).json({ error: 'onboarding_error', message: e?.message || 'onboarding_failed' });
   }
 });
