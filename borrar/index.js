@@ -375,6 +375,23 @@ app.post("/api/checkin", async (req, res) => {
       return res.status(404).json({ ok: false, reason: "invalid" });
     }
 
+    // ⬇️ NUEVO: cargamos la orden para poder devolver buyerName/email
+    let buyerName = "";
+    let buyerEmail = "";
+    try {
+      if (found.orderId) {
+        const ord = await Order.findById(found.orderId)
+          .select("buyerName email")
+          .lean();
+        if (ord) {
+          buyerName = ord.buyerName || "";
+          buyerEmail = ord.email || "";
+        }
+      }
+    } catch (_) {
+      // silencioso: si falla, seguimos sin romper el flujo
+    }
+
     if (found.status === "checked_in") {
       await CheckInLog.create({
         ticketId: found._id,
@@ -386,6 +403,9 @@ app.post("/api/checkin", async (req, res) => {
         reason: "duplicate",
         serial: found.serial,
         checkedInAt: found.checkedInAt,
+        // ⬇️ NUEVO
+        buyerName,
+        buyerEmail,
       });
     }
 
@@ -413,6 +433,10 @@ app.post("/api/checkin", async (req, res) => {
       ok: result === "ok",
       serial: found.serial,
       status: updated?.status || found.status,
+      checkedInAt: updated?.checkedInAt || found.checkedInAt, // ⬅ consistente
+      // ⬇️ NUEVO
+      buyerName,
+      buyerEmail,
     });
   } catch (e) {
     console.error("❌ Error en /api/checkin:", e);
