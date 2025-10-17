@@ -8,21 +8,21 @@ const userSchema = new mongoose.Schema(
     username: { type: String, required: true, trim: true },
 
     // email no requerido para permitir alta por teléfono/Firebase
-    email:    { type: String, unique: true, sparse: true },
+    email: { type: String, unique: true, sparse: true },
 
     // Guardamos SIEMPRE el hash aquí (nunca texto plano).
     // Nota: añadimos un virtual "passwordHash" para compatibilidad.
-    password: { type: String }, 
+    password: { type: String },
 
     // Campos existentes en tu app (según capturas)
-    entName:     { type: String, default: "" }, // legado / compat
-    entityName:  { type: String, default: "" }, // nombre visible actual
-    wUser:       { type: String, default: "" }, // si lo usas
+    entName: { type: String, default: "" }, // legado / compat
+    entityName: { type: String, default: "" }, // nombre visible actual
+    wUser: { type: String, default: "" }, // si lo usas
     profilePicture: { type: String, default: "" },
 
     role: { type: String, enum: ["club", "spectator"], default: "club" },
 
-    facebookId:  { type: String, unique: true, sparse: true },
+    facebookId: { type: String, unique: true, sparse: true },
     instagramId: { type: String, unique: true, sparse: true },
 
     // ---- Integración Firebase ----
@@ -38,14 +38,20 @@ const userSchema = new mongoose.Schema(
       unique: true,
       sparse: true,
     },
+
+    // ---- Reset / creación de contraseña (nuevo) ----
+    resetPasswordToken: { type: String, index: true },
+    resetPasswordExpires: { type: Date },
   },
   {
     timestamps: true,
     toJSON: {
       virtuals: true,
       transform: (_doc, ret) => {
-        // No exponer el hash
+        // No exponer datos sensibles
         delete ret.password;
+        delete ret.resetPasswordToken;
+        delete ret.resetPasswordExpires;
 
         // Exponer siempre entityName para el frontend
         if (!ret.entityName && ret.entName) ret.entityName = ret.entName;
@@ -61,9 +67,14 @@ const userSchema = new mongoose.Schema(
  * Compatibilidad: algunos módulos pueden leer/escribir "passwordHash".
  * Este virtual mapea a "password" (que siempre almacena el hash).
  */
-userSchema.virtual("passwordHash")
-  .get(function () { return this.password; })
-  .set(function (v) { this.password = v; });
+userSchema
+  .virtual("passwordHash")
+  .get(function () {
+    return this.password;
+  })
+  .set(function (v) {
+    this.password = v;
+  });
 
 /* ----------------------------- Hooks & helpers ---------------------------- */
 
@@ -83,7 +94,8 @@ userSchema.pre("save", function (next) {
 userSchema.pre("save", async function (next) {
   if (!this.isModified("password") || !this.password) return next();
 
-  const looksHashed = typeof this.password === "string" && /^\$2[aby]\$/.test(this.password);
+  const looksHashed =
+    typeof this.password === "string" && /^\$2[aby]\$/.test(this.password);
   if (looksHashed) return next();
 
   try {
