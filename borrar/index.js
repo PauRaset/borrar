@@ -1,4 +1,5 @@
 // index.js (entrypoint)
+require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
@@ -8,7 +9,7 @@ const path = require("path");
 const bodyParser = require("body-parser"); // <- para el webhook RAW
 const Stripe = require("stripe");          // <- Stripe SDK
 const clubRoutes = require('./routes/clubRoutes');
-require("dotenv").config();
+
 
 // ✅ Inicializa firebase-admin (solo imprime 1 línea)
 require("./middlewares/firebaseAdmin");
