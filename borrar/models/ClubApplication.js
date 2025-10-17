@@ -3,6 +3,8 @@ const mongoose = require('mongoose');
 
 const ClubApplicationSchema = new mongoose.Schema({
   email: { type: String, required: true, index: true },
+  passwordToken: String,
+  passwordTokenExpiresAt: Date,
   clubName: { type: String, required: true },
   contactName: { type: String, default: '' },
   phone: { type: String, default: '' },
