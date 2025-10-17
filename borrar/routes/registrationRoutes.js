@@ -1,11 +1,19 @@
 // routes/registrationRoutes.js
 const express = require('express');
 const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 const Club = require('../models/Club');
 const ClubApplication = require('../models/ClubApplication');
 const sendSimpleEmail = require('../utils/sendSimpleEmail');
 
+let User = null;
+try { User = require('../models/User'); } catch { /* opcional */ }
+
 const router = express.Router();
+
+const cleanEmail = (e='') => e.toLowerCase().trim();
+const frontendBase = () =>
+  (process.env.FRONTEND_URL || 'https://clubs.nightvibe.life').replace(/\/+$/, '');
 
 // ✅ Comprobación rápida
 router.get('/ping', (_req, res) => {
@@ -22,15 +30,16 @@ router.post('/apply', async (req, res) => {
     if (!email || !clubName) {
       return res.status(400).json({ ok: false, error: 'missing_fields' });
     }
+    const emailNorm = cleanEmail(email);
 
     // token de verificación  (válido 48h)
     const verifyToken = crypto.randomBytes(20).toString('base64url');
     const verifyTokenExpiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
 
-    const appDoc = await ClubApplication.findOneAndUpdate(
-      { email },
+    await ClubApplication.findOneAndUpdate(
+      { email: emailNorm },
       {
-        email,
+        email: emailNorm,
         clubName,
         contactName,
         phone,
@@ -44,13 +53,12 @@ router.post('/apply', async (req, res) => {
     );
 
     // link al frontend (página /register/verify)
-    const frontend = (process.env.FRONTEND_URL || 'https://clubs.nightvibe.life').replace(/\/+$/, '');
-    const link = `${frontend}/register/verify?token=${verifyToken}`;
+    const link = `${frontendBase()}/register/verify?token=${verifyToken}`;
 
     // No bloquees el flujo si el email falla
     try {
       await sendSimpleEmail({
-        to: email,
+        to: emailNorm,
         subject: 'Verifica tu email – NightVibe Clubs',
         html: `
           <p>Hola ${contactName || ''},</p>
@@ -61,11 +69,9 @@ router.post('/apply', async (req, res) => {
       });
     } catch (err) {
       console.error('sendSimpleEmail error:', err?.message || err);
-      // Si quieres informar al frontend:
-      // return res.json({ ok: true, mail: false });
+      // Si quieres informar al frontend, podrías devolver mail:false
     }
 
-    // Pase lo que pase con el email, confirma la creación
     return res.json({ ok: true, mail: true });
   } catch (e) {
     console.error('apply error', e);
@@ -104,8 +110,9 @@ router.post('/verify', async (req, res) => {
 router.get('/applications', async (req, res) => {
   try {
     // TODO: proteger con tu middleware admin
-    const { status = 'pending' } = req.query;
-    const list = await ClubApplication.find({ status }).sort({ createdAt: -1 }).lean();
+    const { status } = req.query;
+    const filter = status ? { status } : {};
+    const list = await ClubApplication.find(filter).sort({ createdAt: -1 }).lean();
     res.json({ ok: true, items: list });
   } catch (e) {
     console.error('list apps', e);
@@ -115,6 +122,7 @@ router.get('/applications', async (req, res) => {
 
 /**
  * POST /api/registration/applications/:id/approve (ADMIN)
+ * Crea el Club + genera scannerApiKey y envía link para crear contraseña.
  */
 router.post('/applications/:id/approve', async (req, res) => {
   try {
@@ -124,10 +132,11 @@ router.post('/applications/:id/approve', async (req, res) => {
     if (!appDoc) return res.status(404).json({ ok: false, error: 'not_found' });
 
     // generar slug básico
-    const base = (appDoc.clubName || '')
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '') || 'club';
+    const base =
+      (appDoc.clubName || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '') || 'club';
     const slug = `${base}-${Math.random().toString(36).slice(2, 6)}`;
 
     // scanner key por club
@@ -136,57 +145,41 @@ router.post('/applications/:id/approve', async (req, res) => {
     const club = await Club.create({
       name: appDoc.clubName,
       slug,
-      ownerUserId: appDoc.email,
+      ownerUserId: appDoc.email, // podrás actualizarlo a UID real si usas Firebase
       managers: [],
       stripeAccountId: null,
       scannerApiKey,
       status: 'active',
     });
 
+    // Cambiamos estado + generamos token para set-password (48h)
     appDoc.status = 'approved';
     appDoc.approvedAt = new Date();
+    appDoc.passwordToken = crypto.randomBytes(24).toString('base64url');
+    appDoc.passwordTokenExpiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
     await appDoc.save();
 
-    // token de contraseña válido 48h
-    const pwToken = crypto.randomBytes(24).toString('base64url');
-    appDoc.passwordToken = pwToken;
-    appDoc.passwordTokenExpiresAt = new Date(Date.now() + 48*60*60*1000);
-    await appDoc.save();
-    
-    const frontendBase = (process.env.FRONTEND_URL || 'https://clubs.nightvibe.life').replace(/\/+$/,'');
-    const setPasswordLink = `${frontendBase}/register/set-password?token=${pwToken}`;
-    
-    // en el email de bienvenida añade:
-    await sendSimpleEmail({
-      to: appDoc.email,
-      subject: 'Tu cuenta de organizador ha sido aprobada 🎉',
-      html: `
-        <p>¡Enhorabuena!</p>
-        <p>Tu panel: <a href="${frontendBase}">${frontendBase}</a></p>
-        <p>Clave del escáner: <code>${scannerApiKey}</code></p>
-        <p><b>Último paso:</b> crea tu contraseña aquí:<br>
-          <a href="${setPasswordLink}">${setPasswordLink}</a>
-        </p>
-        <p>Luego podrás iniciar sesión desde el panel.</p>
-      `
-    });
-    
-    // Email de bienvenida
+    const panelUrl = frontendBase();
+    const setPasswordLink = `${panelUrl}/register/set-password?token=${appDoc.passwordToken}`;
+
+    // Email de bienvenida ÚNICO
     try {
       await sendSimpleEmail({
         to: appDoc.email,
         subject: 'Tu cuenta de organizador ha sido aprobada 🎉',
         html: `
           <p>¡Enhorabuena!</p>
-          <p>Tu panel: <a href="${(process.env.FRONTEND_URL || 'https://clubs.nightvibe.life').replace(/\/+$/, '')}">
-            ${(process.env.FRONTEND_URL || 'https://clubs.nightvibe.life').replace(/\/+$/, '')}
-          </a></p>
+          <p>Tu panel: <a href="${panelUrl}">${panelUrl}</a></p>
           <p>Clave del escáner (guárdala): <code>${scannerApiKey}</code></p>
-          <p>Próximo paso: conecta Stripe desde el dashboard para cobrar.</p>
+          <p><b>Último paso:</b> crea tu contraseña aquí:<br>
+            <a href="${setPasswordLink}">${setPasswordLink}</a>
+          </p>
+          <p>Luego podrás iniciar sesión y conectar Stripe desde el dashboard para cobrar.</p>
         `,
       });
     } catch (err) {
       console.error('sendSimpleEmail (approve) error:', err?.message || err);
+      // No cortamos: el club ya está creado
     }
 
     res.json({ ok: true, club });
@@ -228,10 +221,11 @@ router.post('/applications/:id/reject', async (req, res) => {
   }
 });
 
-const bcrypt = require('bcryptjs');
-let User = null;
-try { User = require('../models/User'); } catch {}
-
+/**
+ * POST /api/registration/set-password
+ * Body: { token, password, name? }
+ * Crea/actualiza el usuario (role: "club") y consume el token.
+ */
 router.post('/set-password', async (req, res) => {
   try {
     const { token, password, name } = req.body || {};
@@ -243,21 +237,39 @@ router.post('/set-password', async (req, res) => {
       return res.status(400).json({ ok:false, error:'token_expired' });
     if (!User) return res.status(500).json({ ok:false, error:'user_model_missing' });
 
-    const hash = await bcrypt.hash(password, 10);
+    // Buscar o crear
+    const emailNorm = cleanEmail(appDoc.email);
+    let user = await User.findOne({ email: emailNorm });
 
-    // upsert de usuario por email
-    const user = await User.findOneAndUpdate(
-      { email: appDoc.email },
-      {
-        email: appDoc.email,
-        name: name || appDoc.contactName || appDoc.clubName || '',
-        passwordHash: hash,
-        role: 'club_owner',
-      },
-      { upsert: true, new: true }
-    );
+    if (!user) {
+      user = new User({
+        email: emailNorm,
+        username: (name || appDoc.contactName || appDoc.clubName || emailNorm.split('@')[0] || 'user').trim(),
+        role: 'club',
+        entName: appDoc.clubName || '',
+        entityName: appDoc.clubName || '',
+      });
+    } else {
+      // Actualiza nombre si llega y el actual es demasiado genérico
+      if (name && (!user.username || user.username.startsWith('user_'))) {
+        user.username = name.trim();
+      }
+      if (!user.entityName && appDoc.clubName) user.entityName = appDoc.clubName;
+      if (!user.entName && appDoc.clubName) user.entName = appDoc.clubName;
+      user.role = 'club';
+    }
 
-    // consumir token
+    // Fijar contraseña usando helper del modelo si existe
+    if (typeof user.setPassword === 'function') {
+      await user.setPassword(password);
+    } else {
+      const hash = await bcrypt.hash(password, 10);
+      user.password = hash; // el toJSON ya oculta password
+    }
+
+    await user.save();
+
+    // Consumir token
     appDoc.passwordToken = null;
     appDoc.passwordTokenExpiresAt = null;
     await appDoc.save();
