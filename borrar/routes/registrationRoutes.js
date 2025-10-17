@@ -7,6 +7,11 @@ const sendSimpleEmail = require('../utils/sendSimpleEmail');
 
 const router = express.Router();
 
+// ✅ Ruta de prueba para verificar que el router está montado correctamente
+router.get('/ping', (_req, res) => {
+  res.json({ ok: true, ts: new Date().toISOString() });
+});
+
 /**
  * POST /api/registration/apply
  * Crea una solicitud y envía email con enlace de verificación.
