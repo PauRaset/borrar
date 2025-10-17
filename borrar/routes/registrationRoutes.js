@@ -147,6 +147,30 @@ router.post('/applications/:id/approve', async (req, res) => {
     appDoc.approvedAt = new Date();
     await appDoc.save();
 
+    // token de contraseña válido 48h
+    const pwToken = crypto.randomBytes(24).toString('base64url');
+    appDoc.passwordToken = pwToken;
+    appDoc.passwordTokenExpiresAt = new Date(Date.now() + 48*60*60*1000);
+    await appDoc.save();
+    
+    const frontendBase = (process.env.FRONTEND_URL || 'https://clubs.nightvibe.life').replace(/\/+$/,'');
+    const setPasswordLink = `${frontendBase}/register/set-password?token=${pwToken}`;
+    
+    // en el email de bienvenida añade:
+    await sendSimpleEmail({
+      to: appDoc.email,
+      subject: 'Tu cuenta de organizador ha sido aprobada 🎉',
+      html: `
+        <p>¡Enhorabuena!</p>
+        <p>Tu panel: <a href="${frontendBase}">${frontendBase}</a></p>
+        <p>Clave del escáner: <code>${scannerApiKey}</code></p>
+        <p><b>Último paso:</b> crea tu contraseña aquí:<br>
+          <a href="${setPasswordLink}">${setPasswordLink}</a>
+        </p>
+        <p>Luego podrás iniciar sesión desde el panel.</p>
+      `
+    });
+    
     // Email de bienvenida
     try {
       await sendSimpleEmail({
@@ -201,6 +225,47 @@ router.post('/applications/:id/reject', async (req, res) => {
   } catch (e) {
     console.error('reject error', e);
     res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+const bcrypt = require('bcryptjs');
+let User = null;
+try { User = require('../models/User'); } catch {}
+
+router.post('/set-password', async (req, res) => {
+  try {
+    const { token, password, name } = req.body || {};
+    if (!token || !password) return res.status(400).json({ ok:false, error:'missing_fields' });
+
+    const appDoc = await ClubApplication.findOne({ passwordToken: token });
+    if (!appDoc) return res.status(404).json({ ok:false, error:'invalid_token' });
+    if (!appDoc.passwordTokenExpiresAt || appDoc.passwordTokenExpiresAt < new Date())
+      return res.status(400).json({ ok:false, error:'token_expired' });
+    if (!User) return res.status(500).json({ ok:false, error:'user_model_missing' });
+
+    const hash = await bcrypt.hash(password, 10);
+
+    // upsert de usuario por email
+    const user = await User.findOneAndUpdate(
+      { email: appDoc.email },
+      {
+        email: appDoc.email,
+        name: name || appDoc.contactName || appDoc.clubName || '',
+        passwordHash: hash,
+        role: 'club_owner',
+      },
+      { upsert: true, new: true }
+    );
+
+    // consumir token
+    appDoc.passwordToken = null;
+    appDoc.passwordTokenExpiresAt = null;
+    await appDoc.save();
+
+    res.json({ ok:true, userId: user._id });
+  } catch (e) {
+    console.error('set-password error', e);
+    res.status(500).json({ ok:false, error:'server_error' });
   }
 });
 
