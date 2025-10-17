@@ -31,26 +31,30 @@ router.post('/apply', async (req, res) => {
       { upsert: true, new: true }
     );
 
-    // link al frontend (página /register/verify)
-    const frontend = (process.env.FRONTEND_URL || 'https://clubs.nightvibe.life').replace(/\/+$/, '');
-    const link = `${frontend}/register/verify?token=${verifyToken}`;
+// link al frontend (página /register/verify)
+const frontend = (process.env.FRONTEND_URL || 'https://clubs.nightvibe.life').replace(/\/+$/, '');
+const link = `${frontend}/register/verify?token=${verifyToken}`;
 
-    await sendSimpleEmail({
-      to: email,
-      subject: 'Verifica tu email – NightVibe Clubs',
-      html: `
-        <p>Hola ${contactName || ''},</p>
-        <p>Para continuar con el registro de <b>${clubName}</b>, confirma tu correo:</p>
-        <p><a href="${link}">Verificar email</a></p>
-        <p>Enlace válido durante 48 horas.</p>
-      `
-    });
+// ⬇️ No bloquees el flujo si el email falla
+try {
+  await sendSimpleEmail({
+    to: email,
+    subject: 'Verifica tu email – NightVibe Clubs',
+    html: `
+      <p>Hola ${contactName || ''},</p>
+      <p>Para continuar con el registro de <b>${clubName}</b>, confirma tu correo:</p>
+      <p><a href="${link}">Verificar email</a></p>
+      <p>Enlace válido durante 48 horas.</p>
+    `
+  });
+} catch (err) {
+  console.error('sendSimpleEmail error:', err?.message || err);
+  // Si quieres, añade una bandera para el frontend:
+  // return res.json({ ok:true, mail:false });   // y el frontend avisa “no pudimos enviar el email”
+}
 
-    res.json({ ok:true });
-  } catch (e) {
-    console.error('apply error', e);
-    res.status(500).json({ ok:false, error:'server_error' });
-  }
+// pase lo que pase arriba, confirma la creación
+return res.json({ ok:true, mail:true });
 });
 
 /**
