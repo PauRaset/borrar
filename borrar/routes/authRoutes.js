@@ -124,10 +124,6 @@ router.post("/register", async (req, res) => {
 
     await user.save();
 
-    // Opcional: emitir token directo tras registro
-    // const token = issueSessionToken(user);
-    // return res.status(201).json({ message: "Usuario registrado", token });
-
     res.status(201).json({ message: "Usuario registrado correctamente" });
   } catch (error) {
     console.error("Error en el registro:", error);
@@ -166,7 +162,7 @@ router.post("/login", async (req, res) => {
   }
 });
 
-/* -------- Forgot / Reset password (sin tocar schema) -------- */
+/* -------- Forgot / Reset password (JWT temporal por email) -------- */
 /**
  * POST /api/auth/forgot
  * Envía un enlace de reseteo (también sirve para “primera contraseña”).
@@ -195,8 +191,8 @@ router.post("/forgot", async (req, res) => {
         <p>Hola ${user.username || ""},</p>
         <p>Para establecer o restablecer tu contraseña, haz clic en el siguiente enlace:</p>
         <p><a href="${link}">Establecer contraseña</a></p>
-        <p>Si tú no lo solicitaste, ignora este mensaje.</p>
-      `
+        <p>El enlace caduca en 1 hora. Si tú no lo solicitaste, ignora este mensaje.</p>
+      `,
     });
 
     res.json({ ok: true });
@@ -330,9 +326,15 @@ router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
       ...ev,
       categories: Array.isArray(ev.categories)
         ? ev.categories
-        : (typeof ev.categories === "string"
-            ? (() => { try { return JSON.parse(ev.categories); } catch { return []; } })()
-            : []),
+        : typeof ev.categories === "string"
+        ? (() => {
+            try {
+              return JSON.parse(ev.categories);
+            } catch {
+              return [];
+            }
+          })()
+        : [],
     }));
 
     res.json(formatted);
