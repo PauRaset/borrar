@@ -6,8 +6,10 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const Club = require('../models/Club');
 const Order = require('../models/Order');
+let User = null;
+try { User = require('../models/User'); } catch (_) {}
 
-// ======================= Helpers ==========================
+/* ======================= Helpers genéricos ======================= */
 function asInt(v, def) {
   const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : def;
@@ -21,12 +23,11 @@ function csvEscape(v) {
 }
 
 function ordersToCsv(orders = []) {
-  // Una fila por item (así ves cantidades y totales por línea)
   const headers = [
-    'order_id', 'created_at', 'status',
-    'club_id', 'event_id',
+    'order_id','created_at','status',
+    'club_id','event_id',
     'buyer_email',
-    'item_name', 'qty', 'unit_amount_cents', 'currency', 'line_total_cents'
+    'item_name','qty','unit_amount_cents','currency','line_total_cents'
   ];
   const rows = [headers.join(',')];
 
@@ -74,16 +75,31 @@ function ordersToCsv(orders = []) {
   return rows.join('\n');
 }
 
-// (Opcional) Middleware mínimo para asegurar acceso del dueño.
-// Adaptar a tu auth real (Firebase/Passport). De momento, permisivo.
+/* ======================= Auth mínima JWT ======================== */
+function authenticateToken(req, res, next) {
+  const hdr = req.header('Authorization') || '';
+  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+  if (!token) return res.status(401).json({ message: 'No autorizado' });
+  try {
+    const jwt = require('jsonwebtoken');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    // { id, role }
+    req.user = decoded;
+    next();
+  } catch (e) {
+    return res.status(403).json({ message: 'Token no válido' });
+  }
+}
+
+/* (Opcional) Middleware mínimo para asegurar acceso del dueño.
+   De momento sigue permisivo para no romper flujos. */
 async function requireClubOwnerOrManager(req, res, next) {
   try {
     const clubId = req.params.id;
     const club = await Club.findById(clubId).lean();
     if (!club) return res.status(404).json({ error: 'club_not_found' });
 
-    // TODO: integrar con tu auth real.
-    // Por ahora no bloqueamos para no romper tu flujo actual.
+    // TODO: integrar con tu auth real; aquí no bloqueamos.
     req.club = club;
     next();
   } catch (e) {
@@ -92,8 +108,74 @@ async function requireClubOwnerOrManager(req, res, next) {
   }
 }
 
-// ================== 5) Reporting ==========================
+/* ======================= NUEVAS RUTAS BASE ======================= */
+/**
+ * GET /api/clubs/mine
+ * Devuelve los clubs del usuario autenticado. Casamos por:
+ *  - ownerUserId = user._id (string)
+ *  - ownerUserId = user.email (porque en aprobación lo guardas así)
+ *  - managers[] contiene user._id o user.email
+ */
+router.get('/mine', authenticateToken, async (req, res) => {
+  try {
+    const criteria = [];
+    let email = null;
 
+    // intenta obtener email del user
+    if (User && req.user?.id) {
+      try {
+        const u = await User.findById(req.user.id).select('email').lean();
+        email = (u?.email || '').toLowerCase().trim() || null;
+      } catch (_) {}
+    }
+    const userId = req.user?.id?.toString();
+
+    if (userId) criteria.push({ ownerUserId: userId });
+    if (email)  criteria.push({ ownerUserId: email });
+    if (userId) criteria.push({ managers: userId });
+    if (email)  criteria.push({ managers: email });
+
+    if (!criteria.length) return res.json([]);
+
+    const clubs = await Club.find({ $or: criteria }).sort({ createdAt: -1 }).lean();
+    return res.json(clubs);
+  } catch (e) {
+    console.error('GET /api/clubs/mine error:', e);
+    return res.status(500).json({ message: 'Error al obtener tus clubs' });
+  }
+});
+
+/**
+ * GET /api/clubs
+ * Filtros:
+ *  - ownerUserId (o email): exacto (puede ser id o email)
+ *  - manager: valor dentro de managers (id o email)
+ *  - slug: exacto
+ *  - id: exacto
+ */
+router.get('/', async (req, res) => {
+  try {
+    const { ownerUserId, email, manager, slug, id } = req.query || {};
+    const q = {};
+
+    if (id)   q._id  = id;
+    if (slug) q.slug = slug;
+
+    const owner = (ownerUserId || email || '').toString().trim();
+    if (owner) q.ownerUserId = owner;
+
+    const mgr = (manager || '').toString().trim();
+    if (mgr) q.managers = mgr;
+
+    const clubs = await Club.find(q).sort({ createdAt: -1 }).lean();
+    return res.json(clubs);
+  } catch (e) {
+    console.error('GET /api/clubs error:', e);
+    return res.status(500).json({ message: 'Error al listar clubs' });
+  }
+});
+
+/* ======================= Reporting ======================= */
 // GET /api/clubs/:id/orders?from=YYYY-MM-DD&to=YYYY-MM-DD&status=paid
 router.get('/:id/orders', requireClubOwnerOrManager, async (req, res) => {
   try {
@@ -109,11 +191,8 @@ router.get('/:id/orders', requireClubOwnerOrManager, async (req, res) => {
       if (to)   q.createdAt.$lte = new Date(`${to}T23:59:59.999Z`);
     }
 
-    const orders = await Order.find(q)
-      .sort({ createdAt: -1 })
-      .lean();
+    const orders = await Order.find(q).sort({ createdAt: -1 }).lean();
 
-    // Resumen sencillo: total céntimos y nº entradas
     let totalCents = 0;
     let totalTickets = 0;
     for (const o of orders) {
@@ -123,19 +202,14 @@ router.get('/:id/orders', requireClubOwnerOrManager, async (req, res) => {
       }
     }
 
-    res.json({
-      count: orders.length,
-      totalCents,
-      totalTickets,
-      orders,
-    });
+    res.json({ count: orders.length, totalCents, totalTickets, orders });
   } catch (e) {
     console.error('GET /clubs/:id/orders error:', e);
     res.status(500).json({ error: 'server_error' });
   }
 });
 
-// GET /api/clubs/:id/orders.csv  (mismos filtros)
+// GET /api/clubs/:id/orders.csv
 router.get('/:id/orders.csv', requireClubOwnerOrManager, async (req, res) => {
   try {
     const clubId = req.params.id;
@@ -162,26 +236,23 @@ router.get('/:id/orders.csv', requireClubOwnerOrManager, async (req, res) => {
   }
 });
 
-// ============== 5) Reembolso básico =======================
+/* =================== Reembolso básico =================== */
 // POST /api/orders/:orderId/refund
 router.post('/orders/:orderId/refund', async (req, res) => {
   try {
     const orderId = req.params.orderId;
     const order = await Order.findById(orderId);
     if (!order) return res.status(404).json({ error: 'order_not_found' });
-
     if (!order.paymentIntentId) {
       return res.status(400).json({ error: 'missing_payment_intent' });
     }
 
-    // Si quieres devolver también tu fee, añade refund_application_fee:true
     const refund = await stripe.refunds.create({
       payment_intent: order.paymentIntentId,
-      // refund_application_fee: true, // <- Decide tu política
-      // amount: ... // <- parcial, si quisieras
+      // refund_application_fee: true,
+      // amount: ...
     });
 
-    // Marca orden como 'refunded' (si tu lógica lo contempla)
     order.status = 'refunded';
     await order.save();
 
@@ -192,29 +263,23 @@ router.post('/orders/:orderId/refund', async (req, res) => {
   }
 });
 
-// ============== 6) Stripe Connect onboarding ===============
-
+/* ============ Stripe Connect onboarding ============ */
 // POST /api/clubs/:id/stripe/onboarding
 router.post('/:id/stripe/onboarding', requireClubOwnerOrManager, async (req, res) => {
   try {
     const club = await Club.findById(req.params.id);
     if (!club) return res.status(404).json({ error: 'club_not_found' });
 
-    // 1) Crear cuenta si no existe
     if (!club.stripeAccountId) {
       const account = await stripe.accounts.create({
         type: 'express',
-        business_type: 'company', // o 'individual' si tus clubs pueden ser personas físicas
-        metadata: {
-          clubId: String(club._id),
-          clubName: club.name,
-        },
+        business_type: 'company',
+        metadata: { clubId: String(club._id), clubName: club.name },
       });
       club.stripeAccountId = account.id;
       await club.save();
     }
 
-    // 2) Crear Account Link de onboarding
     const portalBase = (process.env.CLUBS_PORTAL_URL || process.env.FRONTEND_URL || 'https://clubs.nightvibe.life').replace(/\/+$/, '');
     const accountLink = await stripe.accountLinks.create({
       account: club.stripeAccountId,
@@ -256,8 +321,7 @@ router.get('/:id/stripe/status', requireClubOwnerOrManager, async (req, res) => 
   }
 });
 
-// ============== 6) Scanner key: regenerar ==================
-
+/* ============ Scanner key: regenerar ============ */
 // POST /api/clubs/:id/scanner-key/regenerate
 router.post('/:id/scanner-key/regenerate', requireClubOwnerOrManager, async (req, res) => {
   try {
@@ -265,7 +329,6 @@ router.post('/:id/scanner-key/regenerate', requireClubOwnerOrManager, async (req
     if (!club) return res.status(404).json({ error: 'club_not_found' });
 
     if (!club.regenerateScannerApiKey) {
-      // por si no has pegado el método en el modelo
       club.scannerApiKey = require('crypto').randomBytes(32).toString('base64url');
       await club.save();
       return res.json({ ok: true, scannerApiKey: club.scannerApiKey });
