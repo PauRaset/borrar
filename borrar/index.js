@@ -7,6 +7,7 @@ const passport = require("passport");
 const path = require("path");
 const bodyParser = require("body-parser"); // <- para el webhook RAW
 const Stripe = require("stripe");          // <- Stripe SDK
+const clubRoutes = require('./routes/clubRoutes');
 require("dotenv").config();
 
 // ✅ Inicializa firebase-admin (solo imprime 1 línea)
@@ -490,6 +491,7 @@ app.use("/api/users", userRoutes);
 app.use("/api/events", eventRoutes);
 app.use("/search", searchRoutes);
 app.use("/api/registration", registrationRoutes); // <-- Y montado AQUÍ
+app.use("/api/clubs", clubRoutes);
 
 // ===== 404 =====
 app.use((_req, res) => res.status(404).send("Ruta no encontrada"));
