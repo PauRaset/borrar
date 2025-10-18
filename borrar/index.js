@@ -35,10 +35,18 @@ try {
   console.warn("ℹ️ models/Club no encontrado. Payouts a clubs deshabilitados.");
 }
 
+// (opcional) Modelo Event para resolver clubId a partir del eventId
+let Event = null;
+try {
+  Event = require("./models/Event"); // Debe exponer { clubId } en el evento
+} catch {
+  console.warn("ℹ️ models/Event no encontrado. Resolución de clubId por eventId limitada al body.");
+}
+
 // ============================================================================
 //   CORS — permitir clubs.nightvibe.life, previews de Vercel y FRONTEND_URL
 // ============================================================================
-const FRONTEND_URL = (process.env.FRONTEND_URL || "").replace(/\/+$/, "");
+const FRONTEND_URL = (process.env.FRONTEND_URL || "https://clubs.nightvibe.life").replace(/\/+$/, "");
 
 const staticAllowed = new Set([
   FRONTEND_URL,
@@ -76,6 +84,37 @@ app.use(
 // Responder preflight explícitamente
 app.options("*", cors());
 
+// ===== Helper: resolver clubId y cuenta destino =====
+async function resolveClubContext({ eventId, clubIdFromBody }) {
+  let clubId = clubIdFromBody || null;
+
+  // 1) Si no viene clubId y tenemos Event, lo intentamos derivar del evento
+  if (!clubId && Event && eventId) {
+    try {
+      const ev = await Event.findById(eventId).select("clubId").lean();
+      clubId = ev?.clubId ? String(ev.clubId) : null;
+    } catch (e) {
+      console.warn("⚠️ No se pudo obtener clubId desde Event:", e?.message || e);
+    }
+  }
+
+  // 2) Si tenemos Club y clubId, cargamos stripeAccountId
+  let destinationAccount = null;
+  if (Club && clubId) {
+    try {
+      const club = await Club.findById(clubId).select("stripeAccountId name").lean();
+      destinationAccount = club?.stripeAccountId || null; // acct_xxx
+      if (!destinationAccount) {
+        console.warn(`⚠️ Club ${clubId} no tiene stripeAccountId asignado.`);
+      }
+    } catch (e) {
+      console.warn("⚠️ No se pudo cargar Club:", e?.message || e);
+    }
+  }
+
+  return { clubId, destinationAccount };
+}
+
 // ===== Webhook Stripe (RAW body) — debe ir ANTES de express.json() =====
 app.post(
   "/api/webhooks/stripe",
@@ -110,7 +149,7 @@ app.post(
         const email  = sessionObj.customer_details?.email || null;
         const name   = sessionObj.customer_details?.name  || "";
         const eventId = sessionObj.metadata?.eventId || "EVT";
-        const clubId  = sessionObj.metadata?.clubId || null;
+        const clubIdMeta  = sessionObj.metadata?.clubId || null;
         const userId  = sessionObj.metadata?.userId || null;
         const phone   = sessionObj.metadata?.phone  || null;
         const paymentIntentId = sessionObj.payment_intent || null;
@@ -133,9 +172,9 @@ app.post(
           currency = (li.price?.currency || currency || "eur").toLowerCase();
         }
 
-        // 3) Opcional: recuperar PaymentIntent para capturar application_fee y destino Connect
+        // 3) Recuperar PaymentIntent para capturar application_fee y destino Connect
         let applicationFeeCents = 0;
-        let destinationAccount = null;
+        let destinationAccount = sessionObj.metadata?.destinationAccount || null;
         let chargeId = null;
         let balanceTxId = null;
 
@@ -158,6 +197,15 @@ app.post(
           } catch (e) {
             console.warn("⚠️ No se pudo expandir PaymentIntent:", e?.message || e);
           }
+        }
+
+        // 3.bis) Si aún no tuviéramos clubId, intentarlo resolver (por si el frontend no lo pasó)
+        let clubId = clubIdMeta;
+        if (!clubId && Event && eventId) {
+          try {
+            const ev = await Event.findById(eventId).select("clubId").lean();
+            clubId = ev?.clubId ? String(ev.clubId) : null;
+          } catch {}
         }
 
         // 4) Crear/actualizar Order
@@ -327,7 +375,7 @@ app.get("/test-image", (req, res) => {
 // ===== Stripe Checkout: crear orden (con validación + payouts Connect) =====
 app.post("/api/orders", async (req, res) => {
   try {
-    const { eventId, items, userId, phone, clubId } = req.body;
+    const { eventId, items, userId, phone, clubId: clubIdFromBody } = req.body;
 
     // Validaciones básicas
     if (!items || !Array.isArray(items) || items.length === 0) {
@@ -373,18 +421,15 @@ app.post("/api/orders", async (req, res) => {
     const fixed = parseInt(process.env.PLATFORM_FEE_FIXED || "0", 10); // céntimos
     const applicationFee = Math.max(0, Math.round((subtotal * bps) / 10000) + fixed);
 
-    // Intenta cargar el club para enviar el dinero a su cuenta Connect
-    let destinationAccount = null;
-    if (Club && clubId) {
-      try {
-        const club = await Club.findById(clubId).select("stripeAccountId").lean();
-        destinationAccount = club?.stripeAccountId || null; // acct_xxx
-      } catch {
-        /* noop */
-      }
-    }
+    // 🔎 Resolver clubId + destinationAccount
+    const { clubId, destinationAccount } = await resolveClubContext({
+      eventId,
+      clubIdFromBody,
+    });
 
-    const successBase = (process.env.FRONTEND_URL || "https://event-app-prod.vercel.app").replace(/\/+$/, "");
+    console.log("🧭 Checkout context => clubId:", clubId, "destinationAccount:", destinationAccount || "(none)");
+
+    const successBase = FRONTEND_URL;
 
     // Parámetros base del Checkout
     const sessionParams = {
@@ -398,7 +443,8 @@ app.post("/api/orders", async (req, res) => {
         userId: userId || "",
         phone: phone || "",
         clubId: clubId || "",
-        // Guardamos copia por comodidad para el webhook:
+
+        // Copias útiles para el webhook / debug:
         destinationAccount: destinationAccount || "",
         applicationFeeCents: String(applicationFee || 0),
       },
@@ -411,9 +457,12 @@ app.post("/api/orders", async (req, res) => {
         transfer_data: { destination: destinationAccount }, // 💸 neto al club
         application_fee_amount: applicationFee,             // 💰 tu fee
       };
+    } else {
+      console.warn("⚠️ No hay destinationAccount (acct_...). El cobro irá a tu plataforma.");
     }
 
     const session = await stripe.checkout.sessions.create(sessionParams);
+    console.log("🧾 Stripe session creada:", session.id, "dest:", destinationAccount || "(platform)");
     return res.json({ url: session.url });
   } catch (e) {
     console.error(
