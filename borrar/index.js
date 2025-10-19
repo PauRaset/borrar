@@ -43,6 +43,14 @@ try {
   console.warn("ℹ️ models/Event no encontrado. Derivación de clubId por eventId limitada.");
 }
 
+// (opcional) Modelo User para poder mapear createdBy -> email/_id
+let UserModel = null;
+try {
+  UserModel = require("./models/User");
+} catch {
+  console.warn("ℹ️ models/User no encontrado. Derivación por createdBy limitada.");
+}
+
 // ============================================================================
 //   CORS — permitir clubs.nightvibe.life, previews de Vercel y FRONTEND_URL
 // ============================================================================
@@ -362,6 +370,57 @@ function _extractClubIdFromEventDoc(ev) {
   return "";
 }
 
+async function resolveConnectedAccount({ clubId, eventId }) {
+  // 1) Si ya viene clubId explícito, intenta Club._id = clubId
+  if (clubId && Club) {
+    const club = await Club.findById(clubId).select("stripeAccountId name ownerUserId managers").lean();
+    if (club?.stripeAccountId) {
+      return { destinationAccount: club.stripeAccountId, clubId: String(club._id), reason: "clubId_direct" };
+    }
+  }
+
+  // 2) Si no, intenta derivar clubId desde el Event
+  if (EventModel && eventId) {
+    const ev = await EventModel.findById(eventId).select("createdBy clubId").lean();
+    if (ev) {
+      // a) Si Event trae clubId directo y existe Club -> usarlo
+      if (ev.clubId && Club) {
+        const c = await Club.findById(ev.clubId).select("stripeAccountId name").lean();
+        if (c?.stripeAccountId) {
+          return { destinationAccount: c.stripeAccountId, clubId: String(c._id), reason: "event.clubId" };
+        }
+      }
+
+      // b) Mapear createdBy(User) -> buscar Club por ownerUserId o managers
+      if (UserModel) {
+        try {
+          const u = await UserModel.findById(ev.createdBy).select("email").lean();
+          const email = (u?.email || "").toLowerCase();
+          const uid = _normalizeId(ev.createdBy);
+
+          if (Club) {
+            const club = await Club.findOne({
+              $or: [
+                { ownerUserId: uid },
+                { ownerUserId: email },
+                { managers: uid },
+                { managers: email },
+              ],
+            }).select("stripeAccountId name").lean();
+
+            if (club?.stripeAccountId) {
+              return { destinationAccount: club.stripeAccountId, clubId: String(club._id), reason: "match_user" };
+            }
+          }
+        } catch {}
+      }
+    }
+  }
+
+  // 3) nada encontrado
+  return { destinationAccount: null, clubId: null, reason: "not_found" };
+}
+
 // ===== Stripe Checkout: crear orden (con validación + payouts Connect) =====
 app.post("/api/orders", async (req, res) => {
   try {
@@ -411,35 +470,12 @@ app.post("/api/orders", async (req, res) => {
     const fixed = parseInt(process.env.PLATFORM_FEE_FIXED || "0", 10); // céntimos
     const applicationFee = Math.max(0, Math.round((subtotal * bps) / 10000) + fixed);
 
-    // ========== 🔎 Derivar clubId a partir del evento si no viene en el body ==========
-    if ((!clubId || String(clubId).trim() === "") && EventModel && eventId) {
-      try {
-        const ev = await EventModel.findById(eventId)
-          .select("clubId club createdBy organizerClubId ownerClubId")
-          .lean();
-        const derivedClub = _extractClubIdFromEventDoc(ev);
-        if (derivedClub) {
-          clubId = derivedClub;
-          console.log("ℹ️ clubId derivado desde Event:", clubId);
-        }
-      } catch (e) {
-        console.warn("⚠️ No se pudo derivar clubId desde Event:", e?.message || e);
-      }
-    }
+    // 🔎 Resolver cuenta Connect y clubId de forma robusta
+    const resolved = await resolveConnectedAccount({ clubId, eventId });
+    clubId = resolved.clubId || clubId || ""; // por si se resolvió distinto
+    const destinationAccount = resolved.destinationAccount;
 
-    // Intenta cargar el club para enviar el dinero a su cuenta Connect
-    let destinationAccount = null;
-    if (Club && clubId) {
-      try {
-        const club = await Club.findById(clubId).select("stripeAccountId name").lean();
-        destinationAccount = club?.stripeAccountId || null; // acct_xxx
-        console.log("ℹ️ Stripe Connect destination:", destinationAccount, "club:", club?.name || clubId);
-      } catch (e) {
-        console.warn("⚠️ No se pudo cargar Club:", e?.message || e);
-      }
-    } else {
-      console.log("ℹ️ Sin clubId -> cobro en plataforma (no Connect)");
-    }
+    console.log("🔎 resolveConnectedAccount:", resolved);
 
     const successBase = (process.env.FRONTEND_URL || "https://event-app-prod.vercel.app").replace(/\/+$/, "");
 
@@ -454,7 +490,7 @@ app.post("/api/orders", async (req, res) => {
         eventId: eventId || "",
         userId: userId || "",
         phone: phone || "",
-        clubId: clubId || "",                 // ✅ ya no se enviará vacío si existía en el Event
+        clubId: clubId || "",
         destinationAccount: destinationAccount || "",
         applicationFeeCents: String(applicationFee || 0),
       },
@@ -467,9 +503,17 @@ app.post("/api/orders", async (req, res) => {
         transfer_data: { destination: destinationAccount }, // 💸 neto al club
         application_fee_amount: applicationFee,             // 💰 tu fee
       };
+    } else {
+      console.warn("⚠️ Sin Connected Account -> el cobro irá a la cuenta plataforma");
     }
 
     const session = await stripe.checkout.sessions.create(sessionParams);
+    console.log("➡️  Created Checkout Session:", {
+      clubId,
+      destinationAccount,
+      applicationFee,
+      sessionId: session.id,
+    });
     return res.json({ url: session.url });
   } catch (e) {
     console.error(
