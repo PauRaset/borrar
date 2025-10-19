@@ -298,6 +298,60 @@ app.post(
   }
 );
 
+////////////////BORRAR LO DE SOTA
+// === DEBUG: ver estado de una Checkout Session (y su PI) ===
+app.get("/api/debug/checkout-session/:sid", async (req, res) => {
+  try {
+    const sid = req.params.sid;
+    const sess = await stripe.checkout.sessions.retrieve(sid, {
+      expand: ["payment_intent", "payment_intent.latest_charge", "payment_intent.transfer_data"],
+    });
+    res.json({
+      id: sess.id,
+      payment_status: sess.payment_status,
+      mode: sess.mode,
+      amount_total: sess.amount_total,
+      currency: sess.currency,
+      metadata: sess.metadata,
+      payment_intent: sess.payment_intent && {
+        id: sess.payment_intent.id,
+        status: sess.payment_intent.status,
+        application_fee_amount: sess.payment_intent.application_fee_amount,
+        transfer_data: sess.payment_intent.transfer_data || null,
+        latest_charge: sess.payment_intent.latest_charge && {
+          id: sess.payment_intent.latest_charge.id,
+          balance_transaction: sess.payment_intent.latest_charge.balance_transaction,
+        },
+      },
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// === DEBUG: ver PI por id (por si ya tienes el pi_...) ===
+app.get("/api/debug/payment-intent/:pi", async (req, res) => {
+  try {
+    const pi = await stripe.paymentIntents.retrieve(req.params.pi, {
+      expand: ["latest_charge", "transfer_data"],
+    });
+    res.json({
+      id: pi.id,
+      status: pi.status,
+      amount: pi.amount,
+      currency: pi.currency,
+      application_fee_amount: pi.application_fee_amount,
+      transfer_data: pi.transfer_data || null,
+      latest_charge: pi.latest_charge && {
+        id: pi.latest_charge.id,
+        balance_transaction: pi.latest_charge.balance_transaction,
+      },
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+/////////////////BORRAR LO DE SOBRE
 // ===== Parsers & estáticos =====
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
