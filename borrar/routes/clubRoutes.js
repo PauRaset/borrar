@@ -83,8 +83,7 @@ function authenticateToken(req, res, next) {
   try {
     const jwt = require('jsonwebtoken');
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    // { id, role }
-    req.user = decoded;
+    req.user = decoded; // { id, role }
     next();
   } catch (e) {
     return res.status(403).json({ message: 'Token no válido' });
@@ -111,17 +110,12 @@ async function requireClubOwnerOrManager(req, res, next) {
 /* ======================= RUTAS BASE ======================= */
 /**
  * GET /api/clubs/mine
- * Devuelve los clubs del usuario autenticado. Casamos por:
- *  - ownerUserId = user._id (string)
- *  - ownerUserId = user.email (porque en aprobación lo guardas así)
- *  - managers[] contiene user._id o user.email
  */
 router.get('/mine', authenticateToken, async (req, res) => {
   try {
     const criteria = [];
     let email = null;
 
-    // intenta obtener email del user
     if (User && req.user?.id) {
       try {
         const u = await User.findById(req.user.id).select('email').lean();
@@ -147,11 +141,6 @@ router.get('/mine', authenticateToken, async (req, res) => {
 
 /**
  * GET /api/clubs
- * Filtros:
- *  - ownerUserId (o email): exacto (puede ser id o email)
- *  - manager: valor dentro de managers (id o email)
- *  - slug: exacto
- *  - id: exacto
  */
 router.get('/', async (req, res) => {
   try {
@@ -176,7 +165,6 @@ router.get('/', async (req, res) => {
 });
 
 /* ======================= Reporting ======================= */
-// GET /api/clubs/:id/orders?from=YYYY-MM-DD&to=YYYY-MM-DD&status=paid
 router.get('/:id/orders', requireClubOwnerOrManager, async (req, res) => {
   try {
     const clubId = req.params.id;
@@ -209,7 +197,6 @@ router.get('/:id/orders', requireClubOwnerOrManager, async (req, res) => {
   }
 });
 
-// GET /api/clubs/:id/orders.csv
 router.get('/:id/orders.csv', requireClubOwnerOrManager, async (req, res) => {
   try {
     const clubId = req.params.id;
@@ -237,7 +224,6 @@ router.get('/:id/orders.csv', requireClubOwnerOrManager, async (req, res) => {
 });
 
 /* =================== Reembolso básico =================== */
-// POST /api/orders/:orderId/refund
 router.post('/orders/:orderId/refund', async (req, res) => {
   try {
     const orderId = req.params.orderId;
@@ -250,7 +236,6 @@ router.post('/orders/:orderId/refund', async (req, res) => {
     const refund = await stripe.refunds.create({
       payment_intent: order.paymentIntentId,
       // refund_application_fee: true,
-      // amount: ...
     });
 
     order.status = 'refunded';
@@ -264,32 +249,25 @@ router.post('/orders/:orderId/refund', async (req, res) => {
 });
 
 /* ============ Stripe Connect onboarding ============ */
-// POST /api/clubs/:id/stripe/onboarding
 router.post('/:id/stripe/onboarding', requireClubOwnerOrManager, async (req, res) => {
   try {
     const club = await Club.findById(req.params.id);
     if (!club) return res.status(404).json({ error: 'club_not_found' });
 
-    // 1) Crear cuenta si no existe (pide capabilities)
     if (!club.stripeAccountId) {
       const account = await stripe.accounts.create({
         type: 'express',
-        business_type: 'company', // o 'individual', según tu caso
+        business_type: 'company',
         capabilities: {
           card_payments: { requested: true },
           transfers:     { requested: true },
         },
-        // country: 'ES', // opcional si quieres forzar país
-        metadata: {
-          clubId: String(club._id),
-          clubName: club.name,
-        },
+        metadata: { clubId: String(club._id), clubName: club.name },
       });
       club.stripeAccountId = account.id;
       await club.save();
     }
 
-    // 2) Crear Account Link
     const portalBase = (process.env.CLUBS_PORTAL_URL || process.env.FRONTEND_URL || 'https://clubs.nightvibe.life').replace(/\/+$/, '');
     const accountLink = await stripe.accountLinks.create({
       account: club.stripeAccountId,
@@ -301,43 +279,34 @@ router.post('/:id/stripe/onboarding', requireClubOwnerOrManager, async (req, res
     res.json({ url: accountLink.url, accountId: club.stripeAccountId });
   } catch (e) {
     console.error('POST /clubs/:id/stripe/onboarding error:', e);
-    // Devuelve el mensaje para verlo en el front:
     res.status(500).json({ error: 'onboarding_error', message: e?.message || 'onboarding_failed' });
   }
 });
 
-// GET /api/clubs/:id/stripe/status
-router.get('/:id/stripe/status', requireClubOwnerOrManager, async (req, res) => {
+/* === NUEVO: Login Link al Dashboard de Stripe (Express) === */
+router.post('/:id/stripe/login-link', requireClubOwnerOrManager, async (req, res) => {
   try {
     const club = await Club.findById(req.params.id).lean();
     if (!club) return res.status(404).json({ error: 'club_not_found' });
     if (!club.stripeAccountId) {
-      return res.json({ connected: false, requirements: null });
+      // Si no hay cuenta, devolvemos 404 para que el front haga fallback a onboarding
+      return res.status(404).json({ error: 'no_connected_account' });
     }
 
-    const acct = await stripe.accounts.retrieve(club.stripeAccountId);
-    res.json({
-      connected: !acct.requirements?.currently_due?.length,
-      details_submitted: acct.details_submitted,
-      payouts_enabled: acct.payouts_enabled,
-      requirements: {
-        currently_due: acct.requirements?.currently_due || [],
-        eventually_due: acct.requirements?.eventually_due || [],
-        disabled_reason: acct.requirements?.disabled_reason || null,
-      },
+    const portalBase = (process.env.CLUBS_PORTAL_URL || process.env.FRONTEND_URL || 'https://clubs.nightvibe.life').replace(/\/+$/, '');
+    const link = await stripe.accounts.createLoginLink(club.stripeAccountId, {
+      redirect_url: `${portalBase}/dashboard?club=${club._id}&from=stripe`,
     });
+
+    return res.json({ url: link.url });
   } catch (e) {
-    console.error('GET /clubs/:id/stripe/status error:', e);
-    res.status(500).json({ error: 'status_error', message: e?.message || 'status_failed' });
+    console.error('POST /clubs/:id/stripe/login-link error:', e);
+    // Si falla por requisitos pendientes, el front hará fallback a onboarding
+    return res.status(500).json({ error: 'login_link_error', message: e?.message || 'failed' });
   }
 });
 
-/* ======== NUEVO: Resumen de Stripe para el dashboard ======== */
-/**
- * GET /api/clubs/:id/stripe/summary?days=30
- * Devuelve totales de cobros (bruto, fees y neto) y número de transacciones
- * para los últimos `days` días en la cuenta Connect del club.
- */
+/* ======== Resumen de Stripe para el dashboard ======== */
 router.get('/:id/stripe/summary', requireClubOwnerOrManager, async (req, res) => {
   try {
     const club = await Club.findById(req.params.id).lean();
@@ -349,7 +318,6 @@ router.get('/:id/stripe/summary', requireClubOwnerOrManager, async (req, res) =>
     const days = Math.max(1, parseInt(req.query.days || '30', 10));
     const since = Math.floor((Date.now() - days * 24 * 60 * 60 * 1000) / 1000);
 
-    // Balance transactions trae amount/fee/net listos
     const txns = await stripe.balanceTransactions.list(
       { limit: 100, created: { gte: since }, type: 'charge' },
       { stripeAccount: club.stripeAccountId }
@@ -376,7 +344,6 @@ router.get('/:id/stripe/summary', requireClubOwnerOrManager, async (req, res) =>
 });
 
 /* ============ Scanner key: regenerar ============ */
-// POST /api/clubs/:id/scanner-key/regenerate
 router.post('/:id/scanner-key/regenerate', requireClubOwnerOrManager, async (req, res) => {
   try {
     const club = await Club.findById(req.params.id);
@@ -397,6 +364,7 @@ router.post('/:id/scanner-key/regenerate', requireClubOwnerOrManager, async (req
 });
 
 module.exports = router;
+
 
 /*// routes/clubRoutes.js
 const express = require('express');
@@ -492,7 +460,7 @@ function authenticateToken(req, res, next) {
 }
 
 // (Opcional) Middleware mínimo para asegurar acceso del dueño.
-//   De momento sigue permisivo para no romper flujos. 
+ //  De momento sigue permisivo para no romper flujos. 
 async function requireClubOwnerOrManager(req, res, next) {
   try {
     const clubId = req.params.id;
@@ -508,7 +476,7 @@ async function requireClubOwnerOrManager(req, res, next) {
   }
 }
 
-// ======================= NUEVAS RUTAS BASE ======================= 
+// ======================= RUTAS BASE ======================= 
 
 router.get('/mine', authenticateToken, async (req, res) => {
   try {
@@ -538,7 +506,6 @@ router.get('/mine', authenticateToken, async (req, res) => {
     return res.status(500).json({ message: 'Error al obtener tus clubs' });
   }
 });
-
 
 router.get('/', async (req, res) => {
   try {
@@ -719,6 +686,44 @@ router.get('/:id/stripe/status', requireClubOwnerOrManager, async (req, res) => 
   }
 });
 
+// ======== NUEVO: Resumen de Stripe para el dashboard ======== 
+router.get('/:id/stripe/summary', requireClubOwnerOrManager, async (req, res) => {
+  try {
+    const club = await Club.findById(req.params.id).lean();
+    if (!club) return res.status(404).json({ error: 'club_not_found' });
+    if (!club.stripeAccountId) {
+      return res.json({ connected: false, totals: null });
+    }
+
+    const days = Math.max(1, parseInt(req.query.days || '30', 10));
+    const since = Math.floor((Date.now() - days * 24 * 60 * 60 * 1000) / 1000);
+
+    // Balance transactions trae amount/fee/net listos
+    const txns = await stripe.balanceTransactions.list(
+      { limit: 100, created: { gte: since }, type: 'charge' },
+      { stripeAccount: club.stripeAccountId }
+    );
+
+    let gross = 0, fees = 0, net = 0, count = 0;
+    for (const t of txns.data) {
+      gross += t.amount || 0;
+      fees  += Math.abs(t.fee || 0);
+      net   += t.net || 0;
+      count++;
+    }
+
+    res.json({
+      connected: true,
+      days,
+      currency: (txns.data[0]?.currency || 'eur').toLowerCase(),
+      totals: { gross, fees, net, count }
+    });
+  } catch (e) {
+    console.error('GET /clubs/:id/stripe/summary error:', e);
+    res.status(500).json({ error: 'summary_error', message: e?.message || 'failed' });
+  }
+});
+
 // ============ Scanner key: regenerar ============ 
 // POST /api/clubs/:id/scanner-key/regenerate
 router.post('/:id/scanner-key/regenerate', requireClubOwnerOrManager, async (req, res) => {
@@ -740,4 +745,5 @@ router.post('/:id/scanner-key/regenerate', requireClubOwnerOrManager, async (req
   }
 });
 
-module.exports = router;*/
+module.exports = router;
+*/
