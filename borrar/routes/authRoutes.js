@@ -240,6 +240,25 @@ router.post("/reset", async (req, res) => {
 });
 
 /* -------- Intercambio Firebase -> JWT propio -------- */
+// Permite a la app intercambiar un Firebase ID token por tu JWT legacy
+// Headers: Authorization: Bearer <FirebaseIdToken>
+router.post(
+  "/exchangeFirebase",
+  verifyFirebaseIdToken, // setea req.firebaseUser
+  ensureUserId,          // garantiza req.user.id
+  async (req, res) => {
+    try {
+      const user = await User.findById(req.user.id);
+      if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
+      const token = issueSessionToken(user);
+      return res.json({ token });
+    } catch (e) {
+      console.error("[POST /api/auth/exchangeFirebase]", e);
+      return res.status(500).json({ message: "Error en el servidor" });
+    }
+  }
+);
+
 router.post("/firebase", authController.firebaseLogin);
 
 /* -------- Facebook (spectators) mediante Passport -------- */
@@ -263,7 +282,8 @@ router.get("/profile", authenticateToken, authController.getProfile);
 /* -------- Subir/actualizar foto de perfil -------- */
 router.post(
   "/uploadProfilePicture",
-  authenticateToken,
+  anyAuth,
+  ensureUserId,
   multer.single("profilePicture"),
   async (req, res) => {
     try {
@@ -288,7 +308,7 @@ router.post(
 );
 
 /* -------- Actualizar datos del usuario autenticado -------- */
-router.put("/update", authenticateToken, async (req, res) => {
+router.put("/update", anyAuth, ensureUserId, async (req, res) => {
   try {
     const { username, email, entityName } = req.body;
     const user = await User.findById(req.user.id);
