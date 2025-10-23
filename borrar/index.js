@@ -14,6 +14,11 @@ const clubRoutes = require("./routes/clubRoutes");
 require("./middlewares/firebaseAdmin");
 
 const app = express();
+// Si estamos detrás de un proxy (Vercel/NGINX), esto permite que la cookie `secure`
+// funcione correctamente en producción.
+if (process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', 1);
+}
 
 // ===== Stripe =====
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -91,6 +96,13 @@ app.use(
 );
 // Responder preflight explícitamente
 app.options("*", cors());
+// Captura errores de CORS y responde JSON en lugar de romper la petición
+app.use((err, _req, res, next) => {
+  if (err && /CORS no permitido/.test(String(err.message || ''))) {
+    return res.status(403).json({ error: 'cors_blocked', message: err.message });
+  }
+  return next(err);
+});
 
 // ===== Webhook Stripe (RAW body) — debe ir ANTES de express.json() =====
 app.post(
@@ -354,6 +366,13 @@ app.get("/api/debug/payment-intent/:pi", async (req, res) => {
 // ===== Parsers & estáticos =====
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+// Si el JSON viene malformado devolvemos 400 en vez de 500
+app.use((err, _req, res, next) => {
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'bad_json', message: 'JSON inválido' });
+  }
+  return next(err);
+});
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 // ===== Sesiones =====
@@ -386,6 +405,13 @@ mongoose
 
 // ===== Rutas base =====
 app.get("/", (_req, res) => res.send("¡Servidor funcionando correctamente!"));
+// Healthchecks
+app.get('/api/health', (_req, res) => res.json({ ok: true }));
+app.get('/api/version', (_req, res) => res.json({
+  node: process.version,
+  env: process.env.NODE_ENV || 'development',
+  uptime: process.uptime(),
+}));
 app.get("/test-image", (req, res) => {
   const base = (
     process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`
@@ -750,7 +776,6 @@ app.listen(PORT, () => {
 
 module.exports = app;
 
-
 /*// index.js (entrypoint)
 require("dotenv").config();
 const express = require("express");
@@ -1051,7 +1076,6 @@ app.post(
   }
 );
 
-////////////////BORRAR LO DE SOTA
 // === DEBUG: ver estado de una Checkout Session (y su PI) ===
 app.get("/api/debug/checkout-session/:sid", async (req, res) => {
   try {
@@ -1104,7 +1128,7 @@ app.get("/api/debug/payment-intent/:pi", async (req, res) => {
     res.status(400).json({ error: e.message });
   }
 });
-/////////////////BORRAR LO DE SOBRE
+
 // ===== Parsers & estáticos =====
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -1337,6 +1361,35 @@ app.post("/api/orders", async (req, res) => {
   }
 });
 
+// ========= NUEVO: endpoints de lectura de órdenes para el front ========= 
+// GET /api/orders/by-session/:sid  -> usado por /purchase/success
+app.get("/api/orders/by-session/:sid", async (req, res) => {
+  try {
+    const sid = decodeURIComponent(req.params.sid || "");
+    if (!sid) return res.status(400).json({ error: "missing_sid" });
+
+    const order = await Order.findOne({ stripeSessionId: sid }).lean();
+    if (!order) return res.status(404).json({ error: "order_not_found" });
+
+    return res.json({ order });
+  } catch (e) {
+    console.error("GET /api/orders/by-session error:", e);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// (Opcional) GET /api/orders/:id  -> por si alguna vez lo necesitas
+app.get("/api/orders/:id", async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id).lean();
+    if (!order) return res.status(404).json({ error: "order_not_found" });
+    return res.json({ order });
+  } catch (e) {
+    console.error("GET /api/orders/:id error:", e);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
 // ===== Check-in de tickets (escáner) =====
 app.post("/api/checkin", async (req, res) => {
   try {
@@ -1398,7 +1451,7 @@ app.post("/api/checkin", async (req, res) => {
           buyerEmail = ord.email || "";
         }
       }
-    } catch { }
+    } catch {  }
 
     if (found.status === "checked_in") {
       await CheckInLog.create({
@@ -1473,4 +1526,5 @@ app.listen(PORT, () => {
   console.log(`✨ Servidor corriendo en el puerto ${PORT}`);
 });
 
-module.exports = app;*/
+module.exports = app;
+*/
