@@ -1,5 +1,6 @@
 // middlewares/authMiddleware.js
 const jwt = require('jsonwebtoken');
+const admin = require('./firebaseAdmin');
 
 /**
  * Intenta extraer el JWT del request:
@@ -27,6 +28,76 @@ function extractJwtFromRequest(req) {
   if (req.query?.token) return String(req.query.token);
 
   return null;
+}
+
+// Extrae un Bearer token del header Authorization (pensado para Firebase ID token)
+function extractBearerFromHeader(req) {
+  const h = req.headers?.authorization || req.headers?.Authorization || '';
+  if (typeof h === 'string' && h.startsWith('Bearer ')) return h.slice(7).trim();
+  return null;
+}
+
+// Intenta verificar el JWT "propio" (legacy) sin responder aún (para usar dentro de anyAuth)
+function tryDecodeLegacyJwt(req) {
+  const token = extractJwtFromRequest(req);
+  if (!token) return null;
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const id = decoded.id ?? decoded._id ?? decoded.userId ?? decoded.sub ?? decoded.uid;
+    if (!id) return null;
+    return { ...decoded, id: String(id) };
+  } catch (_) {
+    return null;
+  }
+}
+
+// Verifica Firebase ID token. Si es válido, deja req.firebaseUser y opcionalmente req.user.id
+async function verifyFirebaseIdToken(req, res, next) {
+  try {
+    const idToken = extractBearerFromHeader(req);
+    if (!idToken) return res.status(401).json({ message: 'No autorizado' });
+
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    req.firebaseUser = decoded; // uid, phone_number, etc.
+    // No pisamos req.user si ya está; si no, mapeamos id para compatibilidad
+    if (!req.user) {
+      req.user = { id: String(decoded.uid) };
+    }
+    return next();
+  } catch (error) {
+    console.error('[authMiddleware] Firebase token inválido:', error?.message || error);
+    return res.status(403).json({ message: 'Token no válido' });
+  }
+}
+
+// Middleware híbrido: acepta JWT legacy o Firebase ID token
+async function anyAuth(req, res, next) {
+  // 1) Intenta JWT propio
+  const legacy = tryDecodeLegacyJwt(req);
+  if (legacy && legacy.id) {
+    req.user = legacy;
+    return next();
+  }
+  // 2) Si no hay JWT válido, intenta Firebase
+  try {
+    const idToken = extractBearerFromHeader(req);
+    if (!idToken) return res.status(401).json({ message: 'No autorizado' });
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    req.firebaseUser = decoded;
+    req.user = req.user || { id: String(decoded.uid) };
+    return next();
+  } catch (error) {
+    console.error('[authMiddleware:anyAuth] No autorizado:', error?.message || error);
+    return res.status(403).json({ message: 'Token no válido' });
+  }
+}
+
+// Garantiza que exista req.user.id (string). Si no, intenta mapear desde Firebase.
+function ensureUserId(req, res, next) {
+  const id = req.user?.id || req.user?.userId || req.firebaseUser?.uid;
+  if (!id) return res.status(401).json({ message: 'No autorizado' });
+  req.user = { ...(req.user || {}), id: String(id) };
+  return next();
 }
 
 // Middleware para verificar tu JWT "propio"
@@ -61,4 +132,10 @@ const authenticateToken = (req, res, next) => {
   }
 };
 
+// Export por compatibilidad (default = authenticateToken) + nombrados
 module.exports = authenticateToken;
+module.exports.authenticateToken = authenticateToken;
+module.exports.extractJwtFromRequest = extractJwtFromRequest;
+module.exports.verifyFirebaseIdToken = verifyFirebaseIdToken;
+module.exports.anyAuth = anyAuth;
+module.exports.ensureUserId = ensureUserId;
