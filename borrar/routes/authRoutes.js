@@ -8,7 +8,12 @@ const User = require("../models/User");
 const Event = require("../models/Event"); // <- para /me/attending
 const multer = require("../uploads/multerConfig"); // si lo usas así
 const authController = require("../controllers/authController");
-const { verifyFirebaseIdToken } = require("../middlewares/firebaseAdmin"); // <- para aceptar ID token de Firebase
+const {
+  anyAuth,
+  ensureUserId,
+  verifyFirebaseIdToken,
+  authenticateToken
+} = require("../middlewares/authMiddleware");
 const sendSimpleEmail = require("../utils/sendSimpleEmail");
 
 /* ===================== Helpers ===================== */
