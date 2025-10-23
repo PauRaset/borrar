@@ -19,6 +19,9 @@ const userSchema = new mongoose.Schema(
     entityName: { type: String, default: "" }, // nombre visible actual
     wUser: { type: String, default: "" }, // si lo usas
     profilePicture: { type: String, default: "" },
+    instagram: { type: String, default: "" },
+    bio: { type: String, default: "" },
+    isPrivate: { type: Boolean, default: false },
 
     role: { type: String, enum: ["club", "spectator"], default: "club" },
 
@@ -76,7 +79,19 @@ userSchema
     this.password = v;
   });
 
+// Índices útiles
+userSchema.index({ phoneNumber: 1 });
+userSchema.index({ firebaseUid: 1 });
+userSchema.index({ instagram: 1 });
+
 /* ----------------------------- Hooks & helpers ---------------------------- */
+
+function onlyUploadPath(input) {
+  if (!input || typeof input !== 'string') return input;
+  const i = input.indexOf('/uploads/');
+  if (i !== -1) return input.slice(i); // mantiene desde /uploads/...
+  return input; // ya es relativo o viene con otro formato (respetar)
+}
 
 // Normaliza email y sincroniza entityName <-> entName
 userSchema.pre("save", function (next) {
@@ -85,6 +100,10 @@ userSchema.pre("save", function (next) {
   // Sincronía nombres
   if (!this.entityName && this.entName) this.entityName = this.entName;
   if (this.entityName && !this.entName) this.entName = this.entityName;
+
+  if (this.profilePicture) {
+    this.profilePicture = onlyUploadPath(this.profilePicture.trim());
+  }
 
   next();
 });
@@ -180,19 +199,23 @@ const userSchema = new mongoose.Schema(
   {
     // ---- Identidad básica (mantengo lo que ya tenías) ----
     username: { type: String, required: true, trim: true },
-    email:    { type: String, unique: true, sparse: true }, // no required para permitir alta por teléfono
-    password: { type: String }, // opcional si el usuario entra por Firebase
+
+    // email no requerido para permitir alta por teléfono/Firebase
+    email: { type: String, unique: true, sparse: true },
+
+    // Guardamos SIEMPRE el hash aquí (nunca texto plano).
+    // Nota: añadimos un virtual "passwordHash" para compatibilidad.
+    password: { type: String },
 
     // Campos existentes en tu app (según capturas)
-    // Back-compat: antes usabas "entName"; el frontend muestra "entityName".
-    entName:     { type: String, default: "" }, // legado / compat
-    entityName:  { type: String, default: "" }, // nombre visible actual
-    wUser:       { type: String, default: "" }, // si lo usas
+    entName: { type: String, default: "" }, // legado / compat
+    entityName: { type: String, default: "" }, // nombre visible actual
+    wUser: { type: String, default: "" }, // si lo usas
     profilePicture: { type: String, default: "" },
 
     role: { type: String, enum: ["club", "spectator"], default: "club" },
 
-    facebookId:  { type: String, unique: true, sparse: true },
+    facebookId: { type: String, unique: true, sparse: true },
     instagramId: { type: String, unique: true, sparse: true },
 
     // ---- Integración Firebase ----
@@ -200,7 +223,7 @@ const userSchema = new mongoose.Schema(
       type: String,
       index: true,
       unique: true,
-      sparse: true, // permite muchos docs sin este campo
+      sparse: true,
     },
     phoneNumber: {
       type: String,
@@ -208,34 +231,61 @@ const userSchema = new mongoose.Schema(
       unique: true,
       sparse: true,
     },
+
+    // ---- Reset / creación de contraseña (nuevo) ----
+    resetPasswordToken: { type: String, index: true },
+    resetPasswordExpires: { type: Date },
   },
   {
     timestamps: true,
     toJSON: {
       virtuals: true,
       transform: (_doc, ret) => {
+        // No exponer datos sensibles
+        delete ret.password;
+        delete ret.resetPasswordToken;
+        delete ret.resetPasswordExpires;
+
         // Exponer siempre entityName para el frontend
         if (!ret.entityName && ret.entName) ret.entityName = ret.entName;
+
         return ret;
       },
     },
   }
 );
 
-// ----------------------------- Hooks & helpers ---------------------------- 
 
-// Sincroniza entityName <-> entName para mantener compatibilidad
+userSchema
+  .virtual("passwordHash")
+  .get(function () {
+    return this.password;
+  })
+  .set(function (v) {
+    this.password = v;
+  });
+
+
+// Normaliza email y sincroniza entityName <-> entName
 userSchema.pre("save", function (next) {
-  // Si sólo está rellenado entName, propagar a entityName
+  if (this.email) this.email = this.email.toLowerCase().trim();
+
+  // Sincronía nombres
   if (!this.entityName && this.entName) this.entityName = this.entName;
-  // Si sólo está entityName y entName está vacío, lo mantenemos sincronizado
   if (this.entityName && !this.entName) this.entName = this.entityName;
+
   next();
 });
 
-// Encripta la contraseña SOLO si existe y cambió
+// Encripta la contraseña SOLO si existe y cambió.
+// Si ya parece un hash bcrypt ($2a/$2b/$2y...), no re-hashear.
 userSchema.pre("save", async function (next) {
   if (!this.isModified("password") || !this.password) return next();
+
+  const looksHashed =
+    typeof this.password === "string" && /^\$2[aby]\$/.test(this.password);
+  if (looksHashed) return next();
+
   try {
     const salt = await bcrypt.genSalt(10);
     this.password = await bcrypt.hash(this.password, salt);
@@ -245,10 +295,17 @@ userSchema.pre("save", async function (next) {
   }
 });
 
-// Comparar contraseñas cuando exista password local
+// Comparar contraseñas cuando exista password local (bcrypt)
 userSchema.methods.matchPassword = async function (enteredPassword) {
   if (!this.password) return false;
   return bcrypt.compare(enteredPassword, this.password);
+};
+
+// Fijar contraseña programáticamente (hashea y asigna)
+userSchema.methods.setPassword = async function (plain) {
+  const salt = await bcrypt.genSalt(10);
+  this.password = await bcrypt.hash(plain, salt);
+  return this.password;
 };
 
 // Helper: crear/actualizar desde datos verificados de Firebase
@@ -277,7 +334,6 @@ userSchema.statics.findOrCreateFromFirebase = async function ({
       phoneNumber: phoneNumber || undefined,
       username: usernameBase,
       profilePicture: photoURL || "",
-      // role usa el default "club" (ajústalo si prefieres "spectator")
       role: "spectator",
       // email opcional; si quieres forzar único sintético:
       email: uid ? `${uid}@firebase.local` : undefined,
