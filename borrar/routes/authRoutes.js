@@ -243,15 +243,48 @@ router.post(
 /* -------- Actualizar datos del usuario autenticado -------- */
 router.put("/update", anyAuth, ensureUserId, async (req, res) => {
   try {
-    const { username, email, entityName } = req.body;
+    const {
+      username,
+      email,
+      entityName,
+      profilePicture,
+      instagram,
+      bio,
+      isPrivate,
+    } = req.body || {};
+
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
 
-    if (username) user.username = username;
-    if (email) user.email = cleanEmail(email);
-    if (entityName) {
-      user.entName = entityName;
-      user.entityName = entityName;
+    // Campos legacy (clubs)
+    if (typeof username === 'string' && username.trim()) user.username = username.trim();
+    if (typeof email === 'string' && email.trim()) user.email = cleanEmail(email);
+    if (typeof entityName === 'string' && entityName.trim()) {
+      user.entName = entityName.trim();
+      user.entityName = entityName.trim();
+    }
+
+    // Quitar foto de perfil si viene cadena vacía
+    if (typeof profilePicture === 'string' && profilePicture.trim() === '') {
+      user.profilePicture = '';
+    }
+
+    // Instagram: normalizar a URL https; permitir "@usuario"
+    if (typeof instagram === 'string') {
+      let val = instagram.trim();
+      if (val.startsWith('@')) val = `https://instagram.com/${val.slice(1)}`;
+      if (val && !/^https?:\/\//i.test(val)) val = `https://${val}`;
+      user.instagram = val;
+    }
+
+    // Bio: texto libre controlado por cliente
+    if (typeof bio === 'string') {
+      user.bio = bio;
+    }
+
+    // isPrivate: booleano
+    if (typeof isPrivate !== 'undefined') {
+      user.isPrivate = Boolean(isPrivate);
     }
 
     await user.save();
@@ -269,6 +302,36 @@ router.get("/protected", authenticateToken, authorizeRole(["club"]), (req, res) 
 
 /* -------- Mis eventos donde asisto (acepta Firebase o tu JWT) -------- */
 router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const events = await Event.find({ attendees: req.user.id })
+      .sort({ date: 1 })
+      .populate("createdBy", "username email profilePicture")
+      .lean();
+
+    const formatted = events.map((ev) => ({
+      ...ev,
+      categories: Array.isArray(ev.categories)
+        ? ev.categories
+        : typeof ev.categories === "string"
+        ? (() => {
+            try {
+              return JSON.parse(ev.categories);
+            } catch {
+              return [];
+            }
+          })()
+        : [],
+    }));
+
+    res.json(formatted);
+  } catch (err) {
+    console.error("[GET /users/me/attending] error:", err);
+    res.status(500).json({ message: "Error al obtener tus eventos" });
+  }
+});
+
+/* -------- Alias: Mis eventos donde asisto (para cliente móvil) -------- */
+router.get("/users/me/attending", anyAuth, ensureUserId, async (req, res) => {
   try {
     const events = await Event.find({ attendees: req.user.id })
       .sort({ date: 1 })
