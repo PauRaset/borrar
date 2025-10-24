@@ -177,12 +177,25 @@ router.post("/reset", async (req, res) => {
 // Headers: Authorization: Bearer <FirebaseIdToken>
 router.post(
   "/exchangeFirebase",
-  verifyFirebaseIdToken, // setea req.firebaseUser
-  ensureUserId,          // garantiza req.user.id
+  anyAuth,       // acepta JWT propio o Firebase ID token
+  ensureUserId,  // garantiza req.user.id (si viene Firebase, usa uid)
   async (req, res) => {
     try {
-      const user = await User.findById(req.user.id);
+      let user = await User.findById(req.user.id);
+
+      // Si no existe y venimos con Firebase, crea espectador mínimo
+      if (!user && req.firebaseUser && req.firebaseUser.uid) {
+        const phone = req.firebaseUser.phone_number || "";
+        const username = phone ? `user_${phone.replace(/\D/g, '').slice(-6)}` : `user_${Date.now()}`;
+        user = await User.create({
+          username,
+          phoneNumber: phone,
+          role: "spectator",
+        });
+      }
+
       if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
+
       const token = issueSessionToken(user);
       return res.json({ token });
     } catch (e) {
@@ -325,7 +338,7 @@ router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
 
     res.json(formatted);
   } catch (err) {
-    console.error("[GET /users/me/attending] error:", err);
+    console.error("[GET /me/attending] error:", err);
     res.status(500).json({ message: "Error al obtener tus eventos" });
   }
 });
