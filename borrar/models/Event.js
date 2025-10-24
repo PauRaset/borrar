@@ -74,6 +74,14 @@ function isHex24(s) {
   return typeof s === "string" && /^[a-fA-F0-9]{24}$/.test(s);
 }
 
+/** Normaliza rutas de uploads: si viene URL absoluta, recorta desde /uploads/... */
+function onlyUploadPath(input) {
+  if (!input || typeof input !== 'string') return input;
+  const i = input.indexOf('/uploads/');
+  if (i !== -1) return input.slice(i);
+  return input;
+}
+
 /**
  * Normalizaciones antes de guardar:
  * - Fechas: convertir a Date y usar date → startAt si hace falta.
@@ -107,12 +115,46 @@ eventSchema.pre("save", function (next) {
     this.club = new mongoose.Types.ObjectId(this.clubId);
   }
 
+  // Normalizar imagen principal a ruta relativa
+  if (this.image) {
+    this.image = onlyUploadPath(String(this.image).trim());
+  }
+
+  // Normalizar galería (acepta strings o objetos)
+  if (Array.isArray(this.photos)) {
+    this.photos = this.photos.map((p) => {
+      if (typeof p === 'string') {
+        return { url: onlyUploadPath(p) };
+      }
+      if (p && typeof p === 'object') {
+        const copy = { ...p };
+        if (copy.url) copy.url = onlyUploadPath(String(copy.url));
+        return copy;
+      }
+      return p;
+    });
+  }
+
+  // Normalizar categorías: si viene string JSON o "a,b,c"
+  if (typeof this.categories === 'string') {
+    const raw = this.categories.trim();
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) this.categories = parsed.map(String);
+    } catch (_) {
+      this.categories = raw
+        ? raw.split(',').map((s) => s.trim()).filter(Boolean)
+        : [];
+    }
+  }
+
   next();
 });
 
 /** Índices compuestos útiles */
 eventSchema.index({ clubId: 1, startAt: -1 });
 eventSchema.index({ "createdBy": 1, startAt: -1 });
+eventSchema.index({ attendees: 1, startAt: -1 });
 
 module.exports = mongoose.model("Event", eventSchema);
 
