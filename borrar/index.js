@@ -10,8 +10,9 @@ const bodyParser = require("body-parser"); // <- para el webhook RAW
 const Stripe = require("stripe");          // <- Stripe SDK
 const clubRoutes = require("./routes/clubRoutes");
 
-// ✅ Inicializa firebase-admin (solo imprime 1 línea)
-require("./middlewares/firebaseAdmin");
+// ✅ Inicializa firebase-admin y loguea el project_id para depurar 403
+const admin = require("./middlewares/firebaseAdmin");
+console.log("firebase-admin project:", admin.app().options.credential?.projectId || process.env.FIREBASE_PROJECT_ID || "(desconocido)");
 
 const app = express();
 // Si estamos detrás de un proxy (Vercel/NGINX), esto permite que la cookie `secure`
@@ -412,6 +413,21 @@ app.get('/api/version', (_req, res) => res.json({
   env: process.env.NODE_ENV || 'development',
   uptime: process.uptime(),
 }));
+
+// ===== DEBUG Firebase: verifica un ID token (solo en desarrollo) =====
+if (process.env.NODE_ENV !== 'production') {
+  app.get('/api/debug/verify-token', async (req, res) => {
+    try {
+      const h = req.headers.authorization || '';
+      const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+      if (!token) return res.status(400).json({ ok: false, error: 'missing_bearer' });
+      const decoded = await admin.auth().verifyIdToken(token);
+      return res.json({ ok: true, uid: decoded.uid, projectId: admin.app().options.credential?.projectId || null });
+    } catch (e) {
+      return res.status(403).json({ ok: false, error: e?.errorInfo?.code || e?.message || 'verify_failed' });
+    }
+  });
+}
 app.get("/test-image", (req, res) => {
   const base = (
     process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`
