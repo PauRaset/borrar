@@ -1,74 +1,77 @@
+// middlewares/firebaseAdmin.js
+// Inicializa Firebase Admin como singleton con projectId explícito.
+
 const admin = require('firebase-admin');
 const fs = require('fs');
 const path = require('path');
 
 function normalizePrivateKey(key) {
   if (!key) return key;
-  // Permite poner la clave con \n en .env sin romper
   return key.replace(/\\n/g, '\n');
 }
 
-function fileExists(p) {
-  try { return !!p && fs.existsSync(p); } catch { return false; }
+function readJson(p) {
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch (e) {
+    console.error('[firebaseAdmin] No se pudo leer JSON en', p, e.message);
+    return null;
+  }
 }
 
-function loadCredential() {
-  const {
-    FIREBASE_SERVICE_ACCOUNT_JSON,     // JSON stringificado completo
-    FIREBASE_SERVICE_ACCOUNT_PATH,     // ruta a JSON
-    GOOGLE_APPLICATION_CREDENTIALS,    // ruta a JSON (estándar de Google)
-    FIREBASE_PROJECT_ID,
-    FIREBASE_CLIENT_EMAIL,
-    FIREBASE_PRIVATE_KEY,
-  } = process.env;
+function loadCredentialAndProject() {
+  const env = process.env;
 
-  // 1) JSON stringificado en .env
-  if (FIREBASE_SERVICE_ACCOUNT_JSON) {
+  // 1) JSON stringificado en env
+  if (env.FIREBASE_SERVICE_ACCOUNT_JSON) {
     try {
-      const json = JSON.parse(FIREBASE_SERVICE_ACCOUNT_JSON);
+      const json = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON);
       if (json.private_key) json.private_key = normalizePrivateKey(json.private_key);
-      return admin.credential.cert(json);
+      return { credential: admin.credential.cert(json), projectId: json.project_id };
     } catch (e) {
       console.error('[firebaseAdmin] FIREBASE_SERVICE_ACCOUNT_JSON inválido:', e.message);
     }
   }
 
-  // 2) Ruta en .env (cualquiera de las dos variables)
-  const jsonPath = FIREBASE_SERVICE_ACCOUNT_PATH || GOOGLE_APPLICATION_CREDENTIALS;
-  if (fileExists(jsonPath)) {
-    try {
-      const json = require(path.resolve(jsonPath));
-      return admin.credential.cert(json);
-    } catch (e) {
-      console.error(`[firebaseAdmin] No se pudo leer el JSON en ${jsonPath}:`, e.message);
+  // 2) Ruta a JSON en env
+  const jsonPath = env.FIREBASE_SERVICE_ACCOUNT_PATH || env.GOOGLE_APPLICATION_CREDENTIALS;
+  if (jsonPath && fs.existsSync(jsonPath)) {
+    const json = readJson(path.resolve(jsonPath));
+    if (json) {
+      return { credential: admin.credential.cert(json), projectId: json.project_id };
     }
   }
 
-  // 3) Trio de variables sueltas en .env
-  if (FIREBASE_PROJECT_ID && FIREBASE_CLIENT_EMAIL && FIREBASE_PRIVATE_KEY) {
-    return admin.credential.cert({
-      project_id: FIREBASE_PROJECT_ID,
-      client_email: FIREBASE_CLIENT_EMAIL,
-      private_key: normalizePrivateKey(FIREBASE_PRIVATE_KEY),
-    });
+  // 3) Trío de variables sueltas
+  if (env.FIREBASE_PROJECT_ID && env.FIREBASE_CLIENT_EMAIL && env.FIREBASE_PRIVATE_KEY) {
+    return {
+      credential: admin.credential.cert({
+        project_id: env.FIREBASE_PROJECT_ID,
+        client_email: env.FIREBASE_CLIENT_EMAIL,
+        private_key: normalizePrivateKey(env.FIREBASE_PRIVATE_KEY),
+      }),
+      projectId: env.FIREBASE_PROJECT_ID,
+    };
   }
 
-  // 4) Fallback: application default credentials (GCE/Cloud Run/etc.)
+  // 4) Fallback ADC (GCE/Cloud Run)
   try {
-    return admin.credential.applicationDefault();
+    const cred = admin.credential.applicationDefault();
+    const projectId = env.GCLOUD_PROJECT || env.GOOGLE_CLOUD_PROJECT || env.FIREBASE_PROJECT_ID || null;
+    return { credential: cred, projectId };
   } catch (e) {
-    console.error('[firebaseAdmin] No hay credenciales configuradas:', e.message);
-    return null;
+    console.error('[firebaseAdmin] Sin credenciales:', e.message);
+    return { credential: null, projectId: null };
   }
 }
 
 if (!admin.apps.length) {
-  const credential = loadCredential();
-  if (!credential) {
-    throw new Error('[firebaseAdmin] Falta configurar credenciales. Define FIREBASE_SERVICE_ACCOUNT_JSON o FIREBASE_SERVICE_ACCOUNT_PATH/GOOGLE_APPLICATION_CREDENTIALS o el trío FIREBASE_PROJECT_ID/FIREBASE_CLIENT_EMAIL/FIREBASE_PRIVATE_KEY');
-  }
-  admin.initializeApp({ credential });
-  console.log('✅ firebase-admin inicializado');
+  const { credential, projectId } = loadCredentialAndProject();
+  if (!credential) throw new Error('[firebaseAdmin] Falta configurar credenciales');
+
+  // Forzamos projectId explícito para evitar "Unable to detect a Project Id..."
+  admin.initializeApp({ credential, projectId });
+  console.log('✅ firebase-admin inicializado – projectId =', projectId || '(desconocido)');
 }
 
 module.exports = admin;
