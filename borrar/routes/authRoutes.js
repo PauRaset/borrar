@@ -15,6 +15,37 @@ const {
   verifyFirebaseIdToken,
 } = require("../middlewares/authMiddleware");
 
+const mongoose = require("mongoose");
+const { Types: { ObjectId } } = mongoose;
+
+function isValidObjectId(v) {
+  return typeof v === "string" && ObjectId.isValid(v) && (new ObjectId(v)).toString() === v;
+}
+
+async function resolveUserFromRequest(req) {
+  // 1) JWT legacy con ObjectId válido
+  if (req.user && req.user.id && isValidObjectId(req.user.id)) {
+    const u = await User.findById(req.user.id);
+    if (u) return u;
+  }
+  // 2) Firebase: por firebaseUid o por teléfono
+  const fu = req.firebaseUser;
+  if (fu && fu.uid) {
+    let u = await User.findOne({ firebaseUid: fu.uid });
+    if (u) return u;
+    if (fu.phone_number) {
+      u = await User.findOne({ phoneNumber: fu.phone_number });
+      if (u) return u;
+    }
+  }
+  // 3) JWT con id no-ObjectId: probar como firebaseUid
+  if (req.user && req.user.id && !isValidObjectId(req.user.id)) {
+    const u = await User.findOne({ firebaseUid: req.user.id });
+    if (u) return u;
+  }
+  return null;
+}
+
 /* ===================== Helpers ===================== */
 const cleanEmail = (e) => (e || "").toLowerCase().trim();
 
@@ -181,7 +212,7 @@ router.post(
   ensureUserId,  // garantiza req.user.id (si viene Firebase, usa uid)
   async (req, res) => {
     try {
-      let user = await User.findById(req.user.id);
+      let user = await resolveUserFromRequest(req);
 
       // Si no existe y venimos con Firebase, crea espectador mínimo
       if (!user && req.firebaseUser && req.firebaseUser.uid) {
@@ -190,6 +221,7 @@ router.post(
         user = await User.create({
           username,
           phoneNumber: phone,
+          firebaseUid: req.firebaseUser.uid,
           role: "spectator",
         });
       }
@@ -236,7 +268,7 @@ router.post(
       if (!req.file)
         return res.status(400).json({ message: "Por favor, sube una imagen válida." });
 
-      const user = await User.findById(req.user.id);
+      const user = await resolveUserFromRequest(req);
       if (!user) return res.status(404).json({ message: "Usuario no encontrado." });
 
       user.profilePicture = `/uploads/profilePictures/${req.file.filename}`;
@@ -266,7 +298,7 @@ router.put("/update", anyAuth, ensureUserId, async (req, res) => {
       isPrivate,
     } = req.body || {};
 
-    const user = await User.findById(req.user.id);
+    const user = await resolveUserFromRequest(req);
     if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
 
     // Campos legacy (clubs)
@@ -316,7 +348,9 @@ router.get("/protected", authenticateToken, authorizeRole(["club"]), (req, res) 
 /* -------- Mis eventos donde asisto (acepta Firebase o tu JWT) -------- */
 router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
   try {
-    const events = await Event.find({ attendees: req.user.id })
+    const me = await resolveUserFromRequest(req);
+    if (!me) return res.status(404).json({ message: "Usuario no encontrado" });
+    const events = await Event.find({ attendees: me._id })
       .sort({ date: 1 })
       .populate("createdBy", "username email profilePicture")
       .lean();
@@ -346,7 +380,9 @@ router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
 /* -------- Alias: Mis eventos donde asisto (para cliente móvil) -------- */
 router.get("/users/me/attending", anyAuth, ensureUserId, async (req, res) => {
   try {
-    const events = await Event.find({ attendees: req.user.id })
+    const me = await resolveUserFromRequest(req);
+    if (!me) return res.status(404).json({ message: "Usuario no encontrado" });
+    const events = await Event.find({ attendees: me._id })
       .sort({ date: 1 })
       .populate("createdBy", "username email profilePicture")
       .lean();
