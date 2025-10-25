@@ -9,6 +9,7 @@ const path = require("path");
 const bodyParser = require("body-parser"); // <- para el webhook RAW
 const Stripe = require("stripe");          // <- Stripe SDK
 const clubRoutes = require("./routes/clubRoutes");
+const socialRoutes = require("./routes/socialRoutes");
 
 // ✅ Inicializa firebase-admin y loguea el project_id para depurar 403
 const admin = require("./middlewares/firebaseAdmin");
@@ -775,6 +776,7 @@ const userRoutes = require("./routes/userRoutes");
 const registrationRoutes = require("./routes/registrationRoutes"); // <-- MOVIDO AQUÍ
 
 app.use("/api/auth", authRoutes);
+app.use("/api", socialRoutes); 
 app.use("/api/users", userRoutes);
 app.use("/api/events", eventRoutes);
 app.use("/search", searchRoutes);
