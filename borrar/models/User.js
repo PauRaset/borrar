@@ -135,6 +135,35 @@ userSchema.pre("save", async function (next) {
   }
 });
 
+// Asegura arrays únicos y counters sincronizados antes de guardar
+userSchema.pre("save", function (next) {
+  // Deduplicar manteniendo el orden original
+  function uniqObjectIds(arr) {
+    if (!Array.isArray(arr)) return arr;
+    const seen = new Set();
+    const out = [];
+    for (const v of arr) {
+      const key = v?.toString?.() ?? String(v);
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push(v);
+      }
+    }
+    return out;
+  }
+
+  if (Array.isArray(this.followers)) {
+    this.followers = uniqObjectIds(this.followers);
+    this.followersCount = this.followers.length;
+  }
+  if (Array.isArray(this.following)) {
+    this.following = uniqObjectIds(this.following);
+    this.followingCount = this.following.length;
+  }
+
+  next();
+});
+
 // Comparar contraseñas cuando exista password local (bcrypt)
 userSchema.methods.matchPassword = async function (enteredPassword) {
   if (!this.password) return false;
@@ -249,6 +278,7 @@ userSchema.statics.findOrCreateFromFirebase = async function ({
 
 const User = mongoose.model("User", userSchema);
 module.exports = User;
+
 /*const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 
