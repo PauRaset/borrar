@@ -25,6 +25,13 @@ const userSchema = new mongoose.Schema(
 
     role: { type: String, enum: ["club", "spectator"], default: "club" },
 
+    // --- Social (seguidores / seguidos) ---
+    followers: [{ type: mongoose.Schema.Types.ObjectId, ref: "User", index: true }],
+    following: [{ type: mongoose.Schema.Types.ObjectId, ref: "User", index: true }],
+
+    followersCount: { type: Number, default: 0 },
+    followingCount: { type: Number, default: 0 },
+
     facebookId: { type: String, unique: true, sparse: true },
     instagramId: { type: String, unique: true, sparse: true },
 
@@ -83,6 +90,8 @@ userSchema
 userSchema.index({ phoneNumber: 1 });
 userSchema.index({ firebaseUid: 1 });
 userSchema.index({ instagram: 1 });
+userSchema.index({ followersCount: 1 });
+userSchema.index({ followingCount: 1 });
 
 /* ----------------------------- Hooks & helpers ---------------------------- */
 
@@ -139,6 +148,56 @@ userSchema.methods.setPassword = async function (plain) {
   return this.password;
 };
 
+// ---------------------------- Follow / Unfollow ----------------------------
+userSchema.methods.follow = async function (targetId) {
+  const me = this;
+  if (!targetId) throw new Error('TARGET_REQUIRED');
+  if (me._id.equals(targetId)) throw new Error('NO_SELF_FOLLOW');
+
+  const User = mongoose.model('User');
+  const target = await User.findById(targetId);
+  if (!target) throw new Error('TARGET_NOT_FOUND');
+
+  // ¿ya le sigo?
+  const already = me.following.some((id) => id.equals(target._id));
+  if (already) {
+    return { changed: false, isFollowing: true };
+  }
+
+  me.following.push(target._id);
+  target.followers.push(me._id);
+
+  me.followingCount = me.following.length;
+  target.followersCount = target.followers.length;
+
+  await Promise.all([me.save(), target.save()]);
+  return { changed: true, isFollowing: true };
+};
+
+userSchema.methods.unfollow = async function (targetId) {
+  const me = this;
+  if (!targetId) throw new Error('TARGET_REQUIRED');
+  if (me._id.equals(targetId)) throw new Error('NO_SELF_UNFOLLOW');
+
+  const User = mongoose.model('User');
+  const target = await User.findById(targetId);
+  if (!target) throw new Error('TARGET_NOT_FOUND');
+
+  const beforeMe = me.following.length;
+  const beforeTarget = target.followers.length;
+
+  me.following = me.following.filter((id) => !id.equals(target._id));
+  target.followers = target.followers.filter((id) => !id.equals(me._id));
+
+  const changed = me.following.length !== beforeMe || target.followers.length !== beforeTarget;
+
+  me.followingCount = me.following.length;
+  target.followersCount = target.followers.length;
+
+  await Promise.all([me.save(), target.save()]);
+  return { changed, isFollowing: false };
+};
+
 // Helper: crear/actualizar desde datos verificados de Firebase
 userSchema.statics.findOrCreateFromFirebase = async function ({
   uid,
@@ -190,7 +249,6 @@ userSchema.statics.findOrCreateFromFirebase = async function ({
 
 const User = mongoose.model("User", userSchema);
 module.exports = User;
-
 /*const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 
