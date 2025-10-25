@@ -2,6 +2,13 @@
 const jwt = require('jsonwebtoken');
 const admin = require('./firebaseAdmin');
 
+// Helper: get header value case-insensitively
+function getHeader(req, name) {
+  if (!req || !req.headers) return undefined;
+  const key = Object.keys(req.headers).find(k => k.toLowerCase() === name.toLowerCase());
+  return key ? req.headers[key] : undefined;
+}
+
 /**
  * Intenta extraer el JWT del request:
  * - Authorization: "Bearer <token>"  ✅
@@ -10,9 +17,15 @@ const admin = require('./firebaseAdmin');
  * - query: ?token=... (solo si llega así) ✅
  */
 function extractJwtFromRequest(req) {
+  // 0) Explicit legacy headers first
+  const xAuth = getHeader(req, 'x-auth-token') || getHeader(req, 'auth-token');
+  if (typeof xAuth === 'string' && xAuth.trim().length > 0) {
+    return xAuth.trim();
+  }
+
+  // 1) Authorization: Bearer <token>  |  Authorization: <token>
   const h =
-    req.headers?.authorization ||
-    req.headers?.Authorization ||
+    getHeader(req, 'authorization') ||
     '';
 
   if (typeof h === 'string' && h.length) {
@@ -20,11 +33,13 @@ function extractJwtFromRequest(req) {
     if (!h.includes(' ')) return h.trim();
   }
 
+  // 2) Cookies
   const c = req.cookies || {};
   if (c.token) return c.token;
   if (c.jwt) return c.jwt;
   if (c.access_token) return c.access_token;
 
+  // 3) Query param
   if (req.query?.token) return String(req.query.token);
 
   return null;
@@ -32,7 +47,7 @@ function extractJwtFromRequest(req) {
 
 // Extrae un Bearer token del header Authorization (pensado para Firebase ID token)
 function extractBearerFromHeader(req) {
-  const h = req.headers?.authorization || req.headers?.Authorization || '';
+  const h = getHeader(req, 'authorization') || '';
   if (typeof h === 'string' && h.startsWith('Bearer ')) return h.slice(7).trim();
   return null;
 }
@@ -105,6 +120,7 @@ const authenticateToken = (req, res, next) => {
   const token = extractJwtFromRequest(req);
 
   if (!token) {
+    console.error('[authMiddleware.authenticateToken] Missing token (x-auth-token or Authorization)');
     return res.status(401).json({ message: 'No autorizado' });
   }
 
@@ -139,3 +155,6 @@ module.exports.extractJwtFromRequest = extractJwtFromRequest;
 module.exports.verifyFirebaseIdToken = verifyFirebaseIdToken;
 module.exports.anyAuth = anyAuth;
 module.exports.ensureUserId = ensureUserId;
+
+// Convenience: hybrid auth that accepts legacy JWT or Firebase, and ensures req.user.id
+module.exports.anyAuthWithId = [anyAuth, ensureUserId];
