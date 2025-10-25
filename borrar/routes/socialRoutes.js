@@ -10,14 +10,14 @@ const {
   getUserStats,
 } = require('../controllers/socialController');
 
-const { anyAuth } = require('../middlewares/authMiddleware');
+const { anyAuth, anyAuthWithId } = require('../middlewares/authMiddleware');
 
 // Toggle (seguir / dejar de seguir) – requiere auth
-router.post('/social/follow/toggle', anyAuth, toggleFollow);
+router.post('/social/follow/toggle', anyAuthWithId, toggleFollow);
 
 // Fallbacks explícitos – requiere auth
-router.post('/users/:id/follow', anyAuth, followUser);
-router.delete('/users/:id/follow', anyAuth, unfollowUser);
+router.post('/users/:id/follow', anyAuthWithId, followUser);
+router.delete('/users/:id/follow', anyAuthWithId, unfollowUser);
 
 // Listas (públicas o protégelas si quieres)
 router.get('/users/:id/followers', getFollowers);
