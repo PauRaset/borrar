@@ -13,7 +13,7 @@ const {
 const { anyAuth, anyAuthWithId } = require('../middlewares/authMiddleware');
 
 // Toggle (seguir / dejar de seguir) – requiere auth
-router.post('/social/follow/toggle', anyAuthWithId, toggleFollow);
+router.post('/follow/toggle', anyAuthWithId, toggleFollow);
 
 // Fallbacks explícitos – requiere auth
 router.post('/users/:id/follow', anyAuthWithId, followUser);
