@@ -154,7 +154,6 @@ exports.getUserStats = async (req, res) => {
 };
 // controllers/socialController.js
 const mongoose = require('mongoose');
-const User = require('../models/User');
 
 // Helpers
 const oid = (v) => (typeof v === 'string' ? new mongoose.Types.ObjectId(v) : v);
