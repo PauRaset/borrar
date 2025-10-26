@@ -85,26 +85,31 @@ async function verifyFirebaseIdToken(req, res, next) {
   }
 }
 
-// Middleware híbrido: acepta JWT legacy o Firebase ID token
+// Middleware híbrido mejorado: acepta JWT propio o Firebase ID token
 async function anyAuth(req, res, next) {
-  // 1) Intenta JWT propio
+  // 1️⃣ Intenta JWT interno (x-auth-token / auth-token / Authorization sin "Bearer")
   const legacy = tryDecodeLegacyJwt(req);
   if (legacy && legacy.id) {
     req.user = legacy;
     return next();
   }
-  // 2) Si no hay JWT válido, intenta Firebase
-  try {
-    const idToken = extractBearerFromHeader(req);
-    if (!idToken) return res.status(401).json({ message: 'No autorizado' });
-    const decoded = await admin.auth().verifyIdToken(idToken);
-    req.firebaseUser = decoded;
-    req.user = req.user || { id: String(decoded.uid) };
-    return next();
-  } catch (error) {
-    console.error('[authMiddleware:anyAuth] No autorizado:', error?.message || error);
-    return res.status(403).json({ message: 'Token no válido' });
+
+  // 2️⃣ Si no hay JWT válido, intenta con Firebase (Authorization: Bearer <idToken>)
+  const idToken = extractBearerFromHeader(req);
+  if (idToken) {
+    try {
+      const decoded = await admin.auth().verifyIdToken(idToken);
+      req.firebaseUser = decoded;
+      req.user = req.user || { id: String(decoded.uid) };
+      return next();
+    } catch (error) {
+      console.warn('[authMiddleware:anyAuth] Firebase token inválido:', error?.message || error);
+    }
   }
+
+  // 3️⃣ Si llega aquí, no hubo ningún token válido
+  console.error('[authMiddleware:anyAuth] No autorizado: sin token válido (ni JWT interno ni Firebase)');
+  return res.status(401).json({ message: 'No autorizado' });
 }
 
 // Garantiza que exista req.user.id (string). Si no, intenta mapear desde Firebase.
