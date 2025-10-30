@@ -1,3 +1,4 @@
+const User = require('../models/User');
 // controllers/socialController.js
 const mongoose = require('mongoose');
 
