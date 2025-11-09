@@ -45,6 +45,14 @@ const eventSchema = new mongoose.Schema(
     dressCode: { type: String, default: "" },
     price: { type: Number, default: 0 },
 
+    // Ventas/entradas (compatibles hacia atrás)
+    currency: { type: String, default: "eur" },
+    capacity: { type: Number, default: 0 },       // 0 = sin límite
+    ticketsSold: { type: Number, default: 0 },     // contador rápido
+    salesStart: { type: Date, default: null },
+    salesEnd:   { type: Date, default: null },
+    isPublished: { type: Boolean, default: true },
+
     attendees: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
 
     createdBy: {
@@ -107,6 +115,22 @@ eventSchema.pre("save", function (next) {
     if (!Number.isNaN(n)) this.price = n;
   }
 
+  // capacity / ticketsSold a número y no negativos
+  if (typeof this.capacity === "string") {
+    const n = Number(this.capacity);
+    if (!Number.isNaN(n)) this.capacity = n;
+  }
+  if (typeof this.ticketsSold === "string") {
+    const n = Number(this.ticketsSold);
+    if (!Number.isNaN(n)) this.ticketsSold = n;
+  }
+  if (this.capacity < 0) this.capacity = 0;
+  if (this.ticketsSold < 0) this.ticketsSold = 0;
+
+  // Normalizar salesStart / salesEnd
+  if (this.salesStart && !(this.salesStart instanceof Date)) this.salesStart = new Date(this.salesStart);
+  if (this.salesEnd && !(this.salesEnd instanceof Date))     this.salesEnd   = new Date(this.salesEnd);
+
   // Sincronizar clubId ⇄ club
   if (this.club && !this.clubId) {
     this.clubId = String(this.club);
@@ -155,6 +179,19 @@ eventSchema.pre("save", function (next) {
 eventSchema.index({ clubId: 1, startAt: -1 });
 eventSchema.index({ "createdBy": 1, startAt: -1 });
 eventSchema.index({ attendees: 1, startAt: -1 });
+// Publicación + ventana temporal de venta
+eventSchema.index({ isPublished: 1, startAt: -1 });
+// Búsquedas por rango de venta
+eventSchema.index({ salesStart: 1, salesEnd: 1 });
+
+// Virtual: evento a la venta ahora
+eventSchema.virtual('isOnSale').get(function () {
+  const now = new Date();
+  if (this.isPublished === false) return false;
+  if (this.salesStart && now < this.salesStart) return false;
+  if (this.salesEnd && now > this.salesEnd) return false;
+  return true;
+});
 
 module.exports = mongoose.model("Event", eventSchema);
 
