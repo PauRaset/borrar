@@ -26,8 +26,9 @@ router.get('/ping', (_req, res) => {
  */
 router.post('/apply', async (req, res) => {
   try {
-    const { email, clubName, contactName, phone, website, instagram } = req.body || {};
-    if (!email || !clubName) {
+    const { email, clubName: clubNameRaw, name, contactName, phone, website, instagram } = req.body || {};
+    const clubNameNorm = String(clubNameRaw || name || '').trim();
+    if (!email || !clubNameNorm) {
       return res.status(400).json({ ok: false, error: 'missing_fields' });
     }
     const emailNorm = cleanEmail(email);
@@ -40,7 +41,7 @@ router.post('/apply', async (req, res) => {
       { email: emailNorm },
       {
         email: emailNorm,
-        clubName,
+        clubName: clubNameNorm,
         contactName,
         phone,
         website,
@@ -62,7 +63,7 @@ router.post('/apply', async (req, res) => {
         subject: 'Verifica tu email – NightVibe Clubs',
         html: `
           <p>Hola ${contactName || ''},</p>
-          <p>Para continuar con el registro de <b>${clubName}</b>, confirma tu correo:</p>
+          <p>Para continuar con el registro de <b>${clubNameNorm}</b>, confirma tu correo:</p>
           <p><a href="${link}">Verificar email</a></p>
           <p>Enlace válido durante 48 horas.</p>
         `,
