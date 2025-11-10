@@ -827,95 +827,24 @@ const searchRoutes = require("./routes/searchRoutes");
 const userRoutes = require("./routes/userRoutes");
 const registrationRoutes = require("./routes/registrationRoutes"); // <-- MOVIDO AQUÍ
 
-// === Registration flow (ClubApplication) ===
-// Crea solicitud y envía email de verificación
-app.post('/api/registration/request', async (req, res) => {
-  try {
-    const { name, email, city, website, instagram, notes } = req.body || {};
-    if (!name || !email) {
-      return res.status(400).json({ message: 'Faltan campos: name y email' });
-    }
-    const normEmail = _cleanEmail(email);
-
-    // Evita duplicados en estados abiertos
-    const exists = await ClubApplication.findOne({
-      email: normEmail,
-      status: { $in: ['pending', 'email_verified'] },
-    });
-    if (exists) {
-      return res.status(200).json({ ok: true, message: 'Solicitud ya existente' });
-    }
-
-    const appDoc = await ClubApplication.create({
-      name: String(name).trim(),
-      email: normEmail,
-      city: city || '',
-      website: website || '',
-      instagram: instagram || '',
-      notes: notes || '',
-      status: 'pending',
-      emailVerified: false,
-    });
-
-    // Token de verificación (24h)
-    const token = jwt.sign(
-      { kind: 'clubreg', id: appDoc._id.toString(), email: normEmail },
-      process.env.JWT_SECRET,
-      { expiresIn: '1d' }
-    );
-
-    const clubsFrontend = (process.env.CLUBS_FRONTEND_URL || 'https://clubs.nightvibe.life').replace(/\/+$/, '');
-    const verifyUrl = `${clubsFrontend}/verify?token=${encodeURIComponent(token)}`;
-
-    await sendSimpleEmail({
-      to: normEmail,
-      subject: 'Verifica tu email – NightVibe Clubs',
-      html: `<p>Hola ${name},</p>
-             <p>Gracias por tu interés en NightVibe. Para continuar, verifica tu email:</p>
-             <p><a href="${verifyUrl}">Verificar email</a></p>
-             <p>Este enlace caduca en 24 horas.</p>`,
-    });
-
-    return res.status(201).json({ ok: true, message: 'Solicitud creada. Revisa tu correo para verificar.' });
-  } catch (e) {
-    console.error('[POST /api/registration/request]', e);
-    return res.status(500).json({ message: 'No se pudo crear la solicitud' });
-  }
+// Compat: clientes antiguos pueden llamar /start|/request|/requests
+// Normalizamos name -> clubName y reenviamos al router en /apply sin perder body
+const registrationRouter = require("./routes/registrationRoutes");
+app.post("/api/registration/start", (req, res, next) => {
+  if (!req.body?.clubName && req.body?.name) req.body.clubName = req.body.name;
+  req.url = "/apply";
+  return registrationRouter(req, res, next);
 });
-
-// Verifica email de la solicitud
-app.post('/api/registration/verify', async (req, res) => {
-  try {
-    const { token } = req.query || {};
-    if (!token) return res.status(400).json({ message: 'Falta token' });
-
-    let payload;
-    try {
-      payload = jwt.verify(token, process.env.JWT_SECRET);
-    } catch (err) {
-      return res.status(400).json({ message: 'Token inválido o expirado' });
-    }
-    if (payload.kind !== 'clubreg' || !payload.id) {
-      return res.status(400).json({ message: 'Token inválido' });
-    }
-
-    const appDoc = await ClubApplication.findById(payload.id);
-    if (!appDoc) return res.status(404).json({ message: 'Solicitud no encontrada' });
-
-    appDoc.emailVerified = true;
-    if (appDoc.status === 'pending') appDoc.status = 'email_verified';
-    await appDoc.save();
-
-    return res.json({ ok: true, message: 'Email verificado. Un admin revisará tu solicitud.' });
-  } catch (e) {
-    console.error('[POST /api/registration/verify]', e);
-    return res.status(500).json({ message: 'No se pudo verificar el email' });
-  }
+app.post("/api/registration/request", (req, res, next) => {
+  if (!req.body?.clubName && req.body?.name) req.body.clubName = req.body.name;
+  req.url = "/apply";
+  return registrationRouter(req, res, next);
 });
-
-// Compat: redirige /start y /requests al nuevo endpoint /api/registration/request
-app.post("/api/registration/start", (req, res) => res.redirect(307, "/api/registration/request"));
-app.post("/api/registration/requests", (req, res) => res.redirect(307, "/api/registration/request"));
+app.post("/api/registration/requests", (req, res, next) => {
+  if (!req.body?.clubName && req.body?.name) req.body.clubName = req.body.name;
+  req.url = "/apply";
+  return registrationRouter(req, res, next);
+});
 
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
@@ -937,7 +866,6 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
-
 
 /*// index.js (entrypoint)
 require("dotenv").config();
