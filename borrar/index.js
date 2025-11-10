@@ -812,11 +812,21 @@ app.post("/api/checkin", async (req, res) => {
 });
 
 // ===== Rutas de tu app =====
+
 const authRoutes = require("./routes/authRoutes");
 const eventRoutes = require("./routes/eventRoutes");
 const searchRoutes = require("./routes/searchRoutes");
 const userRoutes = require("./routes/userRoutes");
 const registrationRoutes = require("./routes/registrationRoutes"); // <-- MOVIDO AQUÍ
+
+// Alias de compatibilidad: el portal de clubs puede enviar POST /api/registration/start
+// Redirigimos internamente a /api/registration/request para mantener compatibilidad
+app.post("/api/registration/start", (req, res, next) => {
+  // Reescribimos la URL para que el router la reciba como /request
+  req.url = "/request";
+  // Delegamos en el router de registro existente
+  return registrationRoutes(req, res, next);
+});
 
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
