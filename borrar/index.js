@@ -819,11 +819,12 @@ const searchRoutes = require("./routes/searchRoutes");
 const userRoutes = require("./routes/userRoutes");
 const registrationRoutes = require("./routes/registrationRoutes"); // <-- MOVIDO AQUÍ
 
-// Alias de compatibilidad: el portal de clubs puede enviar POST /api/registration/start
-// Redirigimos internamente a /api/registration/request para mantener compatibilidad
-app.post("/api/registration/start", (req, res) => {
-  return res.redirect(307, "/api/registration/request");
-});
+
+// Alias de compatibilidad para el portal de clubs
+// Redirige /api/registration/* → /api/auth/register (preserva método y body)
+app.post("/api/registration/start", (req, res) => res.redirect(307, "/api/auth/register"));
+app.post("/api/registration/request", (req, res) => res.redirect(307, "/api/auth/register"));
+app.post("/api/registration/requests", (req, res) => res.redirect(307, "/api/auth/register"));
 
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
