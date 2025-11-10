@@ -821,11 +821,8 @@ const registrationRoutes = require("./routes/registrationRoutes"); // <-- MOVIDO
 
 // Alias de compatibilidad: el portal de clubs puede enviar POST /api/registration/start
 // Redirigimos internamente a /api/registration/request para mantener compatibilidad
-app.post("/api/registration/start", (req, res, next) => {
-  // Reescribimos la URL para que el router la reciba como /request
-  req.url = "/request";
-  // Delegamos en el router de registro existente
-  return registrationRoutes(req, res, next);
+app.post("/api/registration/start", (req, res) => {
+  return res.redirect(307, "/api/registration/request");
 });
 
 app.use("/api/auth", authRoutes);
