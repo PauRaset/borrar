@@ -13,7 +13,7 @@ const router = express.Router();
 
 const cleanEmail = (e='') => e.toLowerCase().trim();
 const frontendBase = () =>
-  (process.env.FRONTEND_URL || 'https://clubs.nightvibe.life').replace(/\/+$/, '');
+  (process.env.CLUBS_FRONTEND_URL || process.env.FRONTEND_URL || 'https://clubs.nightvibe.life').replace(/\/+$/, '');
 
 // ✅ Comprobación rápida
 router.get('/ping', (_req, res) => {
@@ -85,7 +85,7 @@ router.post('/apply', async (req, res) => {
  */
 router.post('/verify', async (req, res) => {
   try {
-    const { token } = req.body || {};
+    const token = (req.body && req.body.token) || (req.query && req.query.token);
     if (!token) return res.status(400).json({ ok: false, error: 'missing_token' });
 
     const appDoc = await ClubApplication.findOne({ verifyToken: token });
