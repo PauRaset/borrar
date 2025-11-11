@@ -279,7 +279,9 @@ router.post('/:id/stripe/onboarding', requireClubOwnerOrManager, async (req, res
     res.json({ url: accountLink.url, accountId: club.stripeAccountId });
   } catch (e) {
     console.error('POST /clubs/:id/stripe/onboarding error:', e);
-    res.status(500).json({ error: 'onboarding_error', message: e?.message || 'onboarding_failed' });
+    const code = e?.raw?.code || e?.code || 'onboarding_error';
+    const msg  = e?.raw?.message || e?.message || 'onboarding_failed';
+    res.status(500).json({ error: code, message: msg });
   }
 });
 
@@ -343,7 +345,41 @@ router.post('/:id/stripe/login-link', requireClubOwnerOrManager, async (req, res
     return res.json({ status: 'dashboard', url: login.url, accountId: club.stripeAccountId });
   } catch (e) {
     console.error('POST /clubs/:id/stripe/login-link error:', e);
-    return res.status(500).json({ error: 'login_link_error', message: e?.message || 'failed' });
+    const code = e?.raw?.code || e?.code || 'login_link_error';
+    const msg  = e?.raw?.message || e?.message || 'failed';
+    return res.status(500).json({ error: code, message: msg });
+  }
+});
+
+/* === Estado Stripe para diagnóstico === */
+router.get('/:id/stripe/status', requireClubOwnerOrManager, async (req, res) => {
+  try {
+    const club = await Club.findById(req.params.id).lean();
+    if (!club) return res.status(404).json({ error: 'club_not_found' });
+
+    if (!club.stripeAccountId) {
+      return res.json({
+        connected: false,
+        reason: 'no_account',
+        accountId: null,
+      });
+    }
+
+    const acc = await stripe.accounts.retrieve(club.stripeAccountId);
+    return res.json({
+      connected: true,
+      accountId: acc.id,
+      type: acc.type,
+      details_submitted: !!acc.details_submitted,
+      charges_enabled: !!acc.charges_enabled,
+      payouts_enabled: !!acc.payouts_enabled,
+      capabilities: acc.capabilities || {},
+    });
+  } catch (e) {
+    console.error('GET /clubs/:id/stripe/status error:', e);
+    const code = e?.raw?.code || e?.code || 'status_error';
+    const msg  = e?.raw?.message || e?.message || 'failed';
+    res.status(500).json({ error: code, message: msg });
   }
 });
 
