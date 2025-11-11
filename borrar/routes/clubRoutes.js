@@ -7,7 +7,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const Club = require('../models/Club');
 const Order = require('../models/Order');
 let User = null;
-try { User = require('../models/User'); } catch (_) {}
+try { User = require('../models/User'); } catch (_){}
 
 /* ======================= Helpers genéricos ======================= */
 function asInt(v, def) {
@@ -286,22 +286,63 @@ router.post('/:id/stripe/onboarding', requireClubOwnerOrManager, async (req, res
 /* === NUEVO: Login Link al Dashboard de Stripe (Express) === */
 router.post('/:id/stripe/login-link', requireClubOwnerOrManager, async (req, res) => {
   try {
-    const club = await Club.findById(req.params.id).lean();
+    const club = await Club.findById(req.params.id);
     if (!club) return res.status(404).json({ error: 'club_not_found' });
-    if (!club.stripeAccountId) {
-      // Si no hay cuenta, devolvemos 404 para que el front haga fallback a onboarding
-      return res.status(404).json({ error: 'no_connected_account' });
-    }
 
     const portalBase = (process.env.CLUBS_PORTAL_URL || process.env.FRONTEND_URL || 'https://clubs.nightvibe.life').replace(/\/+$/, '');
-    const link = await stripe.accounts.createLoginLink(club.stripeAccountId, {
+
+    // 1) Si no hay cuenta conectada, la creamos (Express) y devolvemos onboarding
+    if (!club.stripeAccountId) {
+      const account = await stripe.accounts.create({
+        type: 'express',
+        business_type: 'company',
+        capabilities: {
+          card_payments: { requested: true },
+          transfers:     { requested: true },
+        },
+        metadata: { clubId: String(club._id), clubName: club.name },
+      });
+      club.stripeAccountId = account.id;
+      await club.save();
+
+      const link = await stripe.accountLinks.create({
+        account: account.id,
+        refresh_url: `${portalBase}/dashboard?club=${club._id}&onboarding=refresh`,
+        return_url:  `${portalBase}/dashboard?club=${club._id}&onboarding=return`,
+        type: 'account_onboarding',
+      });
+      return res.json({ status: 'onboarding', url: link.url, accountId: account.id });
+    }
+
+    // 2) Hay cuenta: comprobamos estado
+    const acc = await stripe.accounts.retrieve(club.stripeAccountId);
+
+    if (acc.type === 'standard') {
+      // Standard no soporta login link; deben entrar por stripe.com
+      return res.status(400).json({
+        error: 'standard_account',
+        message: 'La cuenta es Standard. Accede desde stripe.com con tu usuario y contraseña.',
+      });
+    }
+
+    if (!acc.details_submitted || !acc.charges_enabled || !acc.payouts_enabled) {
+      // Falta completar datos: enviamos de nuevo al onboarding
+      const link = await stripe.accountLinks.create({
+        account: club.stripeAccountId,
+        refresh_url: `${portalBase}/dashboard?club=${club._id}&onboarding=refresh`,
+        return_url:  `${portalBase}/dashboard?club=${club._id}&onboarding=return`,
+        type: 'account_onboarding',
+      });
+      return res.json({ status: 'onboarding', url: link.url, accountId: club.stripeAccountId });
+    }
+
+    // 3) Todo ok: devolvemos login link del Dashboard
+    const login = await stripe.accounts.createLoginLink(club.stripeAccountId, {
       redirect_url: `${portalBase}/dashboard?club=${club._id}&from=stripe`,
     });
-
-    return res.json({ url: link.url });
+    return res.json({ status: 'dashboard', url: login.url, accountId: club.stripeAccountId });
   } catch (e) {
     console.error('POST /clubs/:id/stripe/login-link error:', e);
-    // Si falla por requisitos pendientes, el front hará fallback a onboarding
     return res.status(500).json({ error: 'login_link_error', message: e?.message || 'failed' });
   }
 });
