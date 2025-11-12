@@ -170,7 +170,33 @@ const createLimiter = rateLimit({
 app.use(["/api/orders", "/api/webhooks/stripe"], createLimiter);
 
 // ===== Webhook Stripe (RAW body) — debe ir ANTES de express.json() =====
-app.use('/api/webhooks/stripe', require('./routes/stripeWebhooks'));
+// Soporte para ambos secretos de Stripe (plataforma y cuentas conectadas)
+const STRIPE_WEBHOOK_SECRET_PLATFORM = process.env.STRIPE_WEBHOOK_SECRET || "";
+const STRIPE_WEBHOOK_SECRET_CONNECT = process.env.STRIPE_WEBHOOK_SECRET_CONNECT || "";
+
+// Logs de configuración de los secretos (sin mostrar el valor completo)
+function safeSecret(secret) {
+  if (!secret) return "(no definido)";
+  return secret.slice(0, 6) + "***" + secret.slice(-4);
+}
+console.log("Stripe Webhook Secret (plataforma):", safeSecret(STRIPE_WEBHOOK_SECRET_PLATFORM));
+console.log("Stripe Webhook Secret (connect):   ", safeSecret(STRIPE_WEBHOOK_SECRET_CONNECT));
+if (!STRIPE_WEBHOOK_SECRET_PLATFORM) {
+  console.warn("❌ Falta STRIPE_WEBHOOK_SECRET (plataforma) en variables de entorno.");
+}
+if (!STRIPE_WEBHOOK_SECRET_CONNECT) {
+  console.warn("❌ Falta STRIPE_WEBHOOK_SECRET_CONNECT (connect) en variables de entorno.");
+}
+
+// Importa el handler y pasa los secretos
+const stripeWebhooks = require('./routes/stripeWebhooks');
+app.use(
+  '/api/webhooks/stripe',
+  stripeWebhooks({
+    platformSecret: STRIPE_WEBHOOK_SECRET_PLATFORM,
+    connectSecret: STRIPE_WEBHOOK_SECRET_CONNECT,
+  })
+);
 
 /*app.post(
   "/api/webhooks/stripe",
