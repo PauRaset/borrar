@@ -188,28 +188,8 @@ if (!STRIPE_WEBHOOK_SECRET_CONNECT) {
   console.warn("❌ Falta STRIPE_WEBHOOK_SECRET_CONNECT (connect) en variables de entorno.");
 }
 
-// Importa el handler y pasa los secretos (defensivo, nunca monta undefined)
-const stripeWebhooksFactory = require('./routes/stripeWebhooks');
-let stripeWebhooksRouter;
-try {
-  stripeWebhooksRouter = stripeWebhooksFactory({
-    platformSecret: STRIPE_WEBHOOK_SECRET_PLATFORM,
-    connectSecret: STRIPE_WEBHOOK_SECRET_CONNECT || null,
-  });
-} catch (e) {
-  console.error('❌ stripeWebhooks factory failed:', e?.message || e);
-}
-
-// Si por cualquier motivo no obtuvimos un Router válido, montamos un fallback
-if (!stripeWebhooksRouter || typeof stripeWebhooksRouter.use !== 'function') {
-  const r = express.Router();
-  r.post('/', bodyParser.raw({ type: 'application/json' }), (_req, res) => {
-    console.error('⚠️ Webhook deshabilitado: falta STRIPE_WEBHOOK_SECRET/CONNECT o el factory falló.');
-    return res.status(503).send('Webhook disabled');
-  });
-  stripeWebhooksRouter = r;
-}
-
+// Monta el router de webhooks (el módulo exporta un Router listo)
+const stripeWebhooksRouter = require('./routes/stripeWebhooks');
 app.use('/api/webhooks/stripe', stripeWebhooksRouter);
 
 /*app.post(
