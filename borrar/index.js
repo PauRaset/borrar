@@ -119,10 +119,32 @@ app.use(
         : cb(new Error(`CORS no permitido para: ${origin}`)),
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     credentials: true,
+    allowedHeaders: [
+      "Authorization",
+      "Content-Type",
+      "X-Requested-With",
+      "Accept",
+      "Origin",
+    ],
+    exposedHeaders: [
+      "Authorization",
+      "Content-Type",
+    ],
   })
 );
 // Responder preflight explícitamente
 app.options("*", cors());
+// DEBUG temporal: ver headers y si llega Authorization/Cookie
+if (process.env.NODE_ENV !== 'production') {
+  app.all('/api/debug/echo', (req, res) => {
+    res.json({
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      cookies: req.cookies || null,
+    });
+  });
+}
 // Captura errores de CORS y responde JSON en lugar de romper la petición
 app.use((err, _req, res, next) => {
   if (err && /CORS no permitido/.test(String(err.message || ''))) {
