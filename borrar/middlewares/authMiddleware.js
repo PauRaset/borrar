@@ -40,11 +40,12 @@ function extractJwtFromRequest(req) {
   const xAuth = getHeader(req, 'x-auth-token') || getHeader(req, 'auth-token');
   if (typeof xAuth === 'string' && xAuth.trim().length > 0) return xAuth.trim();
 
-  // 1) Authorization
+  // 1) Authorization (acepta también Bearer)
   const h = getHeader(req, 'authorization') || '';
   if (typeof h === 'string' && h.length) {
-    // Si empieza por Bearer lo tratará verifyFirebaseIdToken / anyAuth
-    if (!h.startsWith('Bearer ')) return h.trim();
+    return h.startsWith('Bearer ')
+      ? h.slice(7).trim()
+      : h.trim();
   }
 
   // 2) Cookies
@@ -197,32 +198,39 @@ function ensureUserId(req, res, next) {
 
 // Verifica exclusivamente tu JWT "propio"
 function authenticateToken(req, res, next) {
+  // 1) Intento con nuestro JWT (x-auth-token, Authorization, cookie, query)
   const token = extractJwtFromRequest(req);
-
-  if (!token) {
-    console.error('[authMiddleware.authenticateToken] Missing token (x-auth-token or Authorization)');
-    return res.status(401).json({ message: 'No autorizado' });
-  }
-
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const id =
-      decoded.id ??
-      decoded._id ??
-      decoded.userId ??
-      decoded.sub ??
-      decoded.uid;
-
-    if (!id) {
-      return res.status(403).json({ message: 'Token no válido' });
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const id = decoded.id ?? decoded._id ?? decoded.userId ?? decoded.sub ?? decoded.uid;
+      if (!id) return res.status(403).json({ message: 'Token no válido' });
+      attachUserId(req, String(id), decoded);
+      return next();
+    } catch (_e) {
+      // cae a Firebase si era un ID token
     }
-
-    attachUserId(req, id, decoded);
-    return next();
-  } catch (error) {
-    console.error('[authMiddleware] Token no válido:', error?.message || error);
-    return res.status(403).json({ message: 'Token no válido' });
   }
+
+  // 2) Intento con Firebase ID token si vino como Authorization: Bearer <idToken>
+  const bearer = extractBearerFromHeader(req);
+  if (bearer) {
+    return admin
+      .auth()
+      .verifyIdToken(bearer)
+      .then((decoded) => {
+        req.firebaseUser = decoded;
+        attachUserId(req, decoded.uid);
+        next();
+      })
+      .catch((err) => {
+        console.error('[authMiddleware.authenticateToken] Token no válido (ni JWT ni Firebase):', err?.message || err);
+        res.status(403).json({ message: 'Token no válido' });
+      });
+  }
+
+  console.error('[authMiddleware.authenticateToken] Missing token');
+  return res.status(401).json({ message: 'No autorizado' });
 }
 
 /* ─────────────────────────── Exports ─────────────────────────── */
