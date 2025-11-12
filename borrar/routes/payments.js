@@ -3,6 +3,7 @@ const express = require('express');
 const Stripe = require('stripe');
 const Order = require('../models/Order');
 const Event = require('../models/Event');
+const Club = require('../models/Club');
 
 const router = express.Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
@@ -35,10 +36,26 @@ router.post('/create-checkout-session', async (req, res) => {
       }
     }
 
+    // === Stripe Connect: cuenta del club y comisión de plataforma ===
+    // Detecta el club del evento (adapta si tu Event usa otro campo)
+    const clubId = event.clubId || event.club || event.organizerId || null;
+    if (!clubId) {
+      return res.status(400).json({ error: 'club_not_set', message: 'El evento no tiene club asociado.' });
+    }
+    const club = await Club.findById(clubId).lean();
+    if (!club || !club.stripeAccountId) {
+      return res.status(400).json({ error: 'club_without_connect', message: 'El club no tiene cuenta conectada en Stripe (LIVE).' });
+    }
+
+    // Comisión de gestión fija: 1,50€ por entrada
+    const PLATFORM_FEE_CENTS = 150;
+    const applicationFee = PLATFORM_FEE_CENTS * nQty; // en céntimos
+
     // Crea orden pendiente
     const order = await Order.create({
       userId,
       eventId,
+      clubId,
       qty: nQty,
       amountEUR: unit * nQty,
       currency: 'eur',
@@ -69,10 +86,18 @@ router.post('/create-checkout-session', async (req, res) => {
         eventId: String(event._id),
         orderId: String(order._id),
         userId: String(userId),
+        clubId: String(clubId),
       },
       customer_email: email || undefined,
       allow_promotion_codes: true,
       automatic_tax: { enabled: true },
+      // Destination charge: cobra el pago en la plataforma y transfiere al club,
+      // quedándose la comisión fija (application_fee_amount)
+      payment_intent_data: {
+        application_fee_amount: applicationFee,
+        transfer_data: { destination: club.stripeAccountId },
+        on_behalf_of: club.stripeAccountId,
+      },
     });
 
     order.stripeSessionId = session.id;
