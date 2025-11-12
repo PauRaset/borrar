@@ -170,7 +170,9 @@ const createLimiter = rateLimit({
 app.use(["/api/orders", "/api/webhooks/stripe"], createLimiter);
 
 // ===== Webhook Stripe (RAW body) — debe ir ANTES de express.json() =====
-app.post(
+app.use('/api/webhooks/stripe', require('./routes/stripeWebhooks'));
+
+/*app.post(
   "/api/webhooks/stripe",
   bodyParser.raw({ type: "application/json" }),
   async (req, res) => {
@@ -373,7 +375,7 @@ app.post(
 
     res.json({ received: true });
   }
-);
+);*/
 
 if (process.env.NODE_ENV !== 'production') {
   // === DEBUG: ver estado de una Checkout Session (y su PI) ===
