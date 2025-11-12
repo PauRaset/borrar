@@ -201,7 +201,7 @@ try {
 }
 
 // Si por cualquier motivo no obtuvimos un Router válido, montamos un fallback
-if (!stripeWebhooksRouter || typeof stripeWebhooksRouter !== 'function') {
+if (!stripeWebhooksRouter || typeof stripeWebhooksRouter.use !== 'function') {
   const r = express.Router();
   r.post('/', bodyParser.raw({ type: 'application/json' }), (_req, res) => {
     console.error('⚠️ Webhook deshabilitado: falta STRIPE_WEBHOOK_SECRET/CONNECT o el factory falló.');
