@@ -5,6 +5,7 @@ const { buildTicketPdf } = require('./buildTicketPdf');
 // Validación de credenciales en arranque (para fallar pronto en prod)
 if (!process.env.SENDGRID_API_KEY) {
   console.error('[sendTicketEmail] Falta SENDGRID_API_KEY en variables de entorno');
+  throw new Error('[sendTicketEmail] SENDGRID_API_KEY no configurada');
 }
 if (!process.env.SENDGRID_FROM) {
   console.error('[sendTicketEmail] Falta SENDGRID_FROM en variables de entorno');
@@ -60,6 +61,9 @@ async function sendTicketEmail({
     throw new Error('Email destinatario inválido');
   }
 
+  console.log('[sendTicketEmail] to=', to, 'from=', process.env.SENDGRID_FROM);
+  console.log('[sendTicketEmail] eventTitle=', eventTitle, 'clubName=', clubName);
+
   // PDF adjunto
   let pdfBuffer;
   try {
@@ -77,6 +81,7 @@ async function sendTicketEmail({
     console.error('[sendTicketEmail] Error generando PDF:', e?.message || e);
     throw e;
   }
+  console.log('[sendTicketEmail] sizes: qrPngBuffer=', qrPngBuffer?.length || 0, 'bytes; pdfBuffer=', pdfBuffer?.length || 0, 'bytes');
 
   // Imagen QR inline: la referenciamos en el HTML con cid:qrimg
   const qrAsBase64 = qrPngBuffer.toString('base64');
@@ -160,13 +165,16 @@ Adjuntamos un PDF con tu ticket por si el QR no se muestra en tu cliente de emai
         disposition: 'attachment',
       },
     ],
+    mailSettings: process.env.SENDGRID_SANDBOX === 'true' ? { sandboxMode: { enable: true } } : undefined,
   };
 
   try {
-    await sgMail.send(msg);
+    const [resp] = await sgMail.send(msg);
+    console.log('[sendTicketEmail] enviado OK · status=', resp?.statusCode);
+    return resp;
   } catch (err) {
     logSgError(err);
-    throw err; // re-lanza para que el webhook registre fallo y podamos ver en logs
+    throw err; // mantiene el comportamiento actual de propagar el error
   }
 }
 
