@@ -898,6 +898,34 @@ app.use("/api/registration", registrationRoutes); // <-- Y montado AQUÍ
 app.use("/api/clubs", clubRoutes);
 app.use("/api/social", socialRoutes);
 
+// ===== DEBUG: enviar email de prueba con QR =====
+app.post('/api/debug/send-test-email', express.json(), async (req, res) => {
+  try {
+    const token = req.headers['x-debug-token'];
+    if (!process.env.DEBUG_ADMIN_TOKEN || token !== process.env.DEBUG_ADMIN_TOKEN) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    const { to } = req.body || {};
+    if (!to) return res.status(400).json({ error: 'missing_to' });
+
+    const qrPngBuffer = await QRCode.toBuffer('NV-TEST-' + Date.now(), { width: 300 });
+    const resp = await sendTicketEmail({
+      to,
+      eventTitle: 'Prueba NightVibe',
+      clubName: 'NightVibe',
+      eventDate: new Date().toLocaleString('es-ES'),
+      venue: '',
+      serial: 'NV-TEST',
+      qrPngBuffer,
+      buyerName: 'Tester',
+    });
+    return res.json({ ok: true, status: resp?.statusCode || 202 });
+  } catch (e) {
+    console.error('[debug send-test-email] error:', e?.response?.body || e?.message || e);
+    return res.status(500).json({ error: 'send_failed', message: e?.message || 'unknown' });
+  }
+});
+
 // ===== 404 =====
 app.use((_req, res) => res.status(404).send("Ruta no encontrada"));
 
@@ -910,7 +938,6 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
-
 
 
 /*// index.js (entrypoint)
