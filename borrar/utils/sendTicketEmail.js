@@ -2,6 +2,27 @@
 const sgMail = require('@sendgrid/mail');
 const { buildTicketPdf } = require('./buildTicketPdf');
 
+// Validación de credenciales en arranque (para fallar pronto en prod)
+if (!process.env.SENDGRID_API_KEY) {
+  console.error('[sendTicketEmail] Falta SENDGRID_API_KEY en variables de entorno');
+}
+if (!process.env.SENDGRID_FROM) {
+  console.error('[sendTicketEmail] Falta SENDGRID_FROM en variables de entorno');
+}
+
+function logSgError(err) {
+  if (!err) return;
+  try {
+    if (err.response && err.response.body) {
+      console.error('[sendTicketEmail] SendGrid error body:', JSON.stringify(err.response.body));
+    } else {
+      console.error('[sendTicketEmail] SendGrid error:', err.message || err);
+    }
+  } catch (_) {
+    console.error('[sendTicketEmail] SendGrid error (stringified failed):', err);
+  }
+}
+
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
 /**
@@ -35,17 +56,27 @@ async function sendTicketEmail({
     throw new Error('Falta la variable SENDGRID_FROM (remitente) en el .env');
   }
 
+  if (!to || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(to))) {
+    throw new Error('Email destinatario inválido');
+  }
+
   // PDF adjunto
-  const pdfBuffer = await buildTicketPdf({
-    eventTitle,
-    clubName,
-    eventDate,
-    venue,
-    serial,
-    qrPngBuffer,
-    buyerName,
-    seatLabel,
-  });
+  let pdfBuffer;
+  try {
+    pdfBuffer = await buildTicketPdf({
+      eventTitle,
+      clubName,
+      eventDate,
+      venue,
+      serial,
+      qrPngBuffer,
+      buyerName,
+      seatLabel,
+    });
+  } catch (e) {
+    console.error('[sendTicketEmail] Error generando PDF:', e?.message || e);
+    throw e;
+  }
 
   // Imagen QR inline: la referenciamos en el HTML con cid:qrimg
   const qrAsBase64 = qrPngBuffer.toString('base64');
@@ -131,7 +162,12 @@ Adjuntamos un PDF con tu ticket por si el QR no se muestra en tu cliente de emai
     ],
   };
 
-  await sgMail.send(msg);
+  try {
+    await sgMail.send(msg);
+  } catch (err) {
+    logSgError(err);
+    throw err; // re-lanza para que el webhook registre fallo y podamos ver en logs
+  }
 }
 
 function escapeHtml(s) {
