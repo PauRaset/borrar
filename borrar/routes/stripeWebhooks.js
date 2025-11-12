@@ -7,6 +7,7 @@ const Order2 = require('../models/Order');
 const Event2 = require('../models/Event');
 const Ticket = require('../models/Ticket');
 const sendTicketEmail = require('../utils/sendTicketEmail');
+const bodyParser = require('body-parser');
 
 // Util de log seguro
 function slog(label, obj) {
@@ -81,14 +82,27 @@ function makeToken(serial) {
   return `${raw}.${sig}`;
 }
 
-router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) => {
+router2.post('/', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
+  const platformSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  const connectSecret  = process.env.STRIPE_WEBHOOK_SECRET_CONNECT;
   try {
-    event = stripe2.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (e) {
-    console.error('Webhook signature failed:', e.message);
-    return res.status(400).send(`Webhook Error: ${e.message}`);
+    // Primero intentamos con el secreto de plataforma
+    event = stripe2.webhooks.constructEvent(req.body, sig, platformSecret);
+  } catch (e1) {
+    // Si falla y tenemos secreto de connect, probamos con ese
+    if (connectSecret) {
+      try {
+        event = stripe2.webhooks.constructEvent(req.body, sig, connectSecret);
+      } catch (e2) {
+        console.error('Webhook signature failed (both secrets):', e1.message, ' // ', e2.message);
+        return res.status(400).send('Webhook Error: invalid signature');
+      }
+    } else {
+      console.error('Webhook signature failed (platform secret):', e1.message);
+      return res.status(400).send('Webhook Error: invalid signature');
+    }
   }
 
   try {
