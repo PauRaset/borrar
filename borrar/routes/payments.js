@@ -132,7 +132,7 @@ router.post('/create-checkout-session', async (req, res) => {
 });*/
 
 // GET /api/payments/direct/:eventId
-// Enlace "estable" que puedes compartir (no caduca).
+// Enlace estable que puedes compartir (no caduca).
 // Crea la sesión de Checkout y hace redirect 303 a Stripe.
 router.get('/direct/:eventId', async (req, res) => {
     try {
@@ -143,7 +143,7 @@ router.get('/direct/:eventId', async (req, res) => {
         return res.status(404).send('Evento no encontrado');
       }
   
-      // Misma lógica de validaciones que arriba
+      // Misma lógica de validaciones que en create-checkout-session
       const now = new Date();
       if (event.isPublished === false) {
         return res.status(400).send('Evento no publicado');
@@ -162,21 +162,42 @@ router.get('/direct/:eventId', async (req, res) => {
   
       const qty = 1;
   
+      // Stock (capacity 0 = sin límite)
       if (event.capacity && event.capacity > 0) {
         if ((event.ticketsSold || 0) + qty > event.capacity) {
           return res.status(409).send('Sin stock suficiente');
         }
       }
   
-      // Order "guest": sin userId, email lo rellenará el webhook desde Stripe
+      // === Stripe Connect: misma lógica que en create-checkout-session ===
+      const clubId = event.clubId || event.club || event.organizerId || null;
+      if (!clubId) {
+        return res
+          .status(400)
+          .send('El evento no tiene club asociado.');
+      }
+  
+      const club = await Club.findById(clubId).lean();
+      if (!club || !club.stripeAccountId) {
+        return res
+          .status(400)
+          .send('El club no tiene cuenta conectada en Stripe (LIVE).');
+      }
+  
+      // Comisión fija de plataforma: 1,50 € por entrada
+      const PLATFORM_FEE_CENTS = 150;
+      const applicationFee = PLATFORM_FEE_CENTS * qty;
+  
+      // Order "guest": sin userId ni email (Stripe nos dará el email)
       const order = await Order.create({
         userId: null,
         eventId,
+        clubId,
         qty,
         amountEUR: unit * qty,
         currency: 'eur',
         email: null,
-        status: 'pending',
+        status: 'created',
       });
   
       const session = await stripe.checkout.sessions.create({
@@ -196,26 +217,39 @@ router.get('/direct/:eventId', async (req, res) => {
             quantity: qty,
           },
         ],
-        // Usa la misma URL de éxito / cancel que el flujo normal
+        // Mismo success/cancel que el flujo normal
         success_url: `${process.env.APP_BASE_URL}/purchase/success?sid={CHECKOUT_SESSION_ID}`,
         cancel_url: `${process.env.APP_BASE_URL}/event/${eventId}?cancelled=1`,
         metadata: {
           eventId: String(event._id),
           orderId: String(order._id),
           userId: '', // invitado
+          clubId: String(clubId),
         },
         allow_promotion_codes: true,
         automatic_tax: { enabled: true },
+        payment_intent_data: {
+          application_fee_amount: applicationFee,
+          transfer_data: { destination: club.stripeAccountId },
+          on_behalf_of: club.stripeAccountId,
+        },
       });
   
       order.stripeSessionId = session.id;
+      order.sessionMetadata = session.metadata || {};
       await order.save();
+  
+      console.log('◆ [direct] Created Checkout Session:', {
+        orderId: String(order._id),
+        sessionId: session.id,
+      });
   
       // Redirige al Checkout de Stripe
       return res.redirect(303, session.url);
     } catch (err) {
-      console.error('[direct-checkout] error', err);
-      return res.status(500).send('No se pudo iniciar el pago');
+      console.error('[direct-checkout] error:', err?.raw || err);
+      const msg = err?.raw?.message || 'No se pudo iniciar el pago';
+      return res.status(500).send(msg);
     }
   });
 
