@@ -9,7 +9,9 @@ const Ticket = require('../models/Ticket');
 const sendTicketEmail = require('../utils/sendTicketEmail');
 
 const router2 = express2.Router();
-const stripe2 = new Stripe2(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
+const stripe2 = new Stripe2(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: '2024-06-20',
+});
 
 function genSerial() {
   const a = crypto.randomBytes(2).toString('hex').toUpperCase();
@@ -35,7 +37,7 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
     event = stripe2.webhooks.constructEvent(
       req.body,
       sig,
-      process.env.STRIPE_WEBHOOK_SECRET
+      process.env.STRIPE_WEBHOOK_SECRET   // 👈 usamos el webhook de "Your Account"
     );
   } catch (e) {
     console.error('Webhook signature failed:', e.message);
@@ -49,22 +51,25 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
       const session = event.data.object;
       const meta = session.metadata || {};
 
-      // --- NUEVO: resolución robusta de la orden ---
+      console.log('[stripe webhook] metadata:', meta);
+
+      // --- Resolución robusta de la Order ---
       let orderId = meta.orderId || null;
       let eventId = meta.eventId || null;
       let userId = meta.userId || null;
-
       let order = null;
 
-      // 1) Intentar por orderId en metadata
+      // 1) Buscar por orderId
       if (orderId) {
         order = await Order2.findById(orderId);
+        if (order) console.log('[stripe webhook] matched by orderId', orderId);
       }
 
-      // 2) Si no hay orderId o no existe, intentar por stripeSessionId
+      // 2) Si no, buscar por stripeSessionId
       if (!order) {
         order = await Order2.findOne({ stripeSessionId: session.id });
         if (order) {
+          console.log('[stripe webhook] matched by sessionId', session.id, '->', order._id);
           orderId = String(order._id);
           eventId = eventId || String(order.eventId);
           userId = userId || String(order.userId);
@@ -72,12 +77,7 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
       }
 
       if (!order) {
-        console.warn(
-          '[stripe webhook] order not found for session',
-          session.id,
-          'meta=',
-          meta
-        );
+        console.warn('[stripe webhook] order not found for session', session.id, 'meta=', meta);
         return res.json({ ok: true });
       }
 
@@ -98,27 +98,25 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
 
       const evt = await Event2.findById(eventId).lean();
 
-      // --- Actualizar contador ticketsSold ---
+      // --- Actualizar ticketsSold ---
+      const qty = order.qty || order.totalTickets || 1;
       if (evt && evt.capacity && evt.capacity > 0) {
         await Event2.updateOne(
           {
             _id: eventId,
             $expr: {
-              $lte: ['$ticketsSold', { $subtract: ['$capacity', order.qty || 1] }],
+              $lte: ['$ticketsSold', { $subtract: ['$capacity', qty] }],
             },
           },
-          { $inc: { ticketsSold: order.qty || 1 } }
+          { $inc: { ticketsSold: qty } }
         );
       } else {
-        await Event2.updateOne(
-          { _id: eventId },
-          { $inc: { ticketsSold: order.qty || 1 } }
-        );
+        await Event2.updateOne({ _id: eventId }, { $inc: { ticketsSold: qty } });
       }
 
       // --- Generar tickets ---
       const created = [];
-      for (let i = 0; i < (order.qty || 1); i++) {
+      for (let i = 0; i < qty; i++) {
         const serial = genSerial();
         const token = makeToken(serial);
         const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
@@ -144,7 +142,6 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
 
       // --- Enviar email ---
       try {
-        const evt = await Event2.findById(eventId).lean();
         const clubName = evt?.clubName || evt?.club?.entityName || '';
         const venue = evt?.locationName || evt?.venue || '';
         const eventDate = evt?.startAt
@@ -154,12 +151,7 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
             })
           : '';
 
-        console.log(
-          '[stripe webhook] sending email to',
-          order.email,
-          'serial=',
-          created[0]?.doc?.serial
-        );
+        console.log('[stripe webhook] sending email to', order.email);
 
         await sendTicketEmail({
           to: order.email,
@@ -176,7 +168,7 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
       }
     }
 
-    // --- Refunds / cancelaciones ---
+    // Refunds / cancelaciones
     if (
       event.type === 'charge.refunded' ||
       event.type === 'payment_intent.canceled'
@@ -186,7 +178,6 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
         { paymentIntentId: pi.id },
         { $set: { status: 'refunded' } }
       );
-      // TODO: invalidar tickets relacionados si procede
     }
 
     res.json({ received: true });
