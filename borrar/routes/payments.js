@@ -12,7 +12,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 
 const toCents = (n) => Math.round(Number(n) * 100);
 
-// POST /api/payments/create-checkout-session
+/*// POST /api/payments/create-checkout-session
 router.post('/create-checkout-session', async (req, res) => {
   try {
     const { eventId, userId, qty = 1, email, phone } = req.body || {};
@@ -129,46 +129,53 @@ router.post('/create-checkout-session', async (req, res) => {
     console.error('[create-checkout-session] error', err);
     return res.status(500).json({ error: 'No se pudo crear la sesión' });
   }
-});
+});*/
 
 // GET /api/payments/direct/:eventId
-// Enlace estable para compartir públicamente
+// Enlace "estable" que puedes compartir (no caduca).
+// Crea la sesión de Checkout y hace redirect 303 a Stripe.
 router.get('/direct/:eventId', async (req, res) => {
     try {
       const { eventId } = req.params;
-      const qty = 1; // 1 entrada por defecto (puedes cambiarlo si quieres)
-  
-      if (!eventId) {
-        return res.status(400).send('Falta eventId');
-      }
   
       const event = await Event.findById(eventId).lean();
-      if (!event) return res.status(404).send('Evento no encontrado');
+      if (!event) {
+        return res.status(404).send('Evento no encontrado');
+      }
   
-      // Ventana de venta y publicación (igual que en el POST)
+      // Misma lógica de validaciones que arriba
       const now = new Date();
-      if (event.isPublished === false) return res.status(400).send('Evento no publicado');
-      if (event.salesStart && now < new Date(event.salesStart)) return res.status(400).send('Venta no iniciada');
-      if (event.salesEnd && now > new Date(event.salesEnd)) return res.status(400).send('Venta finalizada');
+      if (event.isPublished === false) {
+        return res.status(400).send('Evento no publicado');
+      }
+      if (event.salesStart && now < new Date(event.salesStart)) {
+        return res.status(400).send('La venta todavía no ha empezado');
+      }
+      if (event.salesEnd && now > new Date(event.salesEnd)) {
+        return res.status(400).send('La venta ya ha finalizado');
+      }
   
       const unit = Number(event.price || event.priceEUR || 0);
-      if (!unit || unit < 0) return res.status(400).send('Precio inválido');
+      if (!unit || unit < 0) {
+        return res.status(400).send('Precio inválido');
+      }
   
-      // Stock (capacity 0 = sin límite)
+      const qty = 1;
+  
       if (event.capacity && event.capacity > 0) {
         if ((event.ticketsSold || 0) + qty > event.capacity) {
           return res.status(409).send('Sin stock suficiente');
         }
       }
   
-      // Creamos una Order pendiente SIN usuario (para link público)
+      // Order "guest": sin userId, email lo rellenará el webhook desde Stripe
       const order = await Order.create({
         userId: null,
         eventId,
         qty,
         amountEUR: unit * qty,
         currency: 'eur',
-        email: null,         // el email lo cogeremos del Checkout en el webhook
+        email: null,
         status: 'pending',
       });
   
@@ -189,28 +196,26 @@ router.get('/direct/:eventId', async (req, res) => {
             quantity: qty,
           },
         ],
-        // OJO: usa aquí el mismo success_url/cancel_url que tengas ahora mismo
-        // Si tu SuccessClient usa ?sid=..., ponlo así:
+        // Usa la misma URL de éxito / cancel que el flujo normal
         success_url: `${process.env.APP_BASE_URL}/purchase/success?sid={CHECKOUT_SESSION_ID}`,
         cancel_url: `${process.env.APP_BASE_URL}/event/${eventId}?cancelled=1`,
         metadata: {
           eventId: String(event._id),
           orderId: String(order._id),
-          userId: '',      // vacío porque no hay login
+          userId: '', // invitado
         },
         allow_promotion_codes: true,
         automatic_tax: { enabled: true },
-        // NO pasamos customer_email aquí: que Stripe pida el email en el checkout
       });
   
       order.stripeSessionId = session.id;
       await order.save();
   
-      // Redirigimos directamente a Stripe
+      // Redirige al Checkout de Stripe
       return res.redirect(303, session.url);
     } catch (err) {
-      console.error('[payments direct] error', err);
-      return res.status(500).send('No se pudo crear la sesión');
+      console.error('[direct-checkout] error', err);
+      return res.status(500).send('No se pudo iniciar el pago');
     }
   });
 
