@@ -111,29 +111,28 @@ function isAllowedOrigin(origin) {
   }
 }
 
-app.use(
-  cors({
-    origin: (origin, cb) =>
-      isAllowedOrigin(origin)
-        ? cb(null, true)
-        : cb(new Error(`CORS no permitido para: ${origin}`)),
-    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    credentials: true,
-    allowedHeaders: [
-      "Authorization",
-      "Content-Type",
-      "X-Requested-With",
-      "Accept",
-      "Origin",
-    ],
-    exposedHeaders: [
-      "Authorization",
-      "Content-Type",
-    ],
-  })
-);
-// Responder preflight explícitamente
-app.options("*", cors());
+// Config común de CORS para usar tanto en app.use como en preflight (OPTIONS)
+const corsOptions = {
+  origin: (origin, cb) =>
+    isAllowedOrigin(origin)
+      ? cb(null, true)
+      : cb(new Error(`CORS no permitido para: ${origin}`)),
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  credentials: true,
+  allowedHeaders: [
+    "Authorization",
+    "Content-Type",
+    "X-Requested-With",
+    "Accept",
+    "Origin",
+    "X-Scanner-Key", // necesario para el escáner
+  ],
+  exposedHeaders: ["Authorization", "Content-Type"],
+};
+
+app.use(cors(corsOptions));
+// Responder preflight explícitamente con la MISMA config
+app.options("*", cors(corsOptions));
 // DEBUG temporal: ver headers y si llega Authorization/Cookie
 if (process.env.NODE_ENV !== 'production') {
   app.all('/api/debug/echo', (req, res) => {
