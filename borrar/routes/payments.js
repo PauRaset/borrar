@@ -227,7 +227,7 @@ router.get('/direct/:eventId', async (req, res) => {
           clubId: String(clubId),
         },
         allow_promotion_codes: true,
-        automatic_tax: { enabled: true },
+        automatic_tax: { enabled: false },
         payment_intent_data: {
           application_fee_amount: applicationFee,
           transfer_data: { destination: club.stripeAccountId },
