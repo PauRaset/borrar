@@ -131,4 +131,87 @@ router.post('/create-checkout-session', async (req, res) => {
   }
 });
 
+// GET /api/payments/direct/:eventId
+// Enlace estable para compartir públicamente
+router.get('/direct/:eventId', async (req, res) => {
+    try {
+      const { eventId } = req.params;
+      const qty = 1; // 1 entrada por defecto (puedes cambiarlo si quieres)
+  
+      if (!eventId) {
+        return res.status(400).send('Falta eventId');
+      }
+  
+      const event = await Event.findById(eventId).lean();
+      if (!event) return res.status(404).send('Evento no encontrado');
+  
+      // Ventana de venta y publicación (igual que en el POST)
+      const now = new Date();
+      if (event.isPublished === false) return res.status(400).send('Evento no publicado');
+      if (event.salesStart && now < new Date(event.salesStart)) return res.status(400).send('Venta no iniciada');
+      if (event.salesEnd && now > new Date(event.salesEnd)) return res.status(400).send('Venta finalizada');
+  
+      const unit = Number(event.price || event.priceEUR || 0);
+      if (!unit || unit < 0) return res.status(400).send('Precio inválido');
+  
+      // Stock (capacity 0 = sin límite)
+      if (event.capacity && event.capacity > 0) {
+        if ((event.ticketsSold || 0) + qty > event.capacity) {
+          return res.status(409).send('Sin stock suficiente');
+        }
+      }
+  
+      // Creamos una Order pendiente SIN usuario (para link público)
+      const order = await Order.create({
+        userId: null,
+        eventId,
+        qty,
+        amountEUR: unit * qty,
+        currency: 'eur',
+        email: null,         // el email lo cogeremos del Checkout en el webhook
+        status: 'pending',
+      });
+  
+      const session = await stripe.checkout.sessions.create({
+        mode: 'payment',
+        locale: 'es',
+        currency: 'eur',
+        line_items: [
+          {
+            price_data: {
+              currency: 'eur',
+              unit_amount: toCents(unit),
+              product_data: {
+                name: event.title || 'Entrada NightVibe',
+                metadata: { eventId: String(event._id) },
+              },
+            },
+            quantity: qty,
+          },
+        ],
+        // OJO: usa aquí el mismo success_url/cancel_url que tengas ahora mismo
+        // Si tu SuccessClient usa ?sid=..., ponlo así:
+        success_url: `${process.env.APP_BASE_URL}/purchase/success?sid={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${process.env.APP_BASE_URL}/event/${eventId}?cancelled=1`,
+        metadata: {
+          eventId: String(event._id),
+          orderId: String(order._id),
+          userId: '',      // vacío porque no hay login
+        },
+        allow_promotion_codes: true,
+        automatic_tax: { enabled: true },
+        // NO pasamos customer_email aquí: que Stripe pida el email en el checkout
+      });
+  
+      order.stripeSessionId = session.id;
+      await order.save();
+  
+      // Redirigimos directamente a Stripe
+      return res.redirect(303, session.url);
+    } catch (err) {
+      console.error('[payments direct] error', err);
+      return res.status(500).send('No se pudo crear la sesión');
+    }
+  });
+
 module.exports = router;
