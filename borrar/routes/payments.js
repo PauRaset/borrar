@@ -6,14 +6,16 @@ const Event = require('../models/Event');
 const Club = require('../models/Club');
 
 const router = express.Router();
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: '2024-06-20',
+});
 
 const toCents = (n) => Math.round(Number(n) * 100);
 
 // POST /api/payments/create-checkout-session
 router.post('/create-checkout-session', async (req, res) => {
   try {
-    const { eventId, userId, qty = 1, email } = req.body || {};
+    const { eventId, userId, qty = 1, email, phone } = req.body || {};
     if (!eventId || !userId) {
       return res.status(400).json({ error: 'Faltan eventId o userId' });
     }
@@ -23,20 +25,16 @@ router.post('/create-checkout-session', async (req, res) => {
 
     // Ventana de venta y publicación
     const now = new Date();
-    if (event.isPublished === false) {
+    if (event.isPublished === false)
       return res.status(400).json({ error: 'Evento no publicado' });
-    }
-    if (event.salesStart && now < new Date(event.salesStart)) {
+    if (event.salesStart && now < new Date(event.salesStart))
       return res.status(400).json({ error: 'Venta no iniciada' });
-    }
-    if (event.salesEnd && now > new Date(event.salesEnd)) {
+    if (event.salesEnd && now > new Date(event.salesEnd))
       return res.status(400).json({ error: 'Venta finalizada' });
-    }
 
     const unit = Number(event.price || event.priceEUR || 0);
-    if (!unit || unit < 0) {
+    if (!unit || unit < 0)
       return res.status(400).json({ error: 'Precio inválido' });
-    }
 
     // Stock (capacity 0 = sin límite)
     const nQty = Math.max(1, Number(qty));
@@ -46,13 +44,12 @@ router.post('/create-checkout-session', async (req, res) => {
       }
     }
 
-    // === Stripe Connect: cuenta del club y comisión de plataforma ===
+    // === Stripe Connect: cuenta del club y comisión fija ===
     const clubId = event.clubId || event.club || event.organizerId || null;
     if (!clubId) {
-      return res.status(400).json({
-        error: 'club_not_set',
-        message: 'El evento no tiene club asociado.',
-      });
+      return res
+        .status(400)
+        .json({ error: 'club_not_set', message: 'El evento no tiene club asociado.' });
     }
 
     const club = await Club.findById(clubId).lean();
@@ -63,11 +60,11 @@ router.post('/create-checkout-session', async (req, res) => {
       });
     }
 
-    // Comisión fija: 1,50 € por entrada
+    // Comisión fija de plataforma: 1,50 € por entrada
     const PLATFORM_FEE_CENTS = 150;
     const applicationFee = PLATFORM_FEE_CENTS * nQty;
 
-    // Crea orden pendiente
+    // 1) Crear Order en estado pending/created
     const order = await Order.create({
       userId,
       eventId,
@@ -76,11 +73,11 @@ router.post('/create-checkout-session', async (req, res) => {
       amountEUR: unit * nQty,
       currency: 'eur',
       email: email || null,
-      status: 'pending', // lo ajustamos en el schema para que sea válido
-      applicationFeeCents: applicationFee,
-      destinationAccount: club.stripeAccountId,
+      phone: phone || null,
+      status: 'created',
     });
 
+    // 2) Crear Checkout Session
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       locale: 'es',
@@ -102,7 +99,7 @@ router.post('/create-checkout-session', async (req, res) => {
       cancel_url: `${process.env.APP_BASE_URL}/event/${eventId}?cancelled=1`,
       metadata: {
         eventId: String(event._id),
-        orderId: String(order._id),   // 👈 clave para el webhook
+        orderId: String(order._id),   // 👈 CLAVE
         userId: String(userId),
         clubId: String(clubId),
       },
@@ -116,16 +113,15 @@ router.post('/create-checkout-session', async (req, res) => {
       },
     });
 
-    // Guarda el id de sesión para fallback en el webhook
+    // 3) Guardar referencia de sesión en la Order
     order.stripeSessionId = session.id;
+    order.sessionMetadata = session.metadata || {};
     await order.save();
 
-    console.log('♦♦  Created Checkout Session:', {
-      clubId: String(clubId),
-      destinationAccount: club.stripeAccountId,
-      applicationFee,
-      sessionId: session.id,
+    console.log('◆ Created Checkout Session:', {
       orderId: String(order._id),
+      sessionId: session.id,
+      email,
     });
 
     return res.json({ url: session.url });
