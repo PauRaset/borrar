@@ -652,14 +652,20 @@ app.post("/api/orders", async (req, res) => {
       };
     });
 
-    // Calcula application fee (opcional)
+    // Calcula application fee: 1,50 € por entrada (según env)
     const subtotal = line_items.reduce(
       (acc, li) => acc + li.price_data.unit_amount * li.quantity,
       0
     );
-    const bps = parseInt(process.env.PLATFORM_FEE_BPS || "0", 10);     // basis points
-    const fixed = parseInt(process.env.PLATFORM_FEE_FIXED || "0", 10); // céntimos
-    const applicationFee = Math.max(0, Math.round((subtotal * bps) / 10000) + fixed);
+
+    // total de entradas en el pedido
+    const qtyTotal = line_items.reduce((acc, li) => acc + (li.quantity || 0), 0);
+
+    // fee por ticket en céntimos (ej: 150 = 1,50 €)
+    const perTicketCents = parseInt(process.env.PLATFORM_FEE_PER_TICKET_CENTS || "0", 10);
+
+    // si no has puesto nada, cae a 0
+    const applicationFee = Math.max(0, qtyTotal * perTicketCents);
 
     // 🔎 Resolver cuenta Connect y clubId de forma robusta
     const resolved = await resolveConnectedAccount({ clubId, eventId });
