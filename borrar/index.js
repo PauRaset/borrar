@@ -764,42 +764,90 @@ app.post("/api/checkin", async (req, res) => {
       return res.status(401).json({ ok: false, reason: "unauthorized" });
     }
 
-    const { token, eventId, hmac } = req.body || {};
-    if (!token || !eventId || !hmac) {
+    const { token, eventId, hmac, serial } = req.body || {};
+    console.log("[checkin] body:", req.body);
+
+    // Soportamos dos modos:
+    //  1) Formato nuevo  -> token + eventId + hmac  (NV1)
+    //  2) Formato legacy -> serial + token         (JSON antiguo)
+    const isNewFormat = !!(token && eventId && hmac);
+    const isLegacyFormat = !!(serial && token);
+
+    if (!isNewFormat && !isLegacyFormat) {
       return res.status(400).json({ ok: false, reason: "bad_request" });
     }
 
-    // Verificar firma HMAC
-    const expected = crypto
-      .createHmac("sha256", process.env.QR_HMAC_KEY)
-      .update(`${token}|${eventId}`)
-      .digest("base64url");
-    if (expected !== hmac) {
-      await CheckInLog.create({
-        ticketId: null,
-        eventId,
-        result: "bad_signature",
-      });
-      return res.status(400).json({ ok: false, reason: "bad_signature" });
-    }
-
-    // Buscar ticket por comparación de hash (MVP)
-    const candidates = await Ticket.find({
-      eventId,
-      status: { $in: ["issued", "checked_in"] },
-    }).limit(10000);
-
     let found = null;
-    for (const t of candidates) {
-      const ok = await bcrypt.compare(token, t.tokenHash);
-      if (ok) {
-        found = t;
-        break;
+    let effectiveEventId = eventId || null;
+
+    if (isNewFormat) {
+      // ---------- Modo nuevo: token + eventId + hmac ----------
+      // Verificar firma HMAC
+      const expected = crypto
+        .createHmac("sha256", process.env.QR_HMAC_KEY || "")
+        .update(`${token}|${eventId}`)
+        .digest("base64url");
+
+      if (expected !== hmac) {
+        await CheckInLog.create({
+          ticketId: null,
+          eventId,
+          result: "bad_signature",
+        });
+        return res.status(400).json({ ok: false, reason: "bad_signature" });
       }
+
+      // Buscar ticket por comparación de hash dentro del evento
+      const candidates = await Ticket.find({
+        eventId,
+        status: { $in: ["issued", "checked_in"] },
+      }).limit(10000);
+
+      for (const t of candidates) {
+        const ok = await bcrypt.compare(token, t.tokenHash);
+        if (ok) {
+          found = t;
+          break;
+        }
+      }
+
+      effectiveEventId = eventId;
+    } else if (isLegacyFormat) {
+      // ---------- Modo legacy: serial + token ----------
+      const cand = await Ticket.findOne({
+        serial,
+        status: { $in: ["issued", "checked_in"] },
+      });
+
+      if (!cand) {
+        await CheckInLog.create({
+          ticketId: null,
+          eventId: null,
+          result: "invalid",
+        });
+        return res.status(404).json({ ok: false, reason: "invalid" });
+      }
+
+      const ok = await bcrypt.compare(token, cand.tokenHash);
+      if (!ok) {
+        await CheckInLog.create({
+          ticketId: cand._id,
+          eventId: cand.eventId || null,
+          result: "bad_signature",
+        });
+        return res.status(400).json({ ok: false, reason: "bad_signature" });
+      }
+
+      found = cand;
+      effectiveEventId = cand.eventId || null;
     }
 
     if (!found) {
-      await CheckInLog.create({ ticketId: null, eventId, result: "invalid" });
+      await CheckInLog.create({
+        ticketId: null,
+        eventId: effectiveEventId,
+        result: "invalid",
+      });
       return res.status(404).json({ ok: false, reason: "invalid" });
     }
 
@@ -816,12 +864,14 @@ app.post("/api/checkin", async (req, res) => {
           buyerEmail = ord.email || "";
         }
       }
-    } catch { /* noop */ }
+    } catch {
+      // noop
+    }
 
     if (found.status === "checked_in") {
       await CheckInLog.create({
         ticketId: found._id,
-        eventId,
+        eventId: effectiveEventId,
         result: "duplicate",
       });
       return res.json({
@@ -850,7 +900,7 @@ app.post("/api/checkin", async (req, res) => {
     const result = updated ? "ok" : "duplicate";
     await CheckInLog.create({
       ticketId: found._id,
-      eventId,
+      eventId: effectiveEventId,
       result,
     });
 
