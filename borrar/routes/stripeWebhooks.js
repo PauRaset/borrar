@@ -20,7 +20,9 @@ function genSerial() {
 }
 
 function makeToken(serial) {
-  const raw = `${serial}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+  const raw = `${serial}.${Date.now()}.${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
   const sig = crypto
     .createHmac('sha256', process.env.QR_HMAC_KEY || 'nv_dev')
     .update(raw)
@@ -37,7 +39,7 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
     event = stripe2.webhooks.constructEvent(
       req.body,
       sig,
-      process.env.STRIPE_WEBHOOK_SECRET   // 👈 usamos el webhook de "Your Account"
+      process.env.STRIPE_WEBHOOK_SECRET
     );
   } catch (e) {
     console.error('Webhook signature failed:', e.message);
@@ -51,75 +53,106 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
       const session = event.data.object;
       const meta = session.metadata || {};
 
-      console.log('[stripe webhook] metadata:', meta);
+      console.log('[stripe webhook] metadata =', meta);
 
-      // --- Resolución robusta de la Order ---
-      let orderId = meta.orderId || null;
-      let eventId = meta.eventId || null;
-      let userId = meta.userId || null;
+      const sessionId = session.id;
+      const eventId = meta.eventId || null;
+      const userId = meta.userId || null;
+      const qtyMeta = meta.qty ? Number(meta.qty) : 1;
+
+      // Email fiable desde Stripe
+      const stripeEmail =
+        session.customer_details?.email ||
+        session.customer_email ||
+        null;
+
+      /* 1) Intentar encontrar Order por orderId (si viene) */
       let order = null;
-
-      // 1) Buscar por orderId
-      if (orderId) {
-        order = await Order2.findById(orderId);
-        if (order) console.log('[stripe webhook] matched by orderId', orderId);
-      }
-
-      // 2) Si no, buscar por stripeSessionId
-      if (!order) {
-        order = await Order2.findOne({ stripeSessionId: session.id });
-        if (order) {
-          console.log('[stripe webhook] matched by sessionId', session.id, '->', order._id);
-          orderId = String(order._id);
-          eventId = eventId || String(order.eventId);
-          userId = userId || String(order.userId);
+      if (meta.orderId) {
+        order = await Order2.findById(meta.orderId);
+        if (!order) {
+          console.warn(
+            '[stripe webhook] orderId en metadata pero no existe en Mongo:',
+            meta.orderId
+          );
         }
       }
 
+      /* 2) Si no hay order o no viene orderId, intentamos por stripeSessionId */
       if (!order) {
-        console.warn('[stripe webhook] order not found for session', session.id, 'meta=', meta);
-        return res.json({ ok: true });
+        order = await Order2.findOne({ stripeSessionId: sessionId });
       }
 
-      if (order.status === 'paid') {
-        console.log('[stripe webhook] order already paid', orderId);
-        return res.json({ ok: true }); // idempotencia
+      /* 3) Si sigue sin haber Order, la creamos “on the fly” desde Stripe */
+      if (!order) {
+        console.warn(
+          '[stripe webhook] no Order found for session, creating on the fly:',
+          sessionId
+        );
+
+        const amountTotal = typeof session.amount_total === 'number'
+          ? session.amount_total
+          : null;
+
+        order = await Order2.create({
+          stripeSessionId: sessionId,
+          paymentIntentId: session.payment_intent || null,
+          userId: userId || null,
+          eventId: eventId,
+          clubId: meta.clubId || null,
+          qty: qtyMeta,
+          amountEUR: amountTotal ? amountTotal / 100 : undefined,
+          currency: session.currency || 'eur',
+          email: stripeEmail,
+          status: 'paid',
+          sessionMetadata: meta,
+        });
+      } else {
+        // Order existente: idempotencia
+        if (order.status === 'paid') {
+          console.log('[stripe webhook] order already paid:', order._id);
+          return res.json({ ok: true });
+        }
+        order.status = 'paid';
+        order.paymentIntentId = session.payment_intent || order.paymentIntentId;
+        order.email = order.email || stripeEmail || order.email;
+        await order.save();
       }
 
-      // --- Actualizar orden ---
-      order.status = 'paid';
-      order.paymentIntentId = session.payment_intent;
-      order.email =
-        order.email ||
-        session.customer_details?.email ||
-        session.customer_email ||
-        order.email;
-      await order.save();
+      const usedQty = order.qty || qtyMeta || 1;
 
+      // --- Actualizar contador ticketsSold ---
       const evt = await Event2.findById(eventId).lean();
 
-      // --- Actualizar ticketsSold ---
-      const qty = order.qty || order.totalTickets || 1;
       if (evt && evt.capacity && evt.capacity > 0) {
         await Event2.updateOne(
           {
             _id: eventId,
             $expr: {
-              $lte: ['$ticketsSold', { $subtract: ['$capacity', qty] }],
+              $lte: [
+                '$ticketsSold',
+                { $subtract: ['$capacity', usedQty] },
+              ],
             },
           },
-          { $inc: { ticketsSold: qty } }
+          { $inc: { ticketsSold: usedQty } }
         );
       } else {
-        await Event2.updateOne({ _id: eventId }, { $inc: { ticketsSold: qty } });
+        await Event2.updateOne(
+          { _id: eventId },
+          { $inc: { ticketsSold: usedQty } }
+        );
       }
 
       // --- Generar tickets ---
       const created = [];
-      for (let i = 0; i < qty; i++) {
+      for (let i = 0; i < usedQty; i++) {
         const serial = genSerial();
         const token = makeToken(serial);
-        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+        const tokenHash = crypto
+          .createHash('sha256')
+          .update(token)
+          .digest('hex');
         const qrPayload = JSON.stringify({ serial, token });
         const qrPngBuffer = await QRCode.toBuffer(qrPayload, {
           type: 'png',
@@ -131,7 +164,7 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
           eventId,
           orderId: order._id,
           ownerUserId: userId,
-          email: order.email,
+          email: order.email || stripeEmail,
           serial,
           tokenHash,
           status: 'issued',
@@ -142,20 +175,27 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
 
       // --- Enviar email ---
       try {
-        const clubName = evt?.clubName || evt?.club?.entityName || '';
-        const venue = evt?.locationName || evt?.venue || '';
-        const eventDate = evt?.startAt
-          ? new Date(evt.startAt).toLocaleString('es-ES', {
+        const freshEvt = evt || (await Event2.findById(eventId).lean());
+        const clubName =
+          freshEvt?.clubName || freshEvt?.club?.entityName || '';
+        const venue = freshEvt?.locationName || freshEvt?.venue || '';
+        const eventDate = freshEvt?.startAt
+          ? new Date(freshEvt.startAt).toLocaleString('es-ES', {
               dateStyle: 'medium',
               timeStyle: 'short',
             })
           : '';
 
-        console.log('[stripe webhook] sending email to', order.email);
+        console.log(
+          '[stripe webhook] sending ticket email to',
+          order.email || stripeEmail,
+          'serial=',
+          created[0]?.doc?.serial
+        );
 
         await sendTicketEmail({
-          to: order.email,
-          eventTitle: evt?.title || 'Entrada NightVibe',
+          to: order.email || stripeEmail,
+          eventTitle: freshEvt?.title || 'Entrada NightVibe',
           clubName,
           eventDate,
           venue,
@@ -168,7 +208,7 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
       }
     }
 
-    // Refunds / cancelaciones
+    // ---- Refunds / cancelaciones ----
     if (
       event.type === 'charge.refunded' ||
       event.type === 'payment_intent.canceled'
@@ -178,6 +218,7 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
         { paymentIntentId: pi.id },
         { $set: { status: 'refunded' } }
       );
+      // TODO: invalidar tickets si hace falta
     }
 
     res.json({ received: true });
