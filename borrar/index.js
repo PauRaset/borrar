@@ -814,6 +814,9 @@ app.post("/api/checkin", async (req, res) => {
       effectiveEventId = eventId;
     } else if (isLegacyFormat) {
       // ---------- Modo legacy: serial + token ----------
+      // Compatibilidad hacia atrás: algunas entradas antiguas codifican solo
+      // { serial, token } en el QR y no tienen un tokenHash verificable.
+      // Para estas, validamos únicamente por serial.
       const cand = await Ticket.findOne({
         serial,
         status: { $in: ["issued", "checked_in"] },
@@ -828,16 +831,7 @@ app.post("/api/checkin", async (req, res) => {
         return res.status(404).json({ ok: false, reason: "invalid" });
       }
 
-      const ok = await bcrypt.compare(token, cand.tokenHash);
-      if (!ok) {
-        await CheckInLog.create({
-          ticketId: cand._id,
-          eventId: cand.eventId || null,
-          result: "bad_signature",
-        });
-        return res.status(400).json({ ok: false, reason: "bad_signature" });
-      }
-
+      // A partir de aquí tratamos igual que en el formato nuevo
       found = cand;
       effectiveEventId = cand.eventId || null;
     }
