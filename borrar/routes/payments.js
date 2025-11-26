@@ -10,18 +10,41 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: '2024-06-20',
 });
 
-// Permite precios con coma o punto (ej. "12,50" o "12.5")
+// Permite precios con coma o punto, y acepta formatos como "12,50", "12,50€", " 12.50 € " etc.
 const parsePrice = (value) => {
   if (value === null || value === undefined) return null;
-  if (typeof value === 'number') return value;
 
-  const str = String(value).trim();
+  // Si ya es número
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  let str = String(value).trim();
   if (!str) return null;
 
-  // Normalizamos coma a punto
-  const normalized = str.replace(',', '.');
-  const n = Number(normalized);
+  // Quitamos símbolo de euro y espacios
+  str = str.replace(/[€\s]/g, '');
 
+  // Normalizamos coma a punto
+  str = str.replace(',', '.');
+
+  // Permitimos solo dígitos y UN punto decimal
+  let cleaned = '';
+  let dotSeen = false;
+  for (const ch of str) {
+    if (ch >= '0' && ch <= '9') {
+      cleaned += ch;
+    } else if (ch === '.') {
+      if (!dotSeen) {
+        cleaned += ch;
+        dotSeen = true;
+      }
+    }
+  }
+
+  if (!cleaned) return null;
+
+  const n = Number(cleaned);
   if (!Number.isFinite(n)) return null;
   return n;
 };
@@ -185,7 +208,8 @@ outer.get('/direct/:eventId', async (req, res) => {
           : event.priceEUR
       );
   
-      if (unit === null || unit === undefined || unit < 0) {
+      if (unit === null || unit === undefined || Number.isNaN(unit) || unit < 0) {
+        console.error('[direct] Precio inválido, valor bruto:', event.price, event.priceEUR);
         return res.status(400).send('Precio inválido');
       }
   
@@ -311,7 +335,8 @@ router.get('/direct/:eventId', async (req, res) => {
           : event.priceEUR
       );
   
-      if (unit === null || unit === undefined || unit < 0) {
+      if (unit === null || unit === undefined || Number.isNaN(unit) || unit < 0) {
+        console.error('[direct] Precio inválido, valor bruto:', event.price, event.priceEUR);
         return res.status(400).send('Precio inválido');
       }
   
