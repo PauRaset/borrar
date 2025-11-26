@@ -305,8 +305,13 @@ router.get('/direct/:eventId', async (req, res) => {
         return res.status(400).send('La venta ya ha finalizado');
       }
   
-      const unit = Number(event.price || event.priceEUR || 0);
-      if (!unit || unit < 0) {
+      const unit = parsePrice(
+        event.price !== undefined && event.price !== null
+          ? event.price
+          : event.priceEUR
+      );
+  
+      if (unit === null || unit === undefined || unit < 0) {
         return res.status(400).send('Precio inválido');
       }
   
