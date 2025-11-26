@@ -10,7 +10,27 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: '2024-06-20',
 });
 
-const toCents = (n) => Math.round(Number(n) * 100);
+// Permite precios con coma o punto (ej. "12,50" o "12.5")
+const parsePrice = (value) => {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') return value;
+
+  const str = String(value).trim();
+  if (!str) return null;
+
+  // Normalizamos coma a punto
+  const normalized = str.replace(',', '.');
+  const n = Number(normalized);
+
+  if (!Number.isFinite(n)) return null;
+  return n;
+};
+
+const toCents = (n) => {
+  const parsed = parsePrice(n);
+  if (parsed === null) return NaN;
+  return Math.round(parsed * 100);
+};
 
 /*// POST /api/payments/create-checkout-session
 router.post('/create-checkout-session', async (req, res) => {
@@ -159,8 +179,13 @@ outer.get('/direct/:eventId', async (req, res) => {
         return res.status(400).send('La venta ya ha finalizado');
       }
   
-      const unit = Number(event.price || event.priceEUR || 0);
-      if (!unit || unit < 0) {
+      const unit = parsePrice(
+        event.price !== undefined && event.price !== null
+          ? event.price
+          : event.priceEUR
+      );
+  
+      if (unit === null || unit === undefined || unit < 0) {
         return res.status(400).send('Precio inválido');
       }
   
