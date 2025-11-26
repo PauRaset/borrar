@@ -134,7 +134,11 @@ router.post('/create-checkout-session', async (req, res) => {
 // GET /api/payments/direct/:eventId
 // Enlace estable que puedes compartir (no caduca).
 // Crea la sesión de Checkout y hace redirect 303 a Stripe.
-router.get('/direct/:eventId', async (req, res) => {
+/*r
+
+VENDRE ENTRADES UNICAMENT 1 EVENT (1ra 6 ENTRADES)
+
+outer.get('/direct/:eventId', async (req, res) => {
     try {
       const { eventId } = req.params;
   
@@ -211,6 +215,166 @@ router.get('/direct/:eventId', async (req, res) => {
               unit_amount: toCents(unit),
               product_data: {
                 name: event.title || 'Entrada NightVibe',
+                metadata: { eventId: String(event._id) },
+              },
+            },
+            quantity: qty,
+          },
+        ],
+        // Mismo success/cancel que el flujo normal
+        success_url: `${process.env.APP_BASE_URL}/purchase/success?sid={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${process.env.APP_BASE_URL}/event/${eventId}?cancelled=1`,
+        metadata: {
+          eventId: String(event._id),
+          orderId: String(order._id),
+          userId: '', // invitado
+          clubId: String(clubId),
+        },
+        allow_promotion_codes: true,
+        automatic_tax: { enabled: false },
+        payment_intent_data: {
+          application_fee_amount: applicationFee,
+          transfer_data: { destination: club.stripeAccountId },
+          on_behalf_of: club.stripeAccountId,
+        },
+      });
+  
+      order.stripeSessionId = session.id;
+      order.sessionMetadata = session.metadata || {};
+      await order.save();
+  
+      console.log('◆ [direct] Created Checkout Session:', {
+        orderId: String(order._id),
+        sessionId: session.id,
+      });
+  
+      // Redirige al Checkout de Stripe
+      return res.redirect(303, session.url);
+    } catch (err) {
+      console.error('[direct-checkout] error:', err?.raw || err);
+      const msg = err?.raw?.message || 'No se pudo iniciar el pago';
+      return res.status(500).send(msg);
+    }
+  });*/
+  // GET /api/payments/direct/:eventId
+// Enlace estable que puedes compartir (no caduca).
+// Crea la sesión de Checkout y hace redirect 303 a Stripe.
+router.get('/direct/:eventId', async (req, res) => {
+    try {
+      const { eventId } = req.params;
+  
+      const event = await Event.findById(eventId).lean();
+      if (!event) {
+        return res.status(404).send('Evento no encontrado');
+      }
+  
+      // Misma lógica de validaciones que en create-checkout-session
+      const now = new Date();
+      if (event.isPublished === false) {
+        return res.status(400).send('Evento no publicado');
+      }
+      if (event.salesStart && now < new Date(event.salesStart)) {
+        return res.status(400).send('La venta todavía no ha empezado');
+      }
+      if (event.salesEnd && now > new Date(event.salesEnd)) {
+        return res.status(400).send('La venta ya ha finalizado');
+      }
+  
+      const unit = Number(event.price || event.priceEUR || 0);
+      if (!unit || unit < 0) {
+        return res.status(400).send('Precio inválido');
+      }
+  
+      const qty = 1;
+  
+      // Stock (capacity 0 = sin límite)
+      if (event.capacity && event.capacity > 0) {
+        if ((event.ticketsSold || 0) + qty > event.capacity) {
+          return res.status(409).send('Sin stock suficiente');
+        }
+      }
+  
+      // === Stripe Connect: misma lógica que en create-checkout-session ===
+      const clubId = event.clubId || event.club || event.organizerId || null;
+      if (!clubId) {
+        return res.status(400).send('El evento no tiene club asociado.');
+      }
+  
+      const club = await Club.findById(clubId).lean();
+      if (!club || !club.stripeAccountId) {
+        return res
+          .status(400)
+          .send('El club no tiene cuenta conectada en Stripe (LIVE).');
+      }
+  
+      // Comisión fija de plataforma: 1,50 € por entrada
+      const PLATFORM_FEE_CENTS = 150;
+      const applicationFee = PLATFORM_FEE_CENTS * qty;
+  
+      // Order "guest": sin userId ni email (Stripe nos dará el email)
+      const order = await Order.create({
+        userId: null,
+        eventId,
+        clubId,
+        qty,
+        amountEUR: unit * qty,
+        currency: 'eur',
+        email: null,
+        status: 'created',
+      });
+  
+      // ==== Cartel / imagen del evento para Stripe Checkout ====
+      let eventImageUrl = null;
+  
+      // 1) Intentamos con event.image
+      if (event.image) {
+        if (/^https?:\/\//.test(event.image)) {
+          // ya es una URL absoluta
+          eventImageUrl = event.image;
+        } else if (process.env.PUBLIC_UPLOADS_BASE_URL) {
+          // ruta relativa -> la montamos con un dominio público
+          eventImageUrl = `${process.env.PUBLIC_UPLOADS_BASE_URL}${event.image}`;
+        }
+      }
+  
+      // 2) Si no hay, probamos con la primera foto de event.photos
+      if (
+        !eventImageUrl &&
+        Array.isArray(event.photos) &&
+        event.photos.length > 0 &&
+        event.photos[0]
+      ) {
+        const firstPhoto = event.photos[0];
+        if (/^https?:\/\//.test(firstPhoto)) {
+          eventImageUrl = firstPhoto;
+        } else if (process.env.PUBLIC_UPLOADS_BASE_URL) {
+          eventImageUrl = `${process.env.PUBLIC_UPLOADS_BASE_URL}${firstPhoto}`;
+        }
+      }
+  
+      // Descripción opcional para Stripe
+      const descriptionParts = [];
+      if (event.city) descriptionParts.push(event.city);
+      if (event.date) descriptionParts.push(new Date(event.date).toLocaleDateString('es-ES'));
+      const productDescription =
+        descriptionParts.length > 0
+          ? descriptionParts.join(' • ')
+          : 'Entrada para evento NightVibe';
+  
+      const session = await stripe.checkout.sessions.create({
+        mode: 'payment',
+        locale: 'es',
+        currency: 'eur',
+        line_items: [
+          {
+            price_data: {
+              currency: 'eur',
+              unit_amount: toCents(unit),
+              product_data: {
+                name: event.title || 'Entrada NightVibe',
+                description: productDescription,
+                // 👇 solo añadimos images si tenemos una URL válida
+                ...(eventImageUrl ? { images: [eventImageUrl] } : {}),
                 metadata: { eventId: String(event._id) },
               },
             },
