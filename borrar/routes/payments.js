@@ -324,19 +324,35 @@ router.get('/direct/:eventId', async (req, res) => {
       });
   
       // ==== Cartel / imagen del evento para Stripe Checkout ====
+      // ==== Cartel / imagen del evento para Stripe Checkout ====
       let eventImageUrl = null;
-  
+
+      // Función auxiliar para montar una URL absoluta desde una ruta relativa
+      const buildAbsoluteImageUrl = (relativePath) => {
+        if (!relativePath) return null;
+
+        // si ya es absoluta, la devolvemos tal cual
+        if (/^https?:\/\//.test(relativePath)) return relativePath;
+
+        // nos aseguramos de que empieza por '/'
+        let cleanPath = relativePath;
+        if (!cleanPath.startsWith('/')) {
+          cleanPath = '/' + cleanPath;
+        }
+
+        // base URL: env o dominio actual del backend
+        const base =
+          process.env.PUBLIC_UPLOADS_BASE_URL ||
+          `${req.protocol}://${req.get('host')}`;
+
+        return `${base}${cleanPath}`;
+      };
+
       // 1) Intentamos con event.image
       if (event.image) {
-        if (/^https?:\/\//.test(event.image)) {
-          // ya es una URL absoluta
-          eventImageUrl = event.image;
-        } else if (process.env.PUBLIC_UPLOADS_BASE_URL) {
-          // ruta relativa -> la montamos con un dominio público
-          eventImageUrl = `${process.env.PUBLIC_UPLOADS_BASE_URL}${event.image}`;
-        }
+        eventImageUrl = buildAbsoluteImageUrl(event.image);
       }
-  
+
       // 2) Si no hay, probamos con la primera foto de event.photos
       if (
         !eventImageUrl &&
@@ -344,12 +360,7 @@ router.get('/direct/:eventId', async (req, res) => {
         event.photos.length > 0 &&
         event.photos[0]
       ) {
-        const firstPhoto = event.photos[0];
-        if (/^https?:\/\//.test(firstPhoto)) {
-          eventImageUrl = firstPhoto;
-        } else if (process.env.PUBLIC_UPLOADS_BASE_URL) {
-          eventImageUrl = `${process.env.PUBLIC_UPLOADS_BASE_URL}${firstPhoto}`;
-        }
+        eventImageUrl = buildAbsoluteImageUrl(event.photos[0]);
       }
   
       // Descripción opcional para Stripe
