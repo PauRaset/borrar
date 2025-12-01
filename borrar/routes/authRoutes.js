@@ -206,6 +206,7 @@ router.post("/reset", async (req, res) => {
 /* -------- Intercambio Firebase -> JWT propio -------- */
 // Permite a la app intercambiar un Firebase ID token por tu JWT legacy
 // Headers: Authorization: Bearer <FirebaseIdToken>
+
 router.post(
   "/exchangeFirebase",
   anyAuth,       // acepta JWT propio o Firebase ID token
@@ -236,6 +237,97 @@ router.post(
     }
   }
 );
+
+/**
+ * POST /api/auth/ensure
+ * Asegura que el usuario autenticado existe en la BD y actualiza
+ * los datos básicos enviados desde el cliente móvil tras el login
+ * por teléfono (username, displayName, instagram, bio, etc.).
+ *
+ * Acepta tanto tu JWT propio como un Firebase ID token (anyAuth).
+ */
+router.post("/ensure", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const {
+      username,
+      displayName,
+      instagram,
+      bio,
+    } = req.body || {};
+
+    // Intentamos resolver el usuario actual (por JWT legacy o Firebase)
+    let user = await resolveUserFromRequest(req);
+
+    // Si no existe aún pero venimos con Firebase, lo creamos básico
+    if (!user && req.firebaseUser && req.firebaseUser.uid) {
+      const phone = req.firebaseUser.phone_number || "";
+      const fallbackUsername = phone
+        ? `user_${phone.replace(/\D/g, "").slice(-6)}`
+        : `user_${Date.now()}`;
+
+      user = await User.create({
+        username: fallbackUsername,
+        phoneNumber: phone,
+        firebaseUid: req.firebaseUser.uid,
+        role: "spectator",
+      });
+    }
+
+    if (!user) {
+      return res.status(404).json({ message: "Usuario no encontrado" });
+    }
+
+    // Si viene username, lo normalizamos y comprobamos que no esté usado por otro usuario
+    if (typeof username === "string" && username.trim()) {
+      const normUsername = username.trim();
+      const existing = await User.findOne({
+        username: normUsername,
+        _id: { $ne: user._id },
+      });
+      if (existing) {
+        return res
+          .status(400)
+          .json({ message: "Ese nombre de usuario ya está en uso" });
+      }
+      user.username = normUsername;
+    }
+
+    // displayName -> lo usamos como entityName / entName en spectators
+    if (typeof displayName === "string" && displayName.trim()) {
+      const val = displayName.trim();
+      user.entityName = val;
+      user.entName = val;
+    }
+
+    // Instagram: normalizar igual que en /update
+    if (typeof instagram === "string") {
+      let val = instagram.trim();
+      if (val.startsWith("@")) val = `https://instagram.com/${val.slice(1)}`;
+      if (val && !/^https?:\/\//i.test(val)) val = `https://${val}`;
+      user.instagram = val;
+    }
+
+    // Bio opcional
+    if (typeof bio === "string") {
+      user.bio = bio;
+    }
+
+    // Aseguramos que los spectators creados aquí tienen el rol correcto
+    if (!user.role) {
+      user.role = "spectator";
+    }
+
+    await user.save();
+
+    return res.json({
+      message: "Usuario sincronizado correctamente",
+      user,
+    });
+  } catch (err) {
+    console.error("[POST /api/auth/ensure] error:", err);
+    return res.status(500).json({ message: "Error en el servidor" });
+  }
+});
 
 router.post("/firebase", authController.firebaseLogin);
 
