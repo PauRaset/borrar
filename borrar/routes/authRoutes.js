@@ -501,6 +501,72 @@ router.get("/users/me/attending", anyAuth, ensureUserId, async (req, res) => {
   }
 });
 
+
+/* -------- Perfil completo del usuario autenticado (incluye following) -------- */
+router.get("/me", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const me = await resolveUserFromRequest(req);
+    if (!me) {
+      return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    }
+
+    // Aseguramos que followers/following siempre sean arrays
+    const followers = Array.isArray(me.followers) ? me.followers : [];
+    const following = Array.isArray(me.following) ? me.following : [];
+
+    return res.json({
+      ok: true,
+      user: {
+        _id: me._id,
+        id: me._id, // para compatibilidad con Flutter
+        role: me.role,
+        username: me.username,
+        email: me.email,
+        entName: me.entName,
+        entityName: me.entityName,
+        phoneNumber: me.phoneNumber,
+        firebaseUid: me.firebaseUid,
+        profilePicture: me.profilePicture,
+        instagram: me.instagram,
+        bio: me.bio,
+        isPrivate: me.isPrivate,
+        followers,
+        following,
+        followersCount: followers.length,
+        followingCount: following.length,
+        createdAt: me.createdAt,
+        updatedAt: me.updatedAt,
+      },
+    });
+  } catch (err) {
+    console.error("[GET /api/auth/me] error:", err);
+    return res.status(500).json({ ok: false, message: "Error en el servidor" });
+  }
+});
+
+/* -------- Solo IDs de la gente a la que sigo (para cliente móvil) -------- */
+router.get("/users/me/following-ids", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const me = await resolveUserFromRequest(req);
+    if (!me) {
+      return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    }
+
+    const following = Array.isArray(me.following) ? me.following : [];
+    // Normalizamos a string
+    const followingIds = following.map((v) => v.toString());
+
+    return res.json({
+      ok: true,
+      followingIds,
+      count: followingIds.length,
+    });
+  } catch (err) {
+    console.error("[GET /api/auth/users/me/following-ids] error:", err);
+    return res.status(500).json({ ok: false, message: "Error en el servidor" });
+  }
+});
+
 /* -------- Obtener usuario por id (pública) — al final -------- */
 router.get("/:userId", async (req, res) => {
   try {
