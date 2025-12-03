@@ -503,7 +503,7 @@ router.get("/users/me/attending", anyAuth, ensureUserId, async (req, res) => {
 
 
 /* -------- Perfil completo del usuario autenticado (incluye following) -------- */
-router.get("/me", anyAuth, ensureUserId, async (req, res) => {
+/*router.get("/me", anyAuth, ensureUserId, async (req, res) => {
   try {
     const me = await resolveUserFromRequest(req);
     if (!me) {
@@ -542,10 +542,78 @@ router.get("/me", anyAuth, ensureUserId, async (req, res) => {
     console.error("[GET /api/auth/me] error:", err);
     return res.status(500).json({ ok: false, message: "Error en el servidor" });
   }
+});*/
+
+/* -------- Perfil completo del usuario autenticado (incluye following) -------- */
+router.get("/me", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const me = await resolveUserFromRequest(req);
+    if (!me) {
+      return res
+        .status(404)
+        .json({ ok: false, message: "Usuario no encontrado" });
+    }
+
+    // Recargamos desde BD para asegurarnos de tener followers/following actualizados
+    const meFull = await User.findById(me._id).lean();
+    if (!meFull) {
+      return res
+        .status(404)
+        .json({ ok: false, message: "Usuario no encontrado" });
+    }
+
+    const followers = Array.isArray(meFull.followers) ? meFull.followers : [];
+    const rawFollowing = Array.isArray(meFull.following) ? meFull.following : [];
+
+    // Normalizamos a strings (ObjectId -> "hexstring")
+    const followingIds = rawFollowing.map((v) => v.toString());
+
+    // Log de debug para ver en consola del backend qué está saliendo
+    console.log(
+      "[GET /api/auth/me] followingIds:",
+      followingIds,
+      "followers:",
+      followers
+    );
+
+    return res.json({
+      ok: true,
+      user: {
+        _id: meFull._id,
+        id: meFull._id.toString(), // para compatibilidad con Flutter
+        role: meFull.role,
+        username: meFull.username,
+        email: meFull.email,
+        entName: meFull.entName,
+        entityName: meFull.entityName,
+        phoneNumber: meFull.phoneNumber,
+        firebaseUid: meFull.firebaseUid,
+        profilePicture: meFull.profilePicture,
+        instagram: meFull.instagram,
+        bio: meFull.bio,
+        isPrivate: meFull.isPrivate,
+        // arrays completos tal como vienen de Mongo
+        followers,
+        // por compatibilidad con Flutter: dejamos "following" como array de IDs string
+        following: followingIds,
+        // y además un campo explícito
+        followingIds,
+        followersCount: followers.length,
+        followingCount: followingIds.length,
+        createdAt: meFull.createdAt,
+        updatedAt: meFull.updatedAt,
+      },
+    });
+  } catch (err) {
+    console.error("[GET /api/auth/me] error:", err);
+    return res
+      .status(500)
+      .json({ ok: false, message: "Error en el servidor" });
+  }
 });
 
 /* -------- Solo IDs de la gente a la que sigo (para cliente móvil) -------- */
-router.get("/users/me/following-ids", anyAuth, ensureUserId, async (req, res) => {
+/*router.get("/users/me/following-ids", anyAuth, ensureUserId, async (req, res) => {
   try {
     const me = await resolveUserFromRequest(req);
     if (!me) {
@@ -565,7 +633,56 @@ router.get("/users/me/following-ids", anyAuth, ensureUserId, async (req, res) =>
     console.error("[GET /api/auth/users/me/following-ids] error:", err);
     return res.status(500).json({ ok: false, message: "Error en el servidor" });
   }
-});
+});*/
+
+/* -------- Solo IDs de la gente a la que sigo (para cliente móvil) -------- */
+router.get(
+  "/users/me/following-ids",
+  anyAuth,
+  ensureUserId,
+  async (req, res) => {
+    try {
+      const me = await resolveUserFromRequest(req);
+      if (!me) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Usuario no encontrado" });
+      }
+
+      const meFull = await User.findById(me._id).lean();
+      if (!meFull) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Usuario no encontrado" });
+      }
+
+      const rawFollowing = Array.isArray(meFull.following)
+        ? meFull.following
+        : [];
+
+      const followingIds = rawFollowing.map((v) => v.toString());
+
+      console.log(
+        "[GET /api/auth/users/me/following-ids] followingIds:",
+        followingIds
+      );
+
+      return res.json({
+        ok: true,
+        followingIds,
+        count: followingIds.length,
+      });
+    } catch (err) {
+      console.error(
+        "[GET /api/auth/users/me/following-ids] error:",
+        err
+      );
+      return res
+        .status(500)
+        .json({ ok: false, message: "Error en el servidor" });
+    }
+  }
+);
 
 /* -------- Obtener usuario por id (pública) — al final -------- */
 router.get("/:userId", async (req, res) => {
