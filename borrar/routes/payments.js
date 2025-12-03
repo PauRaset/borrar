@@ -103,8 +103,15 @@ router.get('/direct/:eventId', async (req, res) => {
           .send('El club no tiene cuenta conectada en Stripe (LIVE).');
       }
   
-      // Comisión fija de plataforma: 1,50 € por entrada
-      const PLATFORM_FEE_CENTS = 150;
+      // Comisión de plataforma por entrada:
+      // - Por defecto: 1,50 €
+      // - Si el evento tiene `platformFeeEUR`, se usa ese valor (en euros)
+      const platformFeeEUR =
+        typeof event.platformFeeEUR === 'number'
+          ? event.platformFeeEUR
+          : 1.5;
+
+      const PLATFORM_FEE_CENTS = Math.round(platformFeeEUR * 100);
       const applicationFee = PLATFORM_FEE_CENTS * qty;
   
       // Order "guest": sin userId ni email (Stripe nos dará el email)
