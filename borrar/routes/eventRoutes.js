@@ -375,6 +375,76 @@ router.get("/", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
+   BUSCAR EVENTOS (público)
+   GET /api/events/search?q=...
+   ⚠️ IMPORTANTE: esta ruta debe ir ANTES que cualquier /:id
+------------------------------------------------------------------- */
+router.get("/search", async (req, res) => {
+  try {
+    const qRaw = (req.query.q || req.query.query || req.query.search || "").toString();
+    const q = qRaw.trim();
+
+    if (!q) {
+      return res.json([]);
+    }
+
+    // Escapar regex para evitar caracteres especiales.
+    const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const rx = new RegExp(escapeRegExp(q), "i");
+
+    // Busca por campos comunes.
+    // (Si quieres afinar luego: categorías, clubName/entityName, etc.)
+    const filter = {
+      $or: [
+        { title: rx },
+        { description: rx },
+        { city: rx },
+        { street: rx },
+        { postalCode: rx },
+        { categories: rx }, // categories suele ser array; Mongoose soporta regex sobre arrays de strings
+      ],
+    };
+
+    const events = await Event.find(filter)
+      .sort({ startAt: 1, date: 1, createdAt: -1 })
+      .limit(40)
+      .populate("createdBy", "username email profilePicture displayName")
+      .lean();
+
+    const formattedEvents = events.map((event) => {
+      const photos = Array.isArray(event.photos)
+        ? event.photos
+            .map((p) => toPhotoTileAbs(req, p))
+            .filter(Boolean)
+        : [];
+
+      return {
+        ...event,
+        imageUrl: absUrlFromUpload(req, event.image),
+        photos,
+        createdBy: event.createdBy
+          ? {
+              ...event.createdBy,
+              profilePictureUrl: absUrlFromUpload(req, event.createdBy.profilePicture),
+            }
+          : null,
+        categories: Array.isArray(event.categories)
+          ? event.categories
+          : parseCategoriesMaybe(event.categories),
+      };
+    });
+
+    return res.json(formattedEvents);
+  } catch (error) {
+    console.error("[GET /events/search] Error al buscar eventos:", error);
+    return res.status(500).json({
+      message: "Error al buscar eventos",
+      error: error.message || String(error),
+    });
+  }
+});
+
+/* ------------------------------------------------------------------
    Devuelve asistentes
    - ?full=1 -> lista plana de usuarios (frontend la admite)
    - sin ?full -> { attendees: [...] } (compat)
