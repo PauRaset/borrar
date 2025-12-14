@@ -836,6 +836,73 @@ router.get(
   }
 );
 
+/* ------------------------------------------------------------------
+   BUSCAR USUARIOS (público)
+   GET /api/auth/users/search?q=...
+   ⚠️ IMPORTANTE: esta ruta debe ir ANTES que /:userId
+------------------------------------------------------------------- */
+const searchUsersHandler = async (req, res) => {
+  try {
+    const qRaw = (req.query.q || req.query.query || req.query.search || "").toString();
+    let q = qRaw.trim();
+
+    // Soporta búsquedas tipo "@usuario"
+    if (q.startsWith("@")) q = q.slice(1).trim();
+
+    if (!q) return res.json([]);
+
+    // Escapar regex
+    const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const rx = new RegExp(escapeRegExp(q), "i");
+
+    // URL absoluta para /uploads/...
+    const absUrlFromUpload = (req, p) => {
+      if (!p || typeof p !== "string") return "";
+      if (/^https?:\/\//i.test(p)) return p;
+      const origin = `${req.protocol}://${req.get("host")}`;
+      return p.startsWith("/") ? `${origin}${p}` : `${origin}/${p}`;
+    };
+
+    const users = await User.find({
+      $or: [
+        { username: rx },
+        { entityName: rx },
+        { entName: rx },
+        { instagram: rx },
+      ],
+    })
+      .select("username entityName entName role profilePicture instagram bio isPrivate createdAt")
+      .sort({ createdAt: -1 })
+      .limit(40)
+      .lean();
+
+    const formatted = users.map((u) => ({
+      id: u._id?.toString?.() || u._id,
+      _id: u._id,
+      username: u.username,
+      entityName: u.entityName || u.entName || "",
+      role: u.role,
+      profilePicture: u.profilePicture || "",
+      profilePictureUrl: absUrlFromUpload(req, u.profilePicture),
+      instagram: u.instagram || "",
+      bio: u.bio || "",
+      isPrivate: Boolean(u.isPrivate),
+    }));
+
+    return res.json(formatted);
+  } catch (error) {
+    console.error("[GET /api/auth/users/search] error:", error);
+    return res.status(500).json({
+      message: "Error al buscar usuarios",
+      error: error.message || String(error),
+    });
+  }
+};
+
+router.get("/users/search", searchUsersHandler);
+// Alias opcional por comodidad
+router.get("/searchUsers", searchUsersHandler);
+
 /* -------- Obtener usuario por id (pública) — al final -------- */
 router.get("/:userId", async (req, res) => {
   try {
