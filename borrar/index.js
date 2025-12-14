@@ -13,8 +13,6 @@ const rateLimit = require("express-rate-limit");
 const clubRoutes = require("./routes/clubRoutes");
 const socialRoutes = require("./routes/socialRoutes");
 const { anyAuthWithId } = require("./middlewares/authMiddleware");
-const paymentsRoutes = require('./routes/payments');
-
 
 // ✅ Inicializa firebase-admin y loguea el project_id para depurar 403
 const admin = require("./middlewares/firebaseAdmin");
@@ -478,7 +476,6 @@ app.use(
     },
   })
 );
-app.use('/api/payments', paymentsRoutes);
 
 // ===== Passport (si lo usas) =====
 app.use(passport.initialize());
@@ -922,6 +919,7 @@ const eventRoutes = require("./routes/eventRoutes");
 const searchRoutes = require("./routes/searchRoutes");
 const userRoutes = require("./routes/userRoutes");
 const registrationRoutes = require("./routes/registrationRoutes"); // <-- MOVIDO AQUÍ
+const promotionsRoutes = require("./routes/promotionsRoutes");
 
 // Compat: clientes antiguos pueden llamar /start|/request|/requests
 // Normalizamos name -> clubName y reenviamos al router en /apply sin perder body
@@ -945,6 +943,7 @@ app.post("/api/registration/requests", (req, res, next) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/events", eventRoutes);
+app.use("/api/promotions", promotionsRoutes);
 app.use("/search", searchRoutes);
 app.use("/api/registration", registrationRoutes); // <-- Y montado AQUÍ
 app.use("/api/clubs", clubRoutes);
