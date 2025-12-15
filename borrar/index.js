@@ -13,6 +13,7 @@ const rateLimit = require("express-rate-limit");
 const clubRoutes = require("./routes/clubRoutes");
 const socialRoutes = require("./routes/socialRoutes");
 const { anyAuthWithId } = require("./middlewares/authMiddleware");
+const paymentsRoutes = require('./routes/payments');  
 
 // ✅ Inicializa firebase-admin y loguea el project_id para depurar 403
 const admin = require("./middlewares/firebaseAdmin");
@@ -477,6 +478,7 @@ app.use(
   })
 );
 
+app.use('/api/payments', paymentsRoutes);
 // ===== Passport (si lo usas) =====
 app.use(passport.initialize());
 app.use(passport.session());
