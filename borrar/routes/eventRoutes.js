@@ -335,7 +335,7 @@ async function syncPromotionAfterAttend({ userId, clubId, eventId, attendedNow }
   }
 }
 
-async function syncPromotionAfterPhotoUpload({ userId, clubId, eventId }) {
+async function syncPromotionAfterPhotoApproved({ userId, clubId, eventId }) {
   try {
     const progress = await ensurePromotionProgressDoc({ userId, clubId });
     if (!progress) return;
@@ -368,7 +368,7 @@ async function syncPromotionAfterPhotoUpload({ userId, clubId, eventId }) {
     progress.lastActivityAt = new Date();
     await progress.save();
   } catch (e) {
-    console.warn("[promotions] syncPromotionAfterPhotoUpload failed:", e?.message || e);
+    console.warn("[promotions] syncPromotionAfterPhotoApproved failed:", e?.message || e);
   }
 }
 
@@ -443,6 +443,20 @@ function toPhotoTileAbs(req, entry) {
     };
   }
   return null;
+}
+
+function isApprovedPhotoEntry(p) {
+  if (!p) return false;
+  if (typeof p === "string") return true; // legacy
+  if (typeof p === "object") {
+    const st = String(p.status || "approved");
+    return st === "approved";
+  }
+  return false;
+}
+
+function approvedOnly(list) {
+  return Array.isArray(list) ? list.filter(isApprovedPhotoEntry) : [];
 }
 
 /* -------------------------------------------------------------
@@ -559,11 +573,9 @@ router.get("/", async (req, res) => {
 
     const formattedEvents = events.map((event) => {
       // normaliza fotos a objetos con url absoluta (manteniendo compatibilidad)
-      const photos = Array.isArray(event.photos)
-        ? event.photos
-            .map((p) => toPhotoTileAbs(req, p))
-            .filter(Boolean)
-        : [];
+      const photos = approvedOnly(event.photos)
+        .map((p) => toPhotoTileAbs(req, p))
+        .filter(Boolean);
 
       return {
         ...event,
@@ -626,11 +638,9 @@ router.get("/search", async (req, res) => {
       .lean();
 
     const formattedEvents = events.map((event) => {
-      const photos = Array.isArray(event.photos)
-        ? event.photos
-            .map((p) => toPhotoTileAbs(req, p))
-            .filter(Boolean)
-        : [];
+      const photos = approvedOnly(event.photos)
+        .map((p) => toPhotoTileAbs(req, p))
+        .filter(Boolean);
 
       return {
         ...event,
@@ -680,18 +690,6 @@ async function attendeesHandler(req, res, forceFull = false) {
     if (!event) return res.status(404).json({ message: "Evento no encontrado" });
 
     const list = (event.attendees || []).map((u) => shapePublicUser(req, u)).filter(Boolean);
-    
-    // Promotions: actualizar progreso (Nivel 1 etc.)
-    // Club = creador del evento
-    const clubId = event.createdBy ? event.createdBy.toString() : null;
-    if (clubId) {
-      await syncPromotionAfterAttend({
-        userId,
-        clubId,
-        eventId,
-        attendedNow,
-      });
-    }
 
 
     if (full) {
@@ -725,9 +723,7 @@ router.get("/:id", async (req, res) => {
     const formattedEvent = {
       ...obj,
       imageUrl: absUrlFromUpload(req, obj.image),
-      photos: Array.isArray(obj.photos)
-        ? obj.photos.map((p) => toPhotoTileAbs(req, p)).filter(Boolean)
-        : [],
+      photos: approvedOnly(obj.photos).map((p) => toPhotoTileAbs(req, p)).filter(Boolean),
       createdBy: obj.createdBy
         ? {
             ...obj.createdBy,
@@ -781,7 +777,7 @@ async function getPhotosHandler(req, res) {
     const event = await Event.findById(id).lean();
     if (!event) return res.status(404).json({ message: "Evento no encontrado" });
 
-    const photos = (event.photos || [])
+    const photos = approvedOnly(event.photos)
       .map((p) => toPhotoTileAbs(req, p))
       .filter(Boolean);
 
@@ -796,6 +792,149 @@ router.get("/:id/photos", getPhotosHandler);
 router.get("/:id/gallery", getPhotosHandler);
 router.get("/:id/images", getPhotosHandler);
 router.get("/:id/media", getPhotosHandler);
+
+/* ------------------------------------------------------------------
+   MODERACIÓN DE FOTOS (solo propietario/club)
+------------------------------------------------------------------- */
+
+// Listar fotos por estado (default: pending)
+router.get("/:id/photos/moderation", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    const event = await Event.findById(id).lean();
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    // Solo propietario puede moderar
+    if (event.createdBy?.toString?.() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para moderar fotos de este evento" });
+    }
+
+    const status = (req.query.status || "pending").toString();
+    const all = Array.isArray(event.photos) ? event.photos : [];
+
+    const filtered = all.filter((p) => {
+      if (!p || typeof p !== "object") return false;
+      const st = String(p.status || "approved");
+      return st === status;
+    });
+
+    const out = filtered.map((p) => ({
+      photoId: p.photoId || "",
+      url: absUrlFromUpload(req, p.url),
+      by: p.by || null,
+      byUsername: p.byUsername || null,
+      uploadedAt: p.uploadedAt || null,
+      status: p.status || "approved",
+      reviewedBy: p.reviewedBy || null,
+      reviewedAt: p.reviewedAt || null,
+      reviewNote: p.reviewNote || "",
+    }));
+
+    return res.json({ eventId: id, status, photos: out, count: out.length });
+  } catch (e) {
+    console.error("[GET /events/:id/photos/moderation] error:", e);
+    return res.status(500).json({ message: "Error obteniendo fotos para moderación" });
+  }
+});
+
+// Aprobar foto (cuenta para subir de nivel)
+router.post("/:id/photos/:photoId/approve", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const { id, photoId } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    const event = await Event.findById(id);
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    if (event.createdBy?.toString?.() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para moderar fotos de este evento" });
+    }
+
+    const idx = (event.photos || []).findIndex((p) => p && typeof p === "object" && String(p.photoId || "") === String(photoId));
+    if (idx === -1) return res.status(404).json({ message: "Foto no encontrada" });
+
+    const note = (req.body?.reviewNote || "").toString();
+
+    event.photos[idx].status = "approved";
+    event.photos[idx].reviewedBy = req.user.id;
+    event.photos[idx].reviewedAt = new Date();
+    event.photos[idx].reviewNote = note;
+
+    await event.save();
+
+    // Promotions: solo cuenta cuando está aprobada
+    const clubId = event.createdBy ? event.createdBy.toString() : null;
+    const uploaderId = event.photos[idx].by ? event.photos[idx].by.toString() : null;
+    if (clubId && uploaderId) {
+      await syncPromotionAfterPhotoApproved({ userId: uploaderId, clubId, eventId: id });
+    }
+
+    return res.json({
+      ok: true,
+      photo: {
+        photoId: event.photos[idx].photoId,
+        url: absUrlFromUpload(req, event.photos[idx].url),
+        status: event.photos[idx].status,
+        reviewedBy: event.photos[idx].reviewedBy,
+        reviewedAt: event.photos[idx].reviewedAt,
+        reviewNote: event.photos[idx].reviewNote,
+      },
+    });
+  } catch (e) {
+    console.error("[POST /events/:id/photos/:photoId/approve] error:", e);
+    return res.status(500).json({ message: "Error aprobando foto" });
+  }
+});
+
+// Rechazar foto (NO cuenta para subir de nivel)
+router.post("/:id/photos/:photoId/reject", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const { id, photoId } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    const event = await Event.findById(id);
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    if (event.createdBy?.toString?.() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para moderar fotos de este evento" });
+    }
+
+    const idx = (event.photos || []).findIndex((p) => p && typeof p === "object" && String(p.photoId || "") === String(photoId));
+    if (idx === -1) return res.status(404).json({ message: "Foto no encontrada" });
+
+    const note = (req.body?.reviewNote || "").toString();
+
+    event.photos[idx].status = "rejected";
+    event.photos[idx].reviewedBy = req.user.id;
+    event.photos[idx].reviewedAt = new Date();
+    event.photos[idx].reviewNote = note;
+
+    await event.save();
+
+    return res.json({
+      ok: true,
+      photo: {
+        photoId: event.photos[idx].photoId,
+        url: absUrlFromUpload(req, event.photos[idx].url),
+        status: event.photos[idx].status,
+        reviewedBy: event.photos[idx].reviewedBy,
+        reviewedAt: event.photos[idx].reviewedAt,
+        reviewNote: event.photos[idx].reviewNote,
+      },
+    });
+  } catch (e) {
+    console.error("[POST /events/:id/photos/:photoId/reject] error:", e);
+    return res.status(500).json({ message: "Error rechazando foto" });
+  }
+});
 
 /* ------------------------------------------------------------------
    GALERÍA: POST subir fotos (y alias)
@@ -840,10 +979,16 @@ async function postPhotosHandler(req, res) {
         .replace(/\\/g, "/"); // ej: "uploads/event-photos/event-xxx.jpg"
 
       const meta = {
+        photoId: `evtphoto_${new mongoose.Types.ObjectId().toString()}`,
         url: rel,
         by: req.user.id,
         byUsername,
         uploadedAt: new Date(),
+
+        status: "pending",
+        reviewedBy: null,
+        reviewedAt: null,
+        reviewNote: "",
       };
 
       event.photos = Array.isArray(event.photos) ? event.photos : [];
@@ -852,23 +997,18 @@ async function postPhotosHandler(req, res) {
     }
 
     await event.save();
-    
-    // Promotions: cada foto subida cuenta para misiones (Nivel 1/2 etc.)
-    const clubId = event.createdBy ? event.createdBy.toString() : null;
-    if (clubId) {
-      for (let i = 0; i < savedMeta.length; i++) {
-        await syncPromotionAfterPhotoUpload({ userId: req.user.id, clubId, eventId: id });
-      }
-    }
+    // NO promociones aquí; solo al aprobar
 
     // Respuesta: objetos con url absoluta + byUsername
     const uploaded = savedMeta.map((m) => ({
+      photoId: m.photoId,
       url: absUrlFromUpload(req, m.url),
       byUsername: m.byUsername,
       uploadedAt: m.uploadedAt,
+      status: m.status,
     }));
 
-    const allPhotos = (event.photos || [])
+    const allPhotos = approvedOnly(event.photos)
       .map((p) => toPhotoTileAbs(req, p))
       .filter(Boolean);
 
@@ -921,7 +1061,7 @@ router.delete("/:id/photos/:pid?", anyAuth, ensureUserId, async (req, res) => {
     if (Number.isInteger(idx) && idx >= 0 && idx < photos.length) {
       targetIndex = idx;
     } else {
-      // Por URL (soportar absoluta o relativa)
+      // Por URL o photoId (soportar absoluta o relativa)
       const search = (pid && pid !== "undefined") ? pid : url;
       if (!search) {
         return res.status(400).json({ message: "Debes proporcionar idx o url" });
@@ -937,6 +1077,10 @@ router.delete("/:id/photos/:pid?", anyAuth, ensureUserId, async (req, res) => {
       };
       const needle = toRel(search);
       targetIndex = photos.findIndex((p) => {
+        // Match by photoId (new schema)
+        if (pid && typeof p === "object" && String(p.photoId || "") === String(needle)) {
+          return true;
+        }
         const cand = typeof p === "string"
           ? toRel(p)
           : toRel(p?.url || p?.path || p?.image || p?.photo);
@@ -1058,6 +1202,12 @@ router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
       }
     }
 
+    // 4.5) Promotions: actualizar progreso por asistencia
+    const clubId = event.createdBy ? event.createdBy.toString() : null;
+    if (clubId) {
+      await syncPromotionAfterAttend({ userId, clubId, eventId, attendedNow });
+    }
+
     // 5) Responder
     return res.json({
       _id: event._id,
@@ -1154,9 +1304,7 @@ async function updateEventHandler(req, res) {
     const formatted = {
       ...updated,
       imageUrl: absUrlFromUpload(req, updated.image),
-      photos: Array.isArray(updated.photos)
-        ? updated.photos.map((p) => toPhotoTileAbs(req, p)).filter(Boolean)
-        : [],
+      photos: approvedOnly(updated.photos).map((p) => toPhotoTileAbs(req, p)).filter(Boolean),
       createdBy: updated.createdBy
         ? {
             ...updated.createdBy,
