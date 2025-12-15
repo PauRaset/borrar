@@ -335,7 +335,7 @@ async function syncPromotionAfterAttend({ userId, clubId, eventId, attendedNow }
   }
 }
 
-async function syncPromotionAfterPhotoUpload({ userId, clubId, eventId }) {
+async function syncPromotionAfterPhotoApproved({ userId, clubId, eventId }) {
   try {
     const progress = await ensurePromotionProgressDoc({ userId, clubId });
     if (!progress) return;
@@ -371,6 +371,70 @@ async function syncPromotionAfterPhotoUpload({ userId, clubId, eventId }) {
     console.warn("[promotions] syncPromotionAfterPhotoUpload failed:", e?.message || e);
   }
 }
+
+router.post("/:id/photos/:photoId/approve", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const { id, photoId } = req.params;
+    if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "ID de evento inválido" });
+
+    const event = await Event.findById(id);
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    if (event.createdBy?.toString?.() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para moderar fotos de este evento" });
+    }
+
+    const idx = (event.photos || []).findIndex((p) => p && typeof p === "object" && String(p.photoId || "") === String(photoId));
+    if (idx === -1) return res.status(404).json({ message: "Foto no encontrada" });
+
+    event.photos[idx].status = "approved";
+    event.photos[idx].reviewedBy = req.user.id;
+    event.photos[idx].reviewedAt = new Date();
+    event.photos[idx].reviewNote = (req.body?.reviewNote || "").toString();
+
+    await event.save();
+
+    // ✅ Promotions: cuenta solo cuando se aprueba
+    const clubId = event.createdBy ? event.createdBy.toString() : null;
+    const uploaderId = event.photos[idx].by ? event.photos[idx].by.toString() : null;
+    if (clubId && uploaderId) {
+      await syncPromotionAfterPhotoApproved({ userId: uploaderId, clubId, eventId: id });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[approve photo] error:", e);
+    return res.status(500).json({ message: "Error aprobando foto" });
+  }
+});
+
+router.post("/:id/photos/:photoId/reject", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const { id, photoId } = req.params;
+    if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "ID de evento inválido" });
+
+    const event = await Event.findById(id);
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    if (event.createdBy?.toString?.() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para moderar fotos de este evento" });
+    }
+
+    const idx = (event.photos || []).findIndex((p) => p && typeof p === "object" && String(p.photoId || "") === String(photoId));
+    if (idx === -1) return res.status(404).json({ message: "Foto no encontrada" });
+
+    event.photos[idx].status = "rejected";
+    event.photos[idx].reviewedBy = req.user.id;
+    event.photos[idx].reviewedAt = new Date();
+    event.photos[idx].reviewNote = (req.body?.reviewNote || "").toString();
+
+    await event.save();
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[reject photo] error:", e);
+    return res.status(500).json({ message: "Error rechazando foto" });
+  }
+});
 
 /* ------------------------------------------------------------------
    Configuración de multer
@@ -443,6 +507,17 @@ function toPhotoTileAbs(req, entry) {
     };
   }
   return null;
+}
+
+function isApprovedPhotoEntry(p) {
+  if (!p) return false;
+  if (typeof p === "string") return true; // legacy
+  if (typeof p === "object") return String(p.status || "approved") === "approved";
+  return false;
+}
+
+function approvedOnly(list) {
+  return Array.isArray(list) ? list.filter(isApprovedPhotoEntry) : [];
 }
 
 /* -------------------------------------------------------------
@@ -683,7 +758,7 @@ async function attendeesHandler(req, res, forceFull = false) {
     
     // Promotions: actualizar progreso (Nivel 1 etc.)
     // Club = creador del evento
-    const clubId = event.createdBy ? event.createdBy.toString() : null;
+    /*const clubId = event.createdBy ? event.createdBy.toString() : null;
     if (clubId) {
       await syncPromotionAfterAttend({
         userId,
@@ -691,7 +766,7 @@ async function attendeesHandler(req, res, forceFull = false) {
         eventId,
         attendedNow,
       });
-    }
+    }*/
 
 
     if (full) {
@@ -797,6 +872,45 @@ router.get("/:id/gallery", getPhotosHandler);
 router.get("/:id/images", getPhotosHandler);
 router.get("/:id/media", getPhotosHandler);
 
+
+// Listar fotos por estado (default: pending)
+router.get("/:id/photos/moderation", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "ID de evento inválido" });
+
+    const event = await Event.findById(id).lean();
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    if (event.createdBy?.toString?.() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para moderar fotos de este evento" });
+    }
+
+    const status = (req.query.status || "pending").toString();
+    const photos = (event.photos || []).filter((p) => p && typeof p === "object" && String(p.status || "approved") === status);
+
+    return res.json({
+      eventId: id,
+      status,
+      count: photos.length,
+      photos: photos.map((p) => ({
+        photoId: p.photoId || "",
+        url: absUrlFromUpload(req, p.url),
+        by: p.by || null,
+        byUsername: p.byUsername || null,
+        uploadedAt: p.uploadedAt || null,
+        status: p.status || "approved",
+        reviewedBy: p.reviewedBy || null,
+        reviewedAt: p.reviewedAt || null,
+        reviewNote: p.reviewNote || "",
+      })),
+    });
+  } catch (e) {
+    console.error("[moderation list] error:", e);
+    return res.status(500).json({ message: "Error obteniendo fotos para moderación" });
+  }
+});
+
 /* ------------------------------------------------------------------
    GALERÍA: POST subir fotos (y alias)
    - Acepta múltiples campos: file/files/files[]/photo/photos/photos[]/image/images/images[]
@@ -840,10 +954,16 @@ async function postPhotosHandler(req, res) {
         .replace(/\\/g, "/"); // ej: "uploads/event-photos/event-xxx.jpg"
 
       const meta = {
+        photoId: `evtphoto_${new mongoose.Types.ObjectId().toString()}`,
         url: rel,
         by: req.user.id,
         byUsername,
         uploadedAt: new Date(),
+
+        status: "pending",
+        reviewedBy: null,
+        reviewedAt: null,
+        reviewNote: "",
       };
 
       event.photos = Array.isArray(event.photos) ? event.photos : [];
@@ -853,19 +973,14 @@ async function postPhotosHandler(req, res) {
 
     await event.save();
     
-    // Promotions: cada foto subida cuenta para misiones (Nivel 1/2 etc.)
-    const clubId = event.createdBy ? event.createdBy.toString() : null;
-    if (clubId) {
-      for (let i = 0; i < savedMeta.length; i++) {
-        await syncPromotionAfterPhotoUpload({ userId: req.user.id, clubId, eventId: id });
-      }
-    }
 
     // Respuesta: objetos con url absoluta + byUsername
     const uploaded = savedMeta.map((m) => ({
+      photoId: m.photoId,
       url: absUrlFromUpload(req, m.url),
       byUsername: m.byUsername,
       uploadedAt: m.uploadedAt,
+      status: m.status,
     }));
 
     const allPhotos = (event.photos || [])
@@ -995,8 +1110,15 @@ router.delete("/:id/photos/:pid?", anyAuth, ensureUserId, async (req, res) => {
    - Alterna en Mongo (campo attendees)
    - Escribe/borra doc en Firestore: attendances/{uid}_{eventId}
 ------------------------------------------------------------------- */
+
+
 router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
   const eventId = req.params.id;
+  // Promotions: actualizar progreso por asistencia
+  const clubId = event.createdBy ? event.createdBy.toString() : null;
+  if (clubId) {
+    await syncPromotionAfterAttend({ userId, clubId, eventId, attendedNow });
+  }
 
   try {
     // 1) Recuperar evento
