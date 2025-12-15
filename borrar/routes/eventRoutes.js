@@ -10,6 +10,8 @@ const router = express.Router();
 
 const Event = require("../models/Event");
 const User = require("../models/User");
+const PromotionLevelTemplate = require("../models/PromotionLevelTemplate");
+const UserClubPromotionProgress = require("../models/UserClubPromotionProgress");
 
 // Tu middleware JWT actual (export default)
 const authenticateToken = require("../middlewares/authMiddleware");
@@ -156,6 +158,218 @@ async function ensureUserId(req, res, next) {
 
   // No hubo ni JWT ni Firebase
   return res.status(401).json({ message: "Usuario no autenticado" });
+}
+
+/* ------------------------------------------------------------------
+   PROMOTIONS BRIDGE (auto-progress levels)
+------------------------------------------------------------------- */
+
+async function getGlobalPromotionTemplates() {
+  const templates = await PromotionLevelTemplate.find({ scope: "global", active: true })
+    .sort({ levelNumber: 1 })
+    .lean();
+  return templates || [];
+}
+
+function computeLevelProgress(level) {
+  const missions = Array.isArray(level?.missions) ? level.missions : [];
+  if (!missions.length) return 0;
+  const ratios = missions.map((m) => {
+    const target = Number(m.target || 1);
+    const cur = Number(m.current || 0);
+    if (!target || target <= 0) return 0;
+    return Math.max(0, Math.min(1, cur / target));
+  });
+  return Math.max(0, Math.min(1, ratios.reduce((a, b) => a + b, 0) / ratios.length));
+}
+
+function allMissionsCompleted(level) {
+  const missions = Array.isArray(level?.missions) ? level.missions : [];
+  if (!missions.length) return false;
+  return missions.every((m) => m.status === "completed");
+}
+
+function unlockNextLevel(progress, completedLevelNumber) {
+  const nextLevelNumber = Number(completedLevelNumber) + 1;
+  const next = (progress.levels || []).find((l) => Number(l.levelNumber) === nextLevelNumber);
+  if (!next) return;
+
+  if (next.status === "locked") {
+    next.status = "in_progress";
+    for (const m of next.missions || []) {
+      if (m.status === "locked") m.status = "in_progress";
+      if (!m.startedAt) m.startedAt = new Date();
+      m.updatedAt = new Date();
+    }
+  }
+
+  progress.currentLevel = nextLevelNumber;
+  progress.currentRewardTitle = next.reward?.title || "";
+}
+
+function refreshCurrentSnapshot(progress) {
+  const cur = (progress.levels || []).find((l) => Number(l.levelNumber) === Number(progress.currentLevel));
+  if (!cur) {
+    progress.currentProgress = 0;
+    return;
+  }
+  cur.progress = computeLevelProgress(cur);
+  progress.currentProgress = cur.progress;
+  progress.currentRewardTitle = cur.reward?.title || "";
+}
+
+function clampNonNegative(n) {
+  const x = Number(n || 0);
+  return x < 0 ? 0 : x;
+}
+
+function updateAttendMissionsForLevel(level, counters) {
+  for (const m of level.missions || []) {
+    if (m.type !== "attend_event") continue;
+
+    const platformWide = !!(m.params && m.params.platformWide) || !!(m.meta && m.meta.platformWide);
+    const count = platformWide ? Number(counters.attendancesPlatform || 0) : Number(counters.attendancesInClub || 0);
+
+    m.current = Math.min(count, Number(m.target || 1));
+
+    if (level.status === "locked") continue;
+
+    if (m.current >= Number(m.target || 1)) {
+      m.status = "completed";
+      m.completedAt = m.completedAt || new Date();
+    } else {
+      if (m.status !== "pending") m.status = "in_progress";
+      m.completedAt = null;
+    }
+
+    m.updatedAt = new Date();
+  }
+}
+
+function updatePhotoMissionsForLevel(level, eventId, counters) {
+  for (const m of level.missions || []) {
+    if (m.type !== "upload_event_photo") continue;
+
+    const perEvent = !!(m.params && m.params.perEvent) || !!(m.meta && m.meta.perEvent);
+
+    if (perEvent) {
+      const list = Array.isArray(m.meta?.eventIds) ? m.meta.eventIds : [];
+      const set = new Set(list.map(String));
+      if (eventId) set.add(String(eventId));
+      const updated = Array.from(set);
+      m.meta = { ...(m.meta || {}), eventIds: updated, perEvent: true };
+      m.current = Math.min(updated.length, Number(m.target || 1));
+    } else {
+      const count = Number(counters.photosUploadedInClub || 0);
+      m.current = Math.min(count, Number(m.target || 1));
+    }
+
+    if (level.status === "locked") continue;
+
+    if (m.current >= Number(m.target || 1)) {
+      m.status = "completed";
+      m.completedAt = m.completedAt || new Date();
+    } else {
+      if (m.status !== "pending") m.status = "in_progress";
+      m.completedAt = null;
+    }
+
+    m.updatedAt = new Date();
+  }
+}
+
+async function ensurePromotionProgressDoc({ userId, clubId }) {
+  let progress = await UserClubPromotionProgress.findOne({ user: userId, club: clubId });
+  if (progress) return progress;
+
+  const templates = await getGlobalPromotionTemplates();
+  if (!templates.length) return null;
+
+  const built = UserClubPromotionProgress.buildFromTemplates({ templates, startLevel: 1 });
+  progress = await UserClubPromotionProgress.create({
+    user: userId,
+    club: clubId,
+    ...built,
+  });
+
+  return progress;
+}
+
+async function syncPromotionAfterAttend({ userId, clubId, eventId, attendedNow }) {
+  try {
+    const progress = await ensurePromotionProgressDoc({ userId, clubId });
+    if (!progress) return;
+
+    progress.counters = progress.counters || {};
+    const delta = attendedNow ? 1 : -1;
+
+    progress.counters.attendancesInClub = clampNonNegative((progress.counters.attendancesInClub || 0) + delta);
+    progress.counters.attendancesPlatform = clampNonNegative((progress.counters.attendancesPlatform || 0) + delta);
+
+    for (const lvl of progress.levels || []) {
+      updateAttendMissionsForLevel(lvl, progress.counters);
+      lvl.progress = computeLevelProgress(lvl);
+    }
+
+    let guard = 0;
+    while (guard++ < 15) {
+      const cur = (progress.levels || []).find((l) => Number(l.levelNumber) === Number(progress.currentLevel));
+      if (!cur) break;
+
+      cur.progress = computeLevelProgress(cur);
+      if (cur.status !== "completed" && allMissionsCompleted(cur)) {
+        cur.status = "completed";
+        cur.completedAt = new Date();
+        unlockNextLevel(progress, cur.levelNumber);
+        continue;
+      }
+      break;
+    }
+
+    refreshCurrentSnapshot(progress);
+    progress.lastEventId = eventId || progress.lastEventId;
+    progress.lastActivityAt = new Date();
+    await progress.save();
+  } catch (e) {
+    console.warn("[promotions] syncPromotionAfterAttend failed:", e?.message || e);
+  }
+}
+
+async function syncPromotionAfterPhotoUpload({ userId, clubId, eventId }) {
+  try {
+    const progress = await ensurePromotionProgressDoc({ userId, clubId });
+    if (!progress) return;
+
+    progress.counters = progress.counters || {};
+    progress.counters.photosUploadedInClub = clampNonNegative((progress.counters.photosUploadedInClub || 0) + 1);
+
+    for (const lvl of progress.levels || []) {
+      updatePhotoMissionsForLevel(lvl, eventId, progress.counters);
+      lvl.progress = computeLevelProgress(lvl);
+    }
+
+    let guard = 0;
+    while (guard++ < 15) {
+      const cur = (progress.levels || []).find((l) => Number(l.levelNumber) === Number(progress.currentLevel));
+      if (!cur) break;
+
+      cur.progress = computeLevelProgress(cur);
+      if (cur.status !== "completed" && allMissionsCompleted(cur)) {
+        cur.status = "completed";
+        cur.completedAt = new Date();
+        unlockNextLevel(progress, cur.levelNumber);
+        continue;
+      }
+      break;
+    }
+
+    refreshCurrentSnapshot(progress);
+    progress.lastEventId = eventId || progress.lastEventId;
+    progress.lastActivityAt = new Date();
+    await progress.save();
+  } catch (e) {
+    console.warn("[promotions] syncPromotionAfterPhotoUpload failed:", e?.message || e);
+  }
 }
 
 /* ------------------------------------------------------------------
@@ -466,6 +680,19 @@ async function attendeesHandler(req, res, forceFull = false) {
     if (!event) return res.status(404).json({ message: "Evento no encontrado" });
 
     const list = (event.attendees || []).map((u) => shapePublicUser(req, u)).filter(Boolean);
+    
+    // Promotions: actualizar progreso (Nivel 1 etc.)
+    // Club = creador del evento
+    const clubId = event.createdBy ? event.createdBy.toString() : null;
+    if (clubId) {
+      await syncPromotionAfterAttend({
+        userId,
+        clubId,
+        eventId,
+        attendedNow,
+      });
+    }
+
 
     if (full) {
       // lista directa (frontend lo soporta)
@@ -625,6 +852,14 @@ async function postPhotosHandler(req, res) {
     }
 
     await event.save();
+    
+    // Promotions: cada foto subida cuenta para misiones (Nivel 1/2 etc.)
+    const clubId = event.createdBy ? event.createdBy.toString() : null;
+    if (clubId) {
+      for (let i = 0; i < savedMeta.length; i++) {
+        await syncPromotionAfterPhotoUpload({ userId: req.user.id, clubId, eventId: id });
+      }
+    }
 
     // Respuesta: objetos con url absoluta + byUsername
     const uploaded = savedMeta.map((m) => ({
