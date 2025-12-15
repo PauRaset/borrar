@@ -2,9 +2,37 @@
 const mongoose = require("mongoose");
 
 /**
+ * Photo sub-schema (moderation-ready) with backward compatibility.
+ * - Old docs may only contain { url } (or even strings); we normalize them in pre-save.
+ * - Defaults treat legacy photos as "approved" to avoid blocking existing content.
+ */
+const eventPhotoSchema = new mongoose.Schema(
+  {
+    photoId: { type: String, default: "" },
+    url: { type: String, required: true },
+
+    // who uploaded
+    by: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    byUsername: { type: String, default: "" },
+    uploadedAt: { type: Date, default: Date.now },
+
+    // moderation
+    status: {
+      type: String,
+      enum: ["pending", "approved", "rejected"],
+      default: "approved",
+    },
+    reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    reviewedAt: { type: Date, default: null },
+    reviewNote: { type: String, default: "" },
+  },
+  { _id: false }
+);
+
+/**
  * Schema de eventos con compatibilidad hacia atrás:
  * - startAt / endAt (fechas normalizadas) y "date" legacy.
- * - photos como Mixed para aceptar strings u objetos.
+ * - photos con sub-schema moderable (legacy compatible via pre-save).
  * - age y price como Number.
  * - NUEVO: Relación con Club
  *    - clubId: String (rápido para queries/metadata)
@@ -31,9 +59,9 @@ const eventSchema = new mongoose.Schema(
     // Imagen principal (ruta relativa tipo "uploads/...")
     image: { type: String, default: "" },
 
-    // Galería: acepta strings antiguos o nuevos objetos { url, by, byUsername, uploadedAt }
+    // Galería: fotos moderables (legacy compatible: strings/objetos antiguos se normalizan en pre-save)
     photos: {
-      type: [mongoose.Schema.Types.Mixed],
+      type: [eventPhotoSchema],
       default: [],
     },
 
@@ -80,6 +108,11 @@ const eventSchema = new mongoose.Schema(
 /** Utils */
 function isHex24(s) {
   return typeof s === "string" && /^[a-fA-F0-9]{24}$/.test(s);
+}
+
+/** Genera un id estable para una foto (string) */
+function genPhotoId() {
+  return `evtphoto_${new mongoose.Types.ObjectId().toString()}`;
 }
 
 /** Normaliza rutas de uploads: si viene URL absoluta, recorta desde /uploads/... */
@@ -144,19 +177,41 @@ eventSchema.pre("save", function (next) {
     this.image = onlyUploadPath(String(this.image).trim());
   }
 
-  // Normalizar galería (acepta strings o objetos)
+  // Normalizar galería (acepta strings legacy o objetos)
   if (Array.isArray(this.photos)) {
-    this.photos = this.photos.map((p) => {
-      if (typeof p === 'string') {
-        return { url: onlyUploadPath(p) };
-      }
-      if (p && typeof p === 'object') {
-        const copy = { ...p };
-        if (copy.url) copy.url = onlyUploadPath(String(copy.url));
-        return copy;
-      }
-      return p;
-    });
+    this.photos = this.photos
+      .map((p) => {
+        // Legacy string -> object
+        if (typeof p === "string") {
+          return {
+            photoId: genPhotoId(),
+            url: onlyUploadPath(p),
+            status: "approved", // legacy: no bloqueamos contenido existente
+            uploadedAt: new Date(),
+            reviewedBy: null,
+            reviewedAt: null,
+            reviewNote: "",
+          };
+        }
+
+        if (p && typeof p === "object") {
+          const copy = { ...p };
+          if (copy.url) copy.url = onlyUploadPath(String(copy.url));
+
+          // Ensure defaults for legacy objects
+          if (!copy.photoId) copy.photoId = genPhotoId();
+          if (!copy.status) copy.status = "approved";
+          if (copy.reviewedBy === undefined) copy.reviewedBy = null;
+          if (copy.reviewedAt === undefined) copy.reviewedAt = null;
+          if (copy.reviewNote === undefined) copy.reviewNote = "";
+          if (!copy.uploadedAt) copy.uploadedAt = new Date();
+
+          return copy;
+        }
+
+        return null;
+      })
+      .filter(Boolean);
   }
 
   // Normalizar categorías: si viene string JSON o "a,b,c"
@@ -194,77 +249,3 @@ eventSchema.virtual('isOnSale').get(function () {
 });
 
 module.exports = mongoose.model("Event", eventSchema);
-
-/*// models/Event.js
-const mongoose = require("mongoose");
-
-
-const eventSchema = new mongoose.Schema(
-  {
-    title: { type: String, default: "" },
-    description: { type: String, default: "" },
-
-    // Fechas nuevas normalizadas
-    startAt: { type: Date },
-    endAt:   { type: Date },
-
-    // Compatibilidad con campo antiguo
-    date: { type: Date },
-
-    // Ubicación
-    city: { type: String, default: "" },
-    street: { type: String, default: "" },
-    postalCode: { type: String, default: "" },
-
-    // Imagen principal (ruta relativa tipo "uploads/...")
-    image: { type: String, default: "" },
-
-    // Galería: acepta strings antiguos o nuevos objetos { url, by, byUsername, uploadedAt }
-    photos: {
-      type: [mongoose.Schema.Types.Mixed],
-      default: [],
-    },
-
-    // Multi-categoría
-    categories: { type: [String], default: [] },
-
-    // Extra
-    age: { type: Number, default: 18 },        // se convierte desde string si hace falta
-    dressCode: { type: String, default: "" },
-    price: { type: Number, default: 0 },       // se convierte desde string si hace falta
-
-    attendees: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
-
-    createdBy: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
-      required: true,
-    },
-  },
-  { timestamps: true }
-);
-
-
-eventSchema.pre("save", function (next) {
-  // Fechas
-  if (this.startAt && !(this.startAt instanceof Date)) this.startAt = new Date(this.startAt);
-  if (this.endAt && !(this.endAt instanceof Date))     this.endAt   = new Date(this.endAt);
-  if (this.date && !(this.date instanceof Date))       this.date    = new Date(this.date);
-
-  if (!this.startAt && this.date) this.startAt = this.date;
-
-  // age / price a número
-  if (typeof this.age === "string") {
-    const n = parseInt(this.age, 10);
-    if (!Number.isNaN(n)) this.age = n;
-  }
-  if (typeof this.price === "string") {
-    // admite "12", "12.5", etc.
-    const n = Number(this.price);
-    if (!Number.isNaN(n)) this.price = n;
-  }
-
-  next();
-});
-
-module.exports = mongoose.model("Event", eventSchema);*/
