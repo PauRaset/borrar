@@ -53,6 +53,9 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
       const session = event.data.object;
       const meta = session.metadata || {};
 
+      // Tema/plantilla para Email + PDF (viene desde Checkout metadata)
+      const ticketTheme = typeof meta.ticketTheme === 'string' ? meta.ticketTheme : '';
+
       console.log('[stripe webhook] metadata =', meta);
 
       const sessionId = session.id;
@@ -201,6 +204,7 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
           venue,
           serial: created[0]?.doc?.serial,
           qrPngBuffer: created[0]?.qrPngBuffer,
+          ticketTheme,
           buyerName: '',
         });
       } catch (e) {
