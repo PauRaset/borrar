@@ -1,19 +1,71 @@
 // utils/buildTicketPdf.js
 const PDFDocument = require('pdfkit');
 
-function buildTicketPdf({ eventTitle, clubName, eventDate, venue, serial, qrPngBuffer, buyerName, seatLabel }) {
+function buildTicketPdf({
+  eventTitle,
+  clubName,
+  eventDate,
+  venue,
+  serial,
+  qrPngBuffer,
+  buyerName,
+  seatLabel,
+  ticketTheme,
+  // Logo opcional (para branding por cuenta)
+  brandLogoPath,
+  brandLogoPngBuffer,
+}) {
   return new Promise((resolve, reject) => {
     try {
       const doc = new PDFDocument({ size: 'A4', margin: 48 });
       const bufs = [];
 
-      // Paleta NightVibe
-      const COLOR_BG = '#0b0f19';       // fondo general
-      const COLOR_CARD = '#0d1220';     // tarjeta
-      const COLOR_STROKE = '#1e293b';   // bordes
-      const COLOR_TEXT = '#e5e7eb';     // texto base
-      const COLOR_MUTED = '#93a4bf';    // texto suave
-      const COLOR_ACCENT = '#00e5ff';   // cian NightVibe
+      // Temas (estética) para entradas. Mantiene "default" idéntico a lo actual.
+      const THEMES = {
+        default: {
+          bg: '#0b0f19',
+          card: '#0d1220',
+          stroke: '#1e293b',
+          text: '#e5e7eb',
+          muted: '#93a4bf',
+          accent: '#00e5ff',
+          headerStroke: '#082032',
+          innerStroke: '#053a44',
+          title: '#f1f5f9',
+          sub: '#cbd5e1',
+          venue: '#9fb0c9',
+          logoPath: '',
+          logoBg: '#ffffff',
+        },
+        // Ejemplo de tema alternativo (para una "X cuenta").
+        // Puedes ajustar colores sin tocar el flujo de pago.
+        clubX: {
+          bg: '#080611',
+          card: '#0f0b1f',
+          stroke: '#2a2145',
+          text: '#efeaff',
+          muted: '#b7a7d6',
+          accent: '#ff2bd6',
+          headerStroke: '#160a28',
+          innerStroke: '#3b0b33',
+          title: '#ffffff',
+          sub: '#e7dcff',
+          venue: '#cdbcf0',
+          // Ruta opcional al logo para este tema (mejor en PNG transparente)
+          logoPath: (process.env.CLUBX_TICKET_LOGO_PATH || '').trim(),
+          logoBg: '#ffffff',
+        },
+      };
+
+      const themeName = (typeof ticketTheme === 'string' && ticketTheme.trim()) ? ticketTheme.trim() : 'default';
+      const T = THEMES[themeName] || THEMES.default;
+
+      const COLOR_BG = T.bg;           // fondo general
+      const COLOR_CARD = T.card;       // tarjeta
+      const COLOR_STROKE = T.stroke;   // bordes
+      const COLOR_TEXT = T.text;       // texto base
+      const COLOR_MUTED = T.muted;     // texto suave
+      const COLOR_ACCENT = T.accent;   // acento
 
       doc.on('data', (d) => bufs.push(d));
       doc.on('end', () => resolve(Buffer.concat(bufs)));
@@ -31,11 +83,11 @@ function buildTicketPdf({ eventTitle, clubName, eventDate, venue, serial, qrPngB
       doc.save()
         .roundedRect(cardX - 2, cardY - 2, cardW + 4, cardH + 4, 16)
         .lineWidth(1)
-        .strokeColor('#082032')
+        .strokeColor(T.headerStroke)
         .stroke()
         .restore();
 
-      // Tarjeta con borde cian
+      // Tarjeta con borde
       doc.save()
         .roundedRect(cardX, cardY, cardW, cardH, 14)
         .lineWidth(1.6)
@@ -46,13 +98,36 @@ function buildTicketPdf({ eventTitle, clubName, eventDate, venue, serial, qrPngB
       doc.save()
         .roundedRect(cardX + 1.5, cardY + 1.5, cardW - 3, cardH - 3, 12)
         .lineWidth(0.6)
-        .strokeColor('#053a44')
+        .strokeColor(T.innerStroke)
         .stroke()
         .restore();
 
       // Encabezado
       const headerY = cardY + 18;
       doc.fillColor(COLOR_MUTED).fontSize(10).text('NIGHTVIBE — DIGITAL TICKET', cardX + 22, headerY);
+
+      // Logo de marca (por tema) — opcional
+      // Prioridad: buffer > path pasado por parámetro > path del tema
+      const logoInput = brandLogoPngBuffer || brandLogoPath || T.logoPath;
+      if (logoInput) {
+        try {
+          const logoMaxW = 160;
+          const logoMaxH = 50;
+          const logoX = cardX + cardW - 22 - logoMaxW;
+          const logoY = headerY - 10;
+
+          // Fondo suave (para que el logo se lea bien en modo oscuro)
+          doc.save();
+          doc.roundedRect(logoX - 8, logoY - 6, logoMaxW + 16, logoMaxH + 12, 10)
+            .fillOpacity(0.10)
+            .fill(T.logoBg || '#ffffff')
+            .restore();
+
+          doc.image(logoInput, logoX, logoY, { fit: [logoMaxW, logoMaxH], align: 'right', valign: 'center' });
+        } catch (_) {
+          // si falla el logo, no rompemos el PDF
+        }
+      }
 
       // Club pill
       if (clubName) {
@@ -72,16 +147,16 @@ function buildTicketPdf({ eventTitle, clubName, eventDate, venue, serial, qrPngB
 
       // Evento — tipografía grande
       const titleY = headerY + (clubName ? 50 : 30);
-      doc.fillColor('#f1f5f9').fontSize(28).text(eventTitle || 'Evento', cardX + 22, titleY, { width: cardW - 44 });
+      doc.fillColor(T.title).fontSize(28).text(eventTitle || 'Evento', cardX + 22, titleY, { width: cardW - 44 });
 
       // Subinfo (fecha + venue)
       let subY = titleY + 34;
       if (eventDate) {
-        doc.fillColor('#cbd5e1').fontSize(12).text(eventDate, cardX + 22, subY, { width: cardW - 44 });
+        doc.fillColor(T.sub).fontSize(12).text(eventDate, cardX + 22, subY, { width: cardW - 44 });
         subY += 16;
       }
       if (venue) {
-        doc.fillColor('#9fb0c9').fontSize(12).text(venue, cardX + 22, subY, { width: cardW - 44 });
+        doc.fillColor(T.venue).fontSize(12).text(venue, cardX + 22, subY, { width: cardW - 44 });
         subY += 12;
       }
 
@@ -100,20 +175,20 @@ function buildTicketPdf({ eventTitle, clubName, eventDate, venue, serial, qrPngB
 
       if (buyerName) {
         doc.text('Comprador', leftX, y);
-        doc.fillColor('#cbd5e1').text(buyerName, leftX + 100, y);
+        doc.fillColor(T.sub).text(buyerName, leftX + 100, y);
         y += lineH;
         doc.fillColor(COLOR_TEXT);
       }
 
       if (seatLabel) {
         doc.text('Entrada', leftX, y);
-        doc.fillColor('#cbd5e1').text(seatLabel, leftX + 100, y);
+        doc.fillColor(T.sub).text(seatLabel, leftX + 100, y);
         y += lineH;
         doc.fillColor(COLOR_TEXT);
       }
 
       doc.text('Serial', leftX, y);
-      doc.fillColor('#cbd5e1').text(serial || '—', leftX + 100, y);
+      doc.fillColor(T.sub).text(serial || '—', leftX + 100, y);
       y += lineH;
 
       doc.fillColor(COLOR_MUTED).fontSize(10)
