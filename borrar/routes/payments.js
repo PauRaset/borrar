@@ -39,6 +39,32 @@ const toCents = (n) => {
   return Math.round(parsed * 100);
 };
 
+// Selección de tema/plantilla para Email + PDF de entradas (se consume en el webhook)
+// Nota: esto NO cambia el flujo de pago; solo añade metadata para que el webhook
+// pueda decidir qué estética/plantilla aplicar.
+const resolveTicketTheme = ({ event, club }) => {
+  // 1) Si en el futuro guardas un tema en el evento, lo respetamos
+  const eventTheme = event && typeof event.ticketTheme === 'string' ? event.ticketTheme.trim() : '';
+  if (eventTheme) return eventTheme;
+
+  // 2) Forzar tema para una cuenta concreta vía ENV (clubId o stripeAccountId)
+  // Ejemplos:
+  // - TICKET_THEME_CLUB_ID=655e... (Mongo ObjectId)
+  // - TICKET_THEME_STRIPE_ACCOUNT_ID=acct_...
+  // - TICKET_THEME_NAME=clubX
+  const THEME_NAME = (process.env.TICKET_THEME_NAME || 'clubX').trim();
+  const THEME_CLUB_ID = (process.env.TICKET_THEME_CLUB_ID || '').trim();
+  const THEME_STRIPE_ACCOUNT_ID = (process.env.TICKET_THEME_STRIPE_ACCOUNT_ID || '').trim();
+
+  if (THEME_CLUB_ID && String(club?._id || '') === THEME_CLUB_ID) return THEME_NAME;
+  if (THEME_STRIPE_ACCOUNT_ID && String(club?.stripeAccountId || '') === THEME_STRIPE_ACCOUNT_ID) {
+    return THEME_NAME;
+  }
+
+  // 3) Default
+  return 'default';
+};
+
 
   // GET /api/payments/direct/:eventId
 // Enlace estable que puedes compartir (no caduca).
@@ -102,6 +128,9 @@ router.get('/direct/:eventId', async (req, res) => {
           .status(400)
           .send('El club no tiene cuenta conectada en Stripe (LIVE).');
       }
+
+      // Tema/plantilla para Email + PDF (se aplicará en el webhook)
+      const ticketTheme = resolveTicketTheme({ event, club });
   
       // Comisión de plataforma por entrada:
       // - Por defecto: 1,50 €
@@ -189,7 +218,7 @@ router.get('/direct/:eventId', async (req, res) => {
                 description: productDescription,
                 // 👇 solo añadimos images si tenemos una URL válida
                 ...(eventImageUrl ? { images: [eventImageUrl] } : {}),
-                metadata: { eventId: String(event._id) },
+                metadata: { eventId: String(event._id), ticketTheme },
               },
             },
             quantity: qty,
@@ -203,6 +232,7 @@ router.get('/direct/:eventId', async (req, res) => {
           orderId: String(order._id),
           userId: '', // invitado
           clubId: String(clubId),
+          ticketTheme,
         },
         allow_promotion_codes: true,
         automatic_tax: { enabled: false },
