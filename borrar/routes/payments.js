@@ -188,7 +188,7 @@ router.get('/direct/:eventId', async (req, res) => {
       // Comisión de plataforma por entrada:
       // - Por defecto: 1,50 €
       // - Si el evento tiene `platformFeeEUR`, se usa ese valor (en euros)
-      const platformFeeEUR =
+      /*const platformFeeEUR =
         typeof event.platformFeeEUR === 'number'
           ? event.platformFeeEUR
           : 1.5;
@@ -206,7 +206,40 @@ router.get('/direct/:eventId', async (req, res) => {
         currency: 'eur',
         email: null,
         status: 'created',
+      });*/
+      // Comisión de plataforma por entrada:
+      // - Por defecto: 1,50 €
+      // - Si el evento tiene `platformFeeEUR`, se usa ese valor (admite number o string "1,50")
+      const platformFeeParsed = parsePrice(event.platformFeeEUR);
+      const platformFeeEUR =
+        platformFeeParsed !== null && Number.isFinite(platformFeeParsed) && platformFeeParsed >= 0
+          ? platformFeeParsed
+          : 1.5;
+      
+      const TICKET_CENTS = toCents(unit);
+      const PLATFORM_FEE_CENTS = Math.round(platformFeeEUR * 100);
+      
+      // Si fee = 0, no añadimos línea de gastos (Stripe no acepta unit_amount 0 en line_items en muchos casos)
+      const hasPlatformFee = PLATFORM_FEE_CENTS > 0;
+      
+      // Comisión total (por entrada)
+      const applicationFee = (hasPlatformFee ? PLATFORM_FEE_CENTS : 0) * qty;
+      
+      // Total que paga el comprador (entrada + gastos) * qty
+      const totalEUR = (unit + (hasPlatformFee ? platformFeeEUR : 0)) * qty;
+      
+      // Order "guest": sin userId ni email (Stripe nos dará el email)
+      const order = await Order.create({
+        userId: null,
+        eventId,
+        clubId,
+        qty,
+        amountEUR: totalEUR,
+        currency: 'eur',
+        email: null,
+        status: 'created',
       });
+
   
       // ==== Cartel / imagen del evento para Stripe Checkout ====
       // ==== Cartel / imagen del evento para Stripe Checkout ====
@@ -261,7 +294,7 @@ router.get('/direct/:eventId', async (req, res) => {
         mode: 'payment',
         locale: 'es',
         currency: 'eur',
-        line_items: [
+        /*line_items: [
           {
             price_data: {
               currency: 'eur',
@@ -276,7 +309,41 @@ router.get('/direct/:eventId', async (req, res) => {
             },
             quantity: qty,
           },
-        ],
+        ],*/
+        line_items: [
+        {
+          price_data: {
+            currency: 'eur',
+            unit_amount: TICKET_CENTS,
+            product_data: {
+              name: event.title || 'Entrada NightVibe',
+              description: productDescription,
+              ...(eventImageUrl ? { images: [eventImageUrl] } : {}),
+              metadata: { eventId: String(event._id), ticketTheme },
+            },
+          },
+          quantity: qty,
+        },
+      
+        // Gastos de gestión (tu comisión visible para el comprador)
+        ...(hasPlatformFee
+          ? [
+              {
+                price_data: {
+                  currency: 'eur',
+                  unit_amount: PLATFORM_FEE_CENTS,
+                  product_data: {
+                    name: 'Gastos de gestión',
+                    description: 'Comisión de plataforma NightVibe',
+                    metadata: { eventId: String(event._id), ticketTheme },
+                  },
+                },
+                quantity: qty,
+              },
+            ]
+          : []),
+      ],
+
         // Mismo success/cancel que el flujo normal
         success_url: `${process.env.APP_BASE_URL}/purchase/success?sid={CHECKOUT_SESSION_ID}`,
         cancel_url: `${process.env.APP_BASE_URL}/event/${eventId}?cancelled=1`,
