@@ -40,18 +40,20 @@ function buildTicketPdf({
         // Ejemplo de tema alternativo (para una "X cuenta").
         // Puedes ajustar colores sin tocar el flujo de pago.
         clubX: {
-          bg: '#080611',
-          card: '#0f0b1f',
-          stroke: '#2a2145',
-          text: '#efeaff',
-          muted: '#b7a7d6',
-          accent: '#ff2bd6',
-          headerStroke: '#160a28',
-          innerStroke: '#3b0b33',
-          title: '#ffffff',
-          sub: '#e7dcff',
-          venue: '#cdbcf0',
-          // Ruta opcional al logo para este tema (mejor en PNG transparente)
+          // Fondo blanco + estética “cartel/club”
+          bg: '#ffffff',
+          card: '#ffffff',
+          stroke: '#e5e7eb',     // gris claro (bordes)
+          text: '#111827',       // negro suave
+          muted: '#6b7280',      // gris
+          accent: '#C70000',     // rojo del logo
+          headerStroke: '#C70000',
+          innerStroke: '#f3f4f6',
+          title: '#111827',
+          sub: '#374151',
+          venue: '#4b5563',
+        
+          // Logo del club (ruta opcional)
           logoPath: (process.env.CLUBX_TICKET_LOGO_PATH || '').trim(),
           logoBg: '#ffffff',
         },
