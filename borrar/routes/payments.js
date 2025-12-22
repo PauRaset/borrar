@@ -110,8 +110,30 @@ router.get('/direct/:eventId', async (req, res) => {
         return res.status(400).send('Precio inválido');
       }
 
-      const qty = 1;
+      /*const qty = 1;*/
+      const [qty, setQty] = useState(1);
+
+      const maxQty = 10; // o lo que quieras (si tienes remaining, úsalo aquí)
+      const dec = () => setQty((q) => Math.max(1, q - 1));
+      const inc = () => setQty((q) => Math.min(maxQty, q + 1));
+      
+      const goPay = () => {
+        window.location.href = `${process.env.NEXT_PUBLIC_API_URL}/api/payments/direct/${eventId}?qty=${qty}`;
+      };
+      
+      // UI
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <button onClick={dec}>-</button>
+        <span style={{ minWidth: 24, textAlign: 'center' }}>{qty}</span>
+        <button onClick={inc}>+</button>
+      
+        <button onClick={goPay} style={{ marginLeft: 16 }}>
+          Comprar {qty} entrada{qty > 1 ? 's' : ''}
+        </button>
+      </div>
+
   
+      
       // Stock (capacity 0 = sin límite)
       if (event.capacity && event.capacity > 0) {
         if ((event.ticketsSold || 0) + qty > event.capacity) {
