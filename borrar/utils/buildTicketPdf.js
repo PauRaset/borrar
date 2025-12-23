@@ -37,23 +37,20 @@ function buildTicketPdf({
           logoPath: '',
           logoBg: '#ffffff',
         },
-        // Ejemplo de tema alternativo (para una "X cuenta").
-        // Puedes ajustar colores sin tocar el flujo de pago.
         clubX: {
-          // Fondo blanco + estética “cartel/club”
+          // Estética CLUB: fondo blanco + acento rojo (logo rojo)
           bg: '#ffffff',
           card: '#ffffff',
-          stroke: '#e5e7eb',     // gris claro (bordes)
-          text: '#111827',       // negro suave
-          muted: '#6b7280',      // gris
-          accent: '#C70000',     // rojo del logo
+          stroke: '#e5e7eb',
+          text: '#111827',
+          muted: '#6b7280',
+          accent: '#C70000',
           headerStroke: '#C70000',
           innerStroke: '#f3f4f6',
           title: '#111827',
           sub: '#374151',
           venue: '#4b5563',
-        
-          // Logo del club (ruta opcional)
+          // Ruta opcional al logo para este tema (mejor en PNG transparente)
           logoPath: (process.env.CLUBX_TICKET_LOGO_PATH || '').trim(),
           logoBg: '#ffffff',
         },
@@ -106,7 +103,10 @@ function buildTicketPdf({
 
       // Encabezado
       const headerY = cardY + 18;
-      doc.fillColor(COLOR_MUTED).fontSize(10).text('NIGHTVIBE — DIGITAL TICKET', cardX + 22, headerY);
+      const headerLabel = themeName === 'clubX'
+        ? 'COMISSIÓ DE FESTES — ENTRADA'
+        : 'NIGHTVIBE — DIGITAL TICKET';
+      doc.fillColor(COLOR_MUTED).fontSize(10).text(headerLabel, cardX + 22, headerY);
 
       // Logo de marca (por tema) — opcional
       // Prioridad: buffer > path pasado por parámetro > path del tema
