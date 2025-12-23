@@ -92,6 +92,7 @@ const eventSchema = new mongoose.Schema(
     // 🔥 NUEVO — relación con Club
     clubId: { type: String, index: true, default: "" }, // guardamos como string para flexibilidad
     club:   { type: mongoose.Schema.Types.ObjectId, ref: "Club", index: true, default: null },
+    ticketTheme: { type: String, default: "" },
   },
   {
     timestamps: true,
