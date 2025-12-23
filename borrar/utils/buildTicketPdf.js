@@ -168,7 +168,21 @@ function buildTicketPdf({
 
       // Bloque datos + QR
       const leftX = cardX + 22;
-      const topY = sepY + 16;
+
+      // --- QR centrado (horizontal + vertical) dentro de la tarjeta ---
+      const qrSize = 220;
+      const qrLabelH = 18; // espacio para el texto "SCAN ME"
+      const qrBlockH = qrSize + qrLabelH;
+
+      // Área de contenido: desde debajo del separador hasta antes del footer
+      const contentTop = sepY + 24;
+      const contentBottom = cardY + cardH - 110;
+
+      const qrX = cardX + (cardW - qrSize) / 2;
+      const qrY = contentTop + Math.max(0, ((contentBottom - contentTop) - qrBlockH) / 2);
+
+      // Datos debajo del QR (evita solapamientos y mantiene el diseño limpio)
+      const topY = qrY + qrBlockH + 18;
 
       // Datos
       doc.fillColor(COLOR_TEXT).fontSize(12);
@@ -194,12 +208,9 @@ function buildTicketPdf({
       y += lineH;
 
       doc.fillColor(COLOR_MUTED).fontSize(10)
-        .text('Muestra este QR en la entrada. La reventa o alteración invalida la entrada.', leftX, y + 6, { width: 320 });
+        .text('Muestra este QR en la entrada. La reventa o alteración invalida la entrada.', leftX, y + 6, { width: cardW - 44 });
 
-      // QR
-      const qrSize = 220;
-      const qrX = cardX + cardW - qrSize - 32;
-      const qrY = topY - 8;
+      // QR (posición ya calculada arriba para centrarlo)
 
       try {
         doc.save();
