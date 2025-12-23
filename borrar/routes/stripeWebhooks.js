@@ -53,8 +53,8 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
       const session = event.data.object;
       const meta = session.metadata || {};
 
-      // Tema/plantilla para Email + PDF (viene desde Checkout metadata)
-      const ticketTheme = typeof meta.ticketTheme === 'string' ? meta.ticketTheme : '';
+      // Tema/plantilla para Email + PDF (idealmente viene desde Checkout metadata)
+      const ticketThemeFromMeta = typeof meta.ticketTheme === 'string' ? meta.ticketTheme.trim() : '';
 
       console.log('[stripe webhook] metadata =', meta);
 
@@ -126,6 +126,15 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
 
       // --- Actualizar contador ticketsSold ---
       const evt = await Event2.findById(eventId).lean();
+
+      // Fallback: si Stripe metadata no trae ticketTheme, lo leemos del evento
+      const ticketThemeFromEvent = typeof evt?.ticketTheme === 'string' ? evt.ticketTheme.trim() : '';
+      const ticketThemeResolved = ticketThemeFromMeta || ticketThemeFromEvent || 'default';
+      console.log('[stripe webhook] ticketTheme resolved =', {
+        fromMeta: ticketThemeFromMeta,
+        fromEvent: ticketThemeFromEvent,
+        final: ticketThemeResolved,
+      });
 
       if (evt && evt.capacity && evt.capacity > 0) {
         await Event2.updateOne(
@@ -204,7 +213,7 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
           venue,
           serial: created[0]?.doc?.serial,
           qrPngBuffer: created[0]?.qrPngBuffer,
-          ticketTheme,
+          ticketTheme: ticketThemeResolved,
           buyerName: '',
         });
       } catch (e) {
