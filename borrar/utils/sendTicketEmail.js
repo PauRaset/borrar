@@ -27,20 +27,29 @@ function logSgError(err) {
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
 /**
- * Envía el email de la entrada con:
- *  - QR embebido inline (para que se vea dentro del correo)
- *  - PDF adjunto (ticket.pdf)
+ * Envía el email de la(s) entrada(s) con:
+ *  - QR embebido inline (se muestra el primero)
+ *  - PDF adjunto con 1 o N entradas (ticket.pdf)
+ *
+ * Retrocompatible:
+ *  - Si NO pasas `tickets`, usa `serial` + `qrPngBuffer` como antes.
  *
  * @param {Object} opts
  * @param {string} opts.to                Email del comprador
  * @param {string} opts.eventTitle        Título del evento
  * @param {string} [opts.clubName]        Nombre del club/organizador
- * @param {string} [opts.eventDate]       Fecha/hora legible (ej: "Sáb, 26 Oct 2025 — 23:00")
+ * @param {string} [opts.eventDate]       Fecha/hora legible
  * @param {string} [opts.venue]           Lugar/sala/dirección corta
- * @param {string} opts.serial            Serial del ticket (ej: NV-AB12-3F)
- * @param {Buffer} opts.qrPngBuffer       PNG del QR (Buffer)
+ *
+ * (legacy)
+ * @param {string} [opts.serial]          Serial del ticket
+ * @param {Buffer} [opts.qrPngBuffer]     PNG del QR (Buffer)
+ *
+ * (nuevo)
+ * @param {Array<{serial:string, qrPngBuffer:Buffer, seatLabel?:string}>} [opts.tickets]
+ *
  * @param {string} [opts.buyerName]       Nombre del comprador (si lo tienes)
- * @param {string} [opts.seatLabel]       Etiqueta de entrada/asiento/mesa (opcional)
+ * @param {string} [opts.seatLabel]       Etiqueta (legacy, opcional)
  * @param {string} [opts.ticketTheme]     Tema/plantilla (ej: "default", "clubX")
  */
 async function sendTicketEmail({
@@ -49,8 +58,14 @@ async function sendTicketEmail({
   clubName = '',
   eventDate = '',
   venue = '',
+
+  // legacy
   serial,
   qrPngBuffer,
+
+  // nuevo
+  tickets,
+
   buyerName = '',
   seatLabel = '',
   ticketTheme = '',
@@ -63,24 +78,46 @@ async function sendTicketEmail({
     throw new Error('Email destinatario inválido');
   }
 
+  // Normalizamos tickets (si no vienen, creamos 1 desde legacy)
+  let normalizedTickets = Array.isArray(tickets) ? tickets.filter(Boolean) : [];
+  if (normalizedTickets.length === 0) {
+    if (!serial || !qrPngBuffer) {
+      throw new Error('[sendTicketEmail] Falta tickets[] o (serial + qrPngBuffer)');
+    }
+    normalizedTickets = [{ serial, qrPngBuffer, seatLabel }];
+  }
+
+  // El QR inline del email será el primero
+  const first = normalizedTickets[0];
+  if (!first?.serial || !first?.qrPngBuffer) {
+    throw new Error('[sendTicketEmail] tickets[0] inválido (serial/qrPngBuffer requeridos)');
+  }
+
   console.log('[sendTicketEmail] to=', to, 'from=', process.env.SENDGRID_FROM);
   console.log('[sendTicketEmail] eventTitle=', eventTitle, 'clubName=', clubName);
-  console.log('[sendTicketEmail] ticketTheme=', ticketTheme);
+  console.log('[sendTicketEmail] ticketTheme=', ticketTheme, 'qty=', normalizedTickets.length);
 
-  // PDF adjunto
+  // PDF adjunto (1 PDF con N entradas)
   let pdfBuffer;
   try {
     const themeName = typeof ticketTheme === 'string' ? ticketTheme.trim() : '';
+
     pdfBuffer = await buildTicketPdf({
       eventTitle,
       clubName,
       eventDate,
       venue,
-      serial,
-      qrPngBuffer,
+
+      // ✅ nuevo: pdf multipase
+      tickets: normalizedTickets.map((t) => ({
+        serial: t.serial,
+        qrPngBuffer: t.qrPngBuffer,
+        seatLabel: t.seatLabel || '',
+      })),
+
       buyerName,
-      seatLabel,
       ticketTheme: themeName,
+
       // Logo opcional para el tema clubX (si existe en ENV)
       brandLogoPath: themeName === 'clubX' ? (process.env.CLUBX_TICKET_LOGO_PATH || '').trim() : '',
     });
@@ -88,21 +125,31 @@ async function sendTicketEmail({
     console.error('[sendTicketEmail] Error generando PDF:', e?.message || e);
     throw e;
   }
-  console.log('[sendTicketEmail] sizes: qrPngBuffer=', qrPngBuffer?.length || 0, 'bytes; pdfBuffer=', pdfBuffer?.length || 0, 'bytes');
 
-  // Imagen QR inline: la referenciamos en el HTML con cid:qrimg
-  const qrAsBase64 = qrPngBuffer.toString('base64');
+  const totalQrBytes = normalizedTickets.reduce((acc, t) => acc + (t?.qrPngBuffer?.length || 0), 0);
+  console.log('[sendTicketEmail] sizes: totalQrBytes=', totalQrBytes, 'pdfBuffer=', pdfBuffer?.length || 0);
+
+  // Imagen QR inline (solo 1): cid:qrimg
+  const qrAsBase64 = first.qrPngBuffer.toString('base64');
   const pdfAsBase64 = pdfBuffer.toString('base64');
 
   const safeTitle = escapeHtml(eventTitle);
   const safeVenue = escapeHtml(venue);
-  const safeSerial = escapeHtml(serial);
   const safeBuyer = escapeHtml(buyerName || '');
   const safeDate  = escapeHtml(eventDate || '');
   const safeClub  = escapeHtml(clubName || '');
-  const safeSeat  = escapeHtml(seatLabel || '');
 
-  const subject = `🎟️ ${safeClub ? safeClub + ' — ' : ''}Tu entrada: ${eventTitle}${eventDate ? ' · ' + eventDate : ''}`;
+  const qtyLabel = normalizedTickets.length;
+  const serialList = normalizedTickets.map((t) => t.serial).filter(Boolean);
+
+  const subject = `🎟️ ${safeClub ? safeClub + ' — ' : ''}Tus entradas (${qtyLabel}): ${eventTitle}${eventDate ? ' · ' + eventDate : ''}`;
+
+  const serialsHtml = serialList.length
+    ? `<div style="margin:10px 0 0;color:#cbd5e1;font-size:13px;line-height:1.6">
+         <b style="color:#e5e7eb">Serials:</b><br/>
+         ${serialList.map((s) => `<span style="display:inline-block;margin:2px 6px 2px 0;padding:3px 8px;border-radius:999px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.10);color:#e2e8f0;font-size:12px">${escapeHtml(s)}</span>`).join('')}
+       </div>`
+    : '';
 
   const html = `
   <div style="background:#0b0f19;padding:24px;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#e5e7eb;">
@@ -114,15 +161,22 @@ async function sendTicketEmail({
           ${safeClub ? `<div style="margin-top:8px;display:inline-block;padding:4px 10px;border-radius:999px;background:rgba(0,229,255,.12);color:#00e5ff;font-size:11px;letter-spacing:.03em">${safeClub.toUpperCase()}</div>` : ''}
           ${safeDate ? `<div style="margin-top:4px;color:#cbd5e1">${safeDate}</div>` : ''}
           ${safeVenue ? `<div style="margin-top:2px;color:#9fb0c9">${safeVenue}</div>` : ''}
+
+          <div style="margin-top:10px;color:#93a4bf;font-size:13px">
+            <b style="color:#e5e7eb">${qtyLabel}</b> entrada${qtyLabel > 1 ? 's' : ''} — adjuntamos un PDF con todas.
+          </div>
+
+          ${serialsHtml}
         </td>
       </tr>
 
       <tr>
         <td style="padding:18px 22px 8px;">
-          ${safeBuyer ? `<div style="margin-bottom:8px"><b style="color:#e5e7eb">Comprador:</b> <span style="color:#cbd5e1">${safeBuyer}</span></div>` : ``}
-          ${safeSeat ? `<div style="margin-bottom:8px"><b style="color:#e5e7eb">Entrada:</b> <span style="color:#cbd5e1">${safeSeat}</span></div>` : ``}
-          <div style="margin-bottom:10px"><b style="color:#e5e7eb">Serial:</b> <span style="color:#cbd5e1">${safeSerial}</span></div>
-          <div style="margin:12px 0 18px;color:#93a4bf;font-size:13px">Presenta este QR en la entrada. También adjuntamos un PDF como alternativa.</div>
+          ${safeBuyer ? `<div style="margin-bottom:10px"><b style="color:#e5e7eb">Comprador:</b> <span style="color:#cbd5e1">${safeBuyer}</span></div>` : ``}
+
+          <div style="margin:12px 0 18px;color:#93a4bf;font-size:13px">
+            Presenta el QR en la entrada. Mostramos el primero aquí; los demás están en el PDF adjunto.
+          </div>
 
           <div style="text-align:center;padding:18px;background:#0b0f19;border:1px solid #1e293b;border-radius:12px">
             <img src="cid:qrimg" width="240" height="240" alt="QR Entrada" style="display:inline-block;border-radius:10px" />
@@ -143,11 +197,14 @@ async function sendTicketEmail({
   </div>
   `;
 
-  const text = `Tu entrada de NightVibe
+  const text = `Tus entradas de NightVibe (${qtyLabel})
 ${clubName ? 'Club: ' + clubName + '\n' : ''}Evento: ${eventTitle}
-${eventDate ? 'Fecha: ' + eventDate + '\n' : ''}${venue ? 'Lugar: ' + venue + '\n' : ''}${seatLabel ? 'Entrada: ' + seatLabel + '\n' : ''}Serial: ${serial}
+${eventDate ? 'Fecha: ' + eventDate + '\n' : ''}${venue ? 'Lugar: ' + venue + '\n' : ''}
 
-Adjuntamos un PDF con tu ticket por si el QR no se muestra en tu cliente de email.`;
+Serials:
+${serialList.map((s) => '- ' + s).join('\n')}
+
+Adjuntamos un PDF (ticket.pdf) con todas tus entradas.`;
 
   const msg = {
     to,
@@ -156,7 +213,7 @@ Adjuntamos un PDF con tu ticket por si el QR no se muestra en tu cliente de emai
     text,
     html,
     attachments: [
-      // QR inline
+      // QR inline (solo 1)
       {
         content: qrAsBase64,
         filename: 'qr.png',
@@ -164,7 +221,7 @@ Adjuntamos un PDF con tu ticket por si el QR no se muestra en tu cliente de emai
         disposition: 'inline',
         content_id: 'qrimg',
       },
-      // PDF adjunto
+      // PDF adjunto (con N entradas)
       {
         content: pdfAsBase64,
         filename: 'ticket.pdf',
@@ -181,7 +238,7 @@ Adjuntamos un PDF con tu ticket por si el QR no se muestra en tu cliente de emai
     return resp;
   } catch (err) {
     logSgError(err);
-    throw err; // mantiene el comportamiento actual de propagar el error
+    throw err;
   }
 }
 
@@ -223,6 +280,7 @@ function logSgError(err) {
 
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
+
 async function sendTicketEmail({
   to,
   eventTitle,
@@ -233,6 +291,7 @@ async function sendTicketEmail({
   qrPngBuffer,
   buyerName = '',
   seatLabel = '',
+  ticketTheme = '',
 }) {
   if (!process.env.SENDGRID_FROM) {
     throw new Error('Falta la variable SENDGRID_FROM (remitente) en el .env');
@@ -244,10 +303,12 @@ async function sendTicketEmail({
 
   console.log('[sendTicketEmail] to=', to, 'from=', process.env.SENDGRID_FROM);
   console.log('[sendTicketEmail] eventTitle=', eventTitle, 'clubName=', clubName);
+  console.log('[sendTicketEmail] ticketTheme=', ticketTheme);
 
   // PDF adjunto
   let pdfBuffer;
   try {
+    const themeName = typeof ticketTheme === 'string' ? ticketTheme.trim() : '';
     pdfBuffer = await buildTicketPdf({
       eventTitle,
       clubName,
@@ -257,6 +318,9 @@ async function sendTicketEmail({
       qrPngBuffer,
       buyerName,
       seatLabel,
+      ticketTheme: themeName,
+      // Logo opcional para el tema clubX (si existe en ENV)
+      brandLogoPath: themeName === 'clubX' ? (process.env.CLUBX_TICKET_LOGO_PATH || '').trim() : '',
     });
   } catch (e) {
     console.error('[sendTicketEmail] Error generando PDF:', e?.message || e);
