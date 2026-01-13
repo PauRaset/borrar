@@ -284,10 +284,30 @@ router.get("/:id", async (req, res) => {
     or.push({ firebaseUid: id }, { username: id }, { phoneNumber: id });
 
     const user = await User.findOne({ $or: or })
-      .select("username displayName profilePicture")
+      // Incluimos posibles campos sociales si existen (arrays o counters)
+      .select(
+        "username displayName profilePicture followers following followersCount followingCount firebaseUid phoneNumber"
+      )
       .lean();
 
-    if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
+    // Followers/Following: soporta dos esquemas comunes
+    // - arrays: user.followers / user.following
+    // - counters: user.followersCount / user.followingCount
+    const followersCount = Array.isArray(user.followers)
+      ? user.followers.length
+      : Number(user.followersCount || 0);
+
+    const followingCount = Array.isArray(user.following)
+      ? user.following.length
+      : Number(user.followingCount || 0);
+
+    // Attendances: contamos eventos donde el usuario aparece en `attendees`
+    let attendancesCount = 0;
+    try {
+      attendancesCount = await Event.countDocuments({ attendees: user._id });
+    } catch (_) {
+      attendancesCount = 0;
+    }
 
     return res.json({
       id: String(user._id || id),
@@ -295,6 +315,9 @@ router.get("/:id", async (req, res) => {
       displayName: user.displayName || "",
       profilePicture: user.profilePicture || null,
       avatarUrl: absUrlFromUpload(req, user.profilePicture),
+      followersCount,
+      followingCount,
+      attendancesCount,
     });
   } catch (err) {
     console.error("[GET /users/:id]", err);
@@ -411,9 +434,7 @@ const authenticateToken = require("../middlewares/authMiddleware");
 require("../middlewares/firebaseAdmin");
 const admin = require("firebase-admin");
 
-// -------------------------------------------------------------
-//   Helpers
-//------------------------------------------------------------- 
+
 function backendBase(req) {
   return process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
 }
@@ -449,9 +470,6 @@ function extractIdToken(req) {
   );
 }
 
-// -------------------------------------------------------------
-//   AUTH BRIDGE: acepta Firebase O tu JWT propio
-//------------------------------------------------------------- 
 async function anyAuth(req, res, next) {
   const token = extractIdToken(req);
   if (!token) {
@@ -496,9 +514,7 @@ async function ensureUserId(req, res, next) {
   return res.status(401).json({ message: "Usuario no autenticado" });
 }
 
-// -------------------------------------------------------------
- //  Multer + Sharp para avatar
-//------------------------------------------------------------- 
+
 const ROOT_UPLOADS_DIR = path.join(__dirname, "..", "uploads");
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -532,9 +548,6 @@ async function processImageToJpg(srcPath, outDir, baseName) {
   }
 }
 
-// -------------------------------------------------------------
-//   GET /api/users/me/attending  (ahora con anyAuth)
-//------------------------------------------------------------- 
 router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -557,9 +570,7 @@ router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
   }
 });
 
-// -------------------------------------------------------------
-//   GET /api/users/me  (JWT o Firebase)
-//------------------------------------------------------------- 
+
 router.get("/me", anyAuth, ensureUserId, async (req, res) => {
   try {
     const u = await User.findById(req.user.id).lean();
@@ -587,10 +598,7 @@ router.get("/me", anyAuth, ensureUserId, async (req, res) => {
   }
 });
 
-///-------------------------------------------------------------
-//   PATCH/PUT /api/users/me  (actualiza perfil)
-//   Campos permitidos: username, entName, wUser, role (opcional)
-//------------------------------------------------------------- 
+
 function sanitizeProfileUpdate(body) {
   const allowed = ["username", "entName", "wUser", "role"];
   const out = {};
@@ -626,9 +634,6 @@ router.put("/me", anyAuth, ensureUserId, async (req, res) => {
   return router.handle({ ...req, method: "PATCH" }, res);
 });
 
-// -------------------------------------------------------------
-//   POST /api/users/me/avatar  (subir/cambiar avatar)
-//------------------------------------------------------------- 
 router.post("/me/avatar", anyAuth, ensureUserId, upload.single("avatar"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'Falta el archivo "avatar"' });
@@ -640,7 +645,9 @@ router.post("/me/avatar", anyAuth, ensureUserId, upload.single("avatar"), async 
       `avatar-${Date.now()}-${path.parse(req.file.originalname).name}`
     );
 
-    const rel = path.relative(path.join(__dirname, ".."), processedImagePath).replace(/\\/g, "/");
+    const rel = path
+      .relative(path.join(__dirname, ".."), processedImagePath)
+      .replace(/\\/g, "/");
 
     const user = await User.findByIdAndUpdate(
       req.user.id,
@@ -657,6 +664,125 @@ router.post("/me/avatar", anyAuth, ensureUserId, upload.single("avatar"), async 
   } catch (err) {
     console.error("[POST /api/users/me/avatar] error:", err);
     res.status(500).json({ message: "No se pudo subir el avatar", error: err.message });
+  }
+});
+
+
+
+// GET /api/users/:id  -> admite _id Mongo, firebaseUid, username o phoneNumber
+router.get("/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const or = [];
+    if (/^[a-fA-F0-9]{24}$/.test(id)) or.push({ _id: id });
+    or.push({ firebaseUid: id }, { username: id }, { phoneNumber: id });
+
+    const user = await User.findOne({ $or: or })
+      .select("username displayName profilePicture")
+      .lean();
+
+    if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
+
+    return res.json({
+      id: String(user._id || id),
+      username: user.username || "",
+      displayName: user.displayName || "",
+      profilePicture: user.profilePicture || null,
+      avatarUrl: absUrlFromUpload(req, user.profilePicture),
+    });
+  } catch (err) {
+    console.error("[GET /users/:id]", err);
+    return res.status(500).json({ message: "Error interno" });
+  }
+});
+
+// GET /api/users?ids=a,b,c  -> batch por querystring
+router.get("/", async (req, res) => {
+  try {
+    const idsRaw = (req.query.ids || "").toString();
+    if (!idsRaw) return res.json([]);
+
+    const ids = idsRaw.split(",").map((s) => s.trim()).filter(Boolean);
+    const byObjectId = ids.filter((s) => /^[a-fA-F0-9]{24}$/.test(s));
+
+    const users = await User.find({
+      $or: [
+        { _id: { $in: byObjectId } },
+        { firebaseUid: { $in: ids } },
+        { username: { $in: ids } },
+        { phoneNumber: { $in: ids } },
+      ],
+    })
+      .select("username displayName profilePicture")
+      .lean();
+
+    const out = users.map((u) => ({
+      id: String(u._id),
+      username: u.username || "",
+      displayName: u.displayName || "",
+      profilePicture: u.profilePicture || null,
+      avatarUrl: absUrlFromUpload(req, u.profilePicture),
+    }));
+    res.json(out);
+  } catch (err) {
+    console.error("[GET /users?ids]", err);
+    res.status(500).json({ message: "Error interno" });
+  }
+});
+
+// POST /api/users/batch  -> { ids: [...] }
+router.post("/batch", async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [];
+    if (!ids.length) return res.json([]);
+
+    const byObjectId = ids.filter((s) => /^[a-fA-F0-9]{24}$/.test(s));
+
+    const users = await User.find({
+      $or: [
+        { _id: { $in: byObjectId } },
+        { firebaseUid: { $in: ids } },
+        { username: { $in: ids } },
+        { phoneNumber: { $in: ids } },
+      ],
+    })
+      .select("username displayName profilePicture")
+      .lean();
+
+    const out = users.map((u) => ({
+      id: String(u._id),
+      username: u.username || "",
+      displayName: u.displayName || "",
+      profilePicture: u.profilePicture || null,
+      avatarUrl: absUrlFromUpload(req, u.profilePicture),
+    }));
+    res.json(out);
+  } catch (err) {
+    console.error("[POST /users/batch]", err);
+    res.status(500).json({ message: "Error interno" });
+  }
+});
+
+// GET /api/users/:id/avatar  -> redirige a la imagen real
+router.get("/:id/avatar", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const or = [];
+    if (/^[a-fA-F0-9]{24}$/.test(id)) or.push({ _id: id });
+    or.push({ firebaseUid: id }, { username: id }, { phoneNumber: id });
+
+    const user = await User.findOne({ $or: or })
+      .select("profilePicture")
+      .lean();
+
+    if (!user || !user.profilePicture) return res.status(404).end();
+
+    const url = absUrlFromUpload(req, user.profilePicture);
+    if (!url) return res.status(404).end();
+    return res.redirect(url);
+  } catch (err) {
+    console.error("[GET /users/:id/avatar]", err);
+    res.status(500).end();
   }
 });
 
