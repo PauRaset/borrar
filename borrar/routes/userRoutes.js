@@ -275,6 +275,36 @@ router.post("/me/avatar", anyAuth, ensureUserId, upload.single("avatar"), async 
    (Colocados después de /me* para evitar conflictos de orden)
 ============================================================= */
 
+// GET /api/users/:id/attending  -> lista de eventos donde el usuario asiste
+router.get("/:id/attending", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const or = [];
+    if (/^[a-fA-F0-9]{24}$/.test(id)) or.push({ _id: id });
+    or.push({ firebaseUid: id }, { username: id }, { phoneNumber: id });
+
+    const user = await User.findOne({ $or: or }).select("_id").lean();
+    if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
+
+    const events = await Event.find({ attendees: user._id })
+      .select("title date image createdBy")
+      .sort({ date: -1 })
+      .lean();
+
+    const out = events.map((e) => ({
+      id: e._id.toString(),
+      title: e.title,
+      date: e.date,
+      imageUrl: absUrlFromUpload(req, e.image),
+    }));
+
+    return res.json(out);
+  } catch (err) {
+    console.error("[GET /users/:id/attending]", err);
+    return res.status(500).json({ message: "Error obteniendo eventos asistidos" });
+  }
+});
+
 // GET /api/users/:id  -> admite _id Mongo, firebaseUid, username o phoneNumber
 router.get("/:id", async (req, res) => {
   try {
