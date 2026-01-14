@@ -122,14 +122,14 @@ async function sendTicketEmail({
           ${safeBuyer ? `<div style="margin-bottom:8px"><b style="color:#e5e7eb">Comprador:</b> <span style="color:#cbd5e1">${safeBuyer}</span></div>` : ``}
           ${safeSeat ? `<div style="margin-bottom:8px"><b style="color:#e5e7eb">Entrada:</b> <span style="color:#cbd5e1">${safeSeat}</span></div>` : ``}
           <div style="margin-bottom:10px"><b style="color:#e5e7eb">Serial:</b> <span style="color:#cbd5e1">${safeSerial}</span></div>
-          <div style="margin:12px 0 18px;color:#93a4bf;font-size:13px">Presenta este QR en la entrada. También adjuntamos un PDF como alternativa.</div>
+          <div style="margin:12px 0 18px;color:#93a4bf;font-size:13px">Presenta el QR en la entrada, adjuntamos un PDF con las entradas.</div>
 
-          <div style="text-align:center;padding:18px;background:#0b0f19;border:1px solid #1e293b;border-radius:12px">
+          <!--<div style="text-align:center;padding:18px;background:#0b0f19;border:1px solid #1e293b;border-radius:12px">
             <img src="cid:qrimg" width="240" height="240" alt="QR Entrada" style="display:inline-block;border-radius:10px" />
-          </div>
+          </div>-->
 
           <div style="margin-top:18px;color:#9fb0c9;font-size:12px;line-height:1.5">
-            Si el QR no se muestra correctamente, abre el adjunto <b>ticket.pdf</b>.
+            Abre el adjunto <b>ticket.pdf</b>.
           </div>
         </td>
       </tr>
