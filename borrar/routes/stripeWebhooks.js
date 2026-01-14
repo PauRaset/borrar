@@ -185,7 +185,7 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
         created.push({ doc: t, qrPngBuffer });
       }
 
-      // --- Enviar email (1 SOLO correo con N entradas) ---
+      // --- Enviar email ---
       try {
         const freshEvt = evt || (await Event2.findById(eventId).lean());
         const clubName =
@@ -198,44 +198,31 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
             })
           : '';
 
-        const toEmail = order.email || stripeEmail;
-        if (!toEmail) {
-          console.warn('[stripe webhook] No email found in order/session; skipping email send.', {
-            orderId: String(order._id),
-            sessionId,
-          });
-        } else {
-          // Nuevo payload: lista de tickets para PDF multipase (1 email, 1 PDF con N entradas)
-          const tickets = created.map((x) => ({
-            serial: x.doc.serial,
-            qrPngBuffer: x.qrPngBuffer,
-          }));
+        console.log(
+          '[stripe webhook] sending ticket email to',
+          order.email || stripeEmail,
+          'qty=',
+          created.length,
+          'serials=',
+          created.map((x) => x?.doc?.serial).join(', ')
+        );
 
-          console.log(
-            '[stripe webhook] sending ticket email to',
-            toEmail,
-            'qty=',
-            tickets.length
-          );
+        await sendTicketEmail({
+          to: order.email || stripeEmail,
+          eventTitle: freshEvt?.title || 'Entrada NightVibe',
+          clubName,
+          eventDate,
+          venue,
+          ticketTheme: ticketThemeResolved,
+          buyerName: '',
 
-          await sendTicketEmail({
-            to: toEmail,
-            eventTitle: freshEvt?.title || 'Entrada NightVibe',
-            clubName,
-            eventDate,
-            venue,
-
-            // ✅ NUEVO: todos los tickets
-            tickets,
-
-            // ✅ Retrocompatibilidad (por si sendTicketEmail aún espera 1)
-            serial: tickets[0]?.serial,
-            qrPngBuffer: tickets[0]?.qrPngBuffer,
-
-            ticketTheme: ticketThemeResolved,
-            buyerName: '',
-          });
-        }
+          // ✅ Enviar TODAS las entradas en un solo email / un solo PDF (1 página por entrada)
+          tickets: created.map((x) => ({
+            serial: x?.doc?.serial,
+            qrPngBuffer: x?.qrPngBuffer,
+            seatLabel: '',
+          })),
+        });
       } catch (e) {
         console.error('Email ticket error:', e);
       }
@@ -335,7 +322,6 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
         session.customer_email ||
         null;
 
-
       let order = null;
       if (meta.orderId) {
         order = await Order2.findById(meta.orderId);
@@ -347,12 +333,10 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
         }
       }
 
-      
       if (!order) {
         order = await Order2.findOne({ stripeSessionId: sessionId });
       }
 
-      
       if (!order) {
         console.warn(
           '[stripe webhook] no Order found for session, creating on the fly:',
@@ -451,7 +435,7 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
         created.push({ doc: t, qrPngBuffer });
       }
 
-      // --- Enviar email ---
+      // --- Enviar email (1 SOLO correo con N entradas) ---
       try {
         const freshEvt = evt || (await Event2.findById(eventId).lean());
         const clubName =
@@ -464,24 +448,44 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
             })
           : '';
 
-        console.log(
-          '[stripe webhook] sending ticket email to',
-          order.email || stripeEmail,
-          'serial=',
-          created[0]?.doc?.serial
-        );
+        const toEmail = order.email || stripeEmail;
+        if (!toEmail) {
+          console.warn('[stripe webhook] No email found in order/session; skipping email send.', {
+            orderId: String(order._id),
+            sessionId,
+          });
+        } else {
+          // Nuevo payload: lista de tickets para PDF multipase (1 email, 1 PDF con N entradas)
+          const tickets = created.map((x) => ({
+            serial: x.doc.serial,
+            qrPngBuffer: x.qrPngBuffer,
+          }));
 
-        await sendTicketEmail({
-          to: order.email || stripeEmail,
-          eventTitle: freshEvt?.title || 'Entrada NightVibe',
-          clubName,
-          eventDate,
-          venue,
-          serial: created[0]?.doc?.serial,
-          qrPngBuffer: created[0]?.qrPngBuffer,
-          ticketTheme: ticketThemeResolved,
-          buyerName: '',
-        });
+          console.log(
+            '[stripe webhook] sending ticket email to',
+            toEmail,
+            'qty=',
+            tickets.length
+          );
+
+          await sendTicketEmail({
+            to: toEmail,
+            eventTitle: freshEvt?.title || 'Entrada NightVibe',
+            clubName,
+            eventDate,
+            venue,
+
+            // ✅ NUEVO: todos los tickets
+            tickets,
+
+            // ✅ Retrocompatibilidad (por si sendTicketEmail aún espera 1)
+            serial: tickets[0]?.serial,
+            qrPngBuffer: tickets[0]?.qrPngBuffer,
+
+            ticketTheme: ticketThemeResolved,
+            buyerName: '',
+          });
+        }
       } catch (e) {
         console.error('Email ticket error:', e);
       }
