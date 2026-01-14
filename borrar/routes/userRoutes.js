@@ -75,6 +75,29 @@ async function anyAuth(req, res, next) {
     return authenticateToken(req, res, next);
   }
 }
+// Variante "opcional": intenta auth pero no bloquea si no hay token o es inválido.
+async function optionalAnyAuth(req, res, next) {
+  const token = extractIdToken(req);
+  if (!token) return next();
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.firebaseUser = {
+      uid: decoded.uid,
+      phone: decoded.phone_number || decoded.phoneNumber || null,
+      displayName: decoded.name || null,
+      photoURL: decoded.picture || null,
+    };
+    return next();
+  } catch (_) {
+    // Si no era Firebase válido, intenta JWT, pero sin bloquear si falla.
+    try {
+      return authenticateToken(req, res, next);
+    } catch (e) {
+      return next();
+    }
+  }
+}
 
 // Garantiza req.user.id (ObjectId string de Mongo)
 // - si viene de tu JWT: ya lo pone el middleware
@@ -181,6 +204,7 @@ router.get("/me", anyAuth, ensureUserId, async (req, res) => {
       wUser: u.wUser || "",
       profilePicture: u.profilePicture || "",
       profilePictureUrl: absUrlFromUpload(req, avatarRaw),
+      isPrivate: !!u.isPrivate,
       createdAt: u.createdAt,
       updatedAt: u.updatedAt,
     });
@@ -195,7 +219,7 @@ router.get("/me", anyAuth, ensureUserId, async (req, res) => {
    Campos permitidos: username, entName, wUser, role (opcional)
 ------------------------------------------------------------- */
 function sanitizeProfileUpdate(body) {
-  const allowed = ["username", "entName", "wUser", "role"];
+  const allowed = ["username", "entName", "wUser", "role", "isPrivate"]; // + privacidad
   const out = {};
   for (const k of allowed) {
     if (typeof body[k] !== "undefined") out[k] = body[k];
@@ -216,6 +240,7 @@ router.patch("/me", anyAuth, ensureUserId, async (req, res) => {
       entName: user.entName || "",
       wUser: user.wUser || "",
       role: user.role || null,
+      isPrivate: !!user.isPrivate,
       profilePictureUrl: absUrlFromUpload(req, user.profilePicture || user.avatar || null),
     });
   } catch (err) {
@@ -276,15 +301,26 @@ router.post("/me/avatar", anyAuth, ensureUserId, upload.single("avatar"), async 
 ============================================================= */
 
 // GET /api/users/:id/attending  -> lista de eventos donde el usuario asiste
-router.get("/:id/attending", async (req, res) => {
+router.get("/:id/attending", optionalAnyAuth, async (req, res) => {
   try {
     const id = req.params.id;
     const or = [];
     if (/^[a-fA-F0-9]{24}$/.test(id)) or.push({ _id: id });
     or.push({ firebaseUid: id }, { username: id }, { phoneNumber: id });
 
-    const user = await User.findOne({ $or: or }).select("_id").lean();
+    const user = await User.findOne({ $or: or }).select("_id firebaseUid isPrivate").lean();
     if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
+
+    // Privacy gate: si el perfil es privado, solo el dueño puede ver asistencias.
+    const viewerMongoId = req.user && req.user.id ? String(req.user.id) : "";
+    const viewerUid = req.firebaseUser && req.firebaseUser.uid ? String(req.firebaseUser.uid) : "";
+    const targetMongoId = String(user._id);
+    const targetUid = user.firebaseUid ? String(user.firebaseUid) : "";
+    const isOwner = (viewerMongoId && viewerMongoId === targetMongoId) || (viewerUid && targetUid && viewerUid === targetUid);
+
+    if (user.isPrivate && !isOwner) {
+      return res.status(403).json({ message: "Perfil privado" });
+    }
 
     const events = await Event.find({ attendees: user._id })
       .select("title date image createdBy")
@@ -306,7 +342,7 @@ router.get("/:id/attending", async (req, res) => {
 });
 
 // GET /api/users/:id  -> admite _id Mongo, firebaseUid, username o phoneNumber
-router.get("/:id", async (req, res) => {
+router.get("/:id", optionalAnyAuth, async (req, res) => {
   try {
     const id = req.params.id;
     const or = [];
@@ -316,9 +352,17 @@ router.get("/:id", async (req, res) => {
     const user = await User.findOne({ $or: or })
       // Incluimos posibles campos sociales si existen (arrays o counters)
       .select(
-        "username displayName profilePicture followers following followersCount followingCount firebaseUid phoneNumber"
+        "username displayName profilePicture followers following followersCount followingCount firebaseUid phoneNumber isPrivate"
       )
       .lean();
+
+    if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
+
+    const viewerMongoId = req.user && req.user.id ? String(req.user.id) : "";
+    const viewerUid = req.firebaseUser && req.firebaseUser.uid ? String(req.firebaseUser.uid) : "";
+    const targetMongoId = String(user._id);
+    const targetUid = user.firebaseUid ? String(user.firebaseUid) : "";
+    const isOwner = (viewerMongoId && viewerMongoId === targetMongoId) || (viewerUid && targetUid && viewerUid === targetUid);
 
     // Followers/Following: soporta dos esquemas comunes
     // - arrays: user.followers / user.following
@@ -334,7 +378,12 @@ router.get("/:id", async (req, res) => {
     // Attendances: contamos eventos donde el usuario aparece en `attendees`
     let attendancesCount = 0;
     try {
-      attendancesCount = await Event.countDocuments({ attendees: user._id });
+      // Si el perfil es privado, ocultamos el contador a terceros (solo dueño).
+      if (!user.isPrivate || isOwner) {
+        attendancesCount = await Event.countDocuments({ attendees: user._id });
+      } else {
+        attendancesCount = 0;
+      }
     } catch (_) {
       attendancesCount = 0;
     }
@@ -348,6 +397,7 @@ router.get("/:id", async (req, res) => {
       followersCount,
       followingCount,
       attendancesCount,
+      isPrivate: !!user.isPrivate,
     });
   } catch (err) {
     console.error("[GET /users/:id]", err);
@@ -448,6 +498,7 @@ router.get("/:id/avatar", async (req, res) => {
 module.exports = router;
 
 
+
 /*// routes/userRoutes.js
 const express = require("express");
 const router = express.Router();
@@ -463,7 +514,6 @@ const authenticateToken = require("../middlewares/authMiddleware");
 // Inicializa firebase-admin (igual que en eventRoutes)
 require("../middlewares/firebaseAdmin");
 const admin = require("firebase-admin");
-
 
 function backendBase(req) {
   return process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
@@ -544,7 +594,6 @@ async function ensureUserId(req, res, next) {
   return res.status(401).json({ message: "Usuario no autenticado" });
 }
 
-
 const ROOT_UPLOADS_DIR = path.join(__dirname, "..", "uploads");
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -578,6 +627,7 @@ async function processImageToJpg(srcPath, outDir, baseName) {
   }
 }
 
+
 router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -599,7 +649,6 @@ router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
     res.status(500).json({ message: "Error obteniendo tus eventos" });
   }
 });
-
 
 router.get("/me", anyAuth, ensureUserId, async (req, res) => {
   try {
@@ -627,7 +676,6 @@ router.get("/me", anyAuth, ensureUserId, async (req, res) => {
     return res.status(500).json({ message: "No se pudo obtener el usuario actual" });
   }
 });
-
 
 function sanitizeProfileUpdate(body) {
   const allowed = ["username", "entName", "wUser", "role"];
@@ -698,6 +746,35 @@ router.post("/me/avatar", anyAuth, ensureUserId, upload.single("avatar"), async 
 });
 
 
+// GET /api/users/:id/attending  -> lista de eventos donde el usuario asiste
+router.get("/:id/attending", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const or = [];
+    if (/^[a-fA-F0-9]{24}$/.test(id)) or.push({ _id: id });
+    or.push({ firebaseUid: id }, { username: id }, { phoneNumber: id });
+
+    const user = await User.findOne({ $or: or }).select("_id").lean();
+    if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
+
+    const events = await Event.find({ attendees: user._id })
+      .select("title date image createdBy")
+      .sort({ date: -1 })
+      .lean();
+
+    const out = events.map((e) => ({
+      id: e._id.toString(),
+      title: e.title,
+      date: e.date,
+      imageUrl: absUrlFromUpload(req, e.image),
+    }));
+
+    return res.json(out);
+  } catch (err) {
+    console.error("[GET /users/:id/attending]", err);
+    return res.status(500).json({ message: "Error obteniendo eventos asistidos" });
+  }
+});
 
 // GET /api/users/:id  -> admite _id Mongo, firebaseUid, username o phoneNumber
 router.get("/:id", async (req, res) => {
@@ -708,10 +785,30 @@ router.get("/:id", async (req, res) => {
     or.push({ firebaseUid: id }, { username: id }, { phoneNumber: id });
 
     const user = await User.findOne({ $or: or })
-      .select("username displayName profilePicture")
+      // Incluimos posibles campos sociales si existen (arrays o counters)
+      .select(
+        "username displayName profilePicture followers following followersCount followingCount firebaseUid phoneNumber"
+      )
       .lean();
 
-    if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
+    // Followers/Following: soporta dos esquemas comunes
+    // - arrays: user.followers / user.following
+    // - counters: user.followersCount / user.followingCount
+    const followersCount = Array.isArray(user.followers)
+      ? user.followers.length
+      : Number(user.followersCount || 0);
+
+    const followingCount = Array.isArray(user.following)
+      ? user.following.length
+      : Number(user.followingCount || 0);
+
+    // Attendances: contamos eventos donde el usuario aparece en `attendees`
+    let attendancesCount = 0;
+    try {
+      attendancesCount = await Event.countDocuments({ attendees: user._id });
+    } catch (_) {
+      attendancesCount = 0;
+    }
 
     return res.json({
       id: String(user._id || id),
@@ -719,6 +816,9 @@ router.get("/:id", async (req, res) => {
       displayName: user.displayName || "",
       profilePicture: user.profilePicture || null,
       avatarUrl: absUrlFromUpload(req, user.profilePicture),
+      followersCount,
+      followingCount,
+      attendancesCount,
     });
   } catch (err) {
     console.error("[GET /users/:id]", err);
