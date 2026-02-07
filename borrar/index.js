@@ -17,15 +17,17 @@ const socialRoutes = require("./routes/socialRoutes");
 let shareRoutes = null;
 try {
   shareRoutes = require('./routes/share');
-} catch {
-  console.warn('ℹ️ routes/share no encontrado. Tracking de shares deshabilitado.');
+  console.log('✅ routes/share cargado');
+} catch (e) {
+  console.error('❌ No se pudo cargar ./routes/share (tracking deshabilitado):', e);
 }
 
 let referralAnalyticsRoutes = null;
 try {
   referralAnalyticsRoutes = require('./routes/referralAnalytics');
-} catch {
-  console.warn('ℹ️ routes/referralAnalytics no encontrado. Analytics de referrals deshabilitado.');
+  console.log('✅ routes/referralAnalytics cargado');
+} catch (e) {
+  console.error('❌ No se pudo cargar ./routes/referralAnalytics (analytics deshabilitado):', e);
 }
 const { anyAuthWithId } = require("./middlewares/authMiddleware");
 
@@ -964,11 +966,21 @@ app.use("/api/registration", registrationRoutes); // <-- Y montado AQUÍ
 app.use("/api/clubs", clubRoutes);
 app.use("/api/social", socialRoutes);
 
-// Shares: generar links con refCode y (más adelante) redirects de tracking
-if (shareRoutes) app.use('/api/share', shareRoutes);
+// Shares: generar links con refCode y redirects de tracking
+if (shareRoutes) {
+  app.use('/api/share', shareRoutes);
+  console.log('✅ Mounted /api/share');
+} else {
+  console.warn('⚠️ /api/share NO montado (shareRoutes=null).');
+}
 
 // Analytics: repercusión por usuario/canal en un evento
-if (referralAnalyticsRoutes) app.use('/api/referrals', referralAnalyticsRoutes);
+if (referralAnalyticsRoutes) {
+  app.use('/api/referrals', referralAnalyticsRoutes);
+  console.log('✅ Mounted /api/referrals');
+} else {
+  console.warn('⚠️ /api/referrals NO montado (referralAnalyticsRoutes=null).');
+}
 
 // ===== DEBUG: enviar email de prueba con QR =====
 app.post('/api/debug/send-test-email', express.json(), async (req, res) => {
