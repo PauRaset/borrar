@@ -683,7 +683,7 @@ app.post("/api/orders", async (req, res) => {
       };
     });
 
-    // Calcula application fee: 1,50 € por entrada (según env)
+    // Calcula application fee y línea visible de gastos de gestión (Opción A)
     const subtotal = line_items.reduce(
       (acc, li) => acc + li.price_data.unit_amount * li.quantity,
       0
@@ -693,10 +693,42 @@ app.post("/api/orders", async (req, res) => {
     const qtyTotal = line_items.reduce((acc, li) => acc + (li.quantity || 0), 0);
 
     // fee por ticket en céntimos (ej: 150 = 1,50 €)
-    const perTicketCents = parseInt(process.env.PLATFORM_FEE_PER_TICKET_CENTS || "0", 10);
+    // Default: 1,50€ si no hay env. Se puede sobrescribir por evento con `platformFeeEUR` en MongoDB.
+    let perTicketCents = parseInt(process.env.PLATFORM_FEE_PER_TICKET_CENTS || "150", 10);
+    if (!Number.isFinite(perTicketCents) || perTicketCents < 0) perTicketCents = 150;
 
-    // si no has puesto nada, cae a 0
+    // Override por evento (Mongo): platformFeeEUR (ej. 1, 1.5, 2.25). Si es 0 => sin comisión.
+    if (EventModel && eventId) {
+      try {
+        const evFee = await EventModel.findById(eventId)
+          .select('platformFeeEUR')
+          .lean();
+
+        if (evFee && evFee.platformFeeEUR !== undefined && evFee.platformFeeEUR !== null) {
+          const eur = Number(evFee.platformFeeEUR);
+          if (Number.isFinite(eur) && eur >= 0) {
+            perTicketCents = Math.round(eur * 100);
+          }
+        }
+      } catch (e) {
+        console.warn('⚠️ No se pudo leer platformFeeEUR del evento:', e?.message || e);
+      }
+    }
+
+    // Total fee a cobrar (y a retener como application_fee en Connect)
     const applicationFee = Math.max(0, qtyTotal * perTicketCents);
+
+    // Opción A: el comprador paga la comisión visible (service fee) como línea separada
+    if (perTicketCents > 0 && qtyTotal > 0) {
+      line_items.push({
+        quantity: qtyTotal,
+        price_data: {
+          currency: 'eur',
+          unit_amount: perTicketCents,
+          product_data: { name: 'Gastos de gestión · NightVibe' },
+        },
+      });
+    }
 
     // 🔎 Resolver cuenta Connect y clubId de forma robusta
     const resolved = await resolveConnectedAccount({ clubId, eventId });
@@ -704,6 +736,7 @@ app.post("/api/orders", async (req, res) => {
     const destinationAccount = resolved.destinationAccount;
 
     console.log("🔎 resolveConnectedAccount:", resolved);
+    console.log('💸 Platform fee:', { perTicketCents, qtyTotal, applicationFee });
 
     const successBase = (process.env.FRONTEND_URL || "https://event-app-prod.vercel.app").replace(/\/+$/, "");
 
