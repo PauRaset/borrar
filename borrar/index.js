@@ -12,8 +12,22 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const clubRoutes = require("./routes/clubRoutes");
 const socialRoutes = require("./routes/socialRoutes");
+
+// (opcional) Share / referrals (tracking de compartidos)
+let shareRoutes = null;
+try {
+  shareRoutes = require('./routes/share');
+} catch {
+  console.warn('ℹ️ routes/share no encontrado. Tracking de shares deshabilitado.');
+}
+
+let referralAnalyticsRoutes = null;
+try {
+  referralAnalyticsRoutes = require('./routes/referralAnalytics');
+} catch {
+  console.warn('ℹ️ routes/referralAnalytics no encontrado. Analytics de referrals deshabilitado.');
+}
 const { anyAuthWithId } = require("./middlewares/authMiddleware");
-const paymentsRoutes = require('./routes/payments');  
 
 // ✅ Inicializa firebase-admin y loguea el project_id para depurar 403
 const admin = require("./middlewares/firebaseAdmin");
@@ -478,7 +492,6 @@ app.use(
   })
 );
 
-app.use('/api/payments', paymentsRoutes);
 // ===== Passport (si lo usas) =====
 app.use(passport.initialize());
 app.use(passport.session());
@@ -951,6 +964,12 @@ app.use("/api/registration", registrationRoutes); // <-- Y montado AQUÍ
 app.use("/api/clubs", clubRoutes);
 app.use("/api/social", socialRoutes);
 
+// Shares: generar links con refCode y (más adelante) redirects de tracking
+if (shareRoutes) app.use('/api/share', shareRoutes);
+
+// Analytics: repercusión por usuario/canal en un evento
+if (referralAnalyticsRoutes) app.use('/api/referrals', referralAnalyticsRoutes);
+
 // ===== DEBUG: enviar email de prueba con QR =====
 app.post('/api/debug/send-test-email', express.json(), async (req, res) => {
   try {
@@ -1003,9 +1022,12 @@ const passport = require("passport");
 const path = require("path");
 const bodyParser = require("body-parser"); // <- para el webhook RAW
 const Stripe = require("stripe");          // <- Stripe SDK
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 const clubRoutes = require("./routes/clubRoutes");
 const socialRoutes = require("./routes/socialRoutes");
 const { anyAuthWithId } = require("./middlewares/authMiddleware");
+const paymentsRoutes = require('./routes/payments');  
 
 // ✅ Inicializa firebase-admin y loguea el project_id para depurar 403
 const admin = require("./middlewares/firebaseAdmin");
@@ -1018,8 +1040,26 @@ if (process.env.NODE_ENV === 'production') {
   app.set('trust proxy', 1);
 }
 
+// Validación de variables críticas en producción
+if (process.env.NODE_ENV === 'production') {
+  const missing = [];
+  for (const key of [
+    'STRIPE_SECRET_KEY',
+    'STRIPE_WEBHOOK_SECRET',
+    'MONGO_URI',
+    'SESSION_SECRET',
+    'QR_HMAC_KEY',
+  ]) {
+    if (!process.env[key]) missing.push(key);
+  }
+  if (missing.length) {
+    console.error('❌ Faltan variables de entorno:', missing.join(', '));
+    // No detenemos el proceso automáticamente para no romper despliegues, pero dejamos claro el error:
+  }
+}
+
 // ===== Stripe =====
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
 
 // ===== CARGAS NUEVAS (models/utils) =====
 const QRCode = require("qrcode");
@@ -1029,6 +1069,9 @@ const Order = require("./models/Order");
 const Ticket = require("./models/Ticket");
 const CheckInLog = require("./models/CheckInLog");
 const sendTicketEmail = require("./utils/sendTicketEmail");
+const sendSimpleEmail = require("./utils/sendSimpleEmail");
+const ClubApplication = require("./models/ClubApplication");
+const jwt = require("jsonwebtoken");
 
 // (opcional) Modelo Club para pagos al organizador vía Stripe Connect
 let Club = null;
@@ -1061,6 +1104,7 @@ const FRONTEND_URL = (process.env.FRONTEND_URL || "").replace(/\/+$/, "");
 
 const staticAllowed = new Set([
   FRONTEND_URL,
+  "https://event-app-prod.vercel.app",
   "https://nightvibe-six.vercel.app",
   "http://localhost:3000",
   "https://clubs.nightvibe.life",
@@ -1082,18 +1126,39 @@ function isAllowedOrigin(origin) {
   }
 }
 
-app.use(
-  cors({
-    origin: (origin, cb) =>
-      isAllowedOrigin(origin)
-        ? cb(null, true)
-        : cb(new Error(`CORS no permitido para: ${origin}`)),
-    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    credentials: true,
-  })
-);
-// Responder preflight explícitamente
-app.options("*", cors());
+// Config común de CORS para usar tanto en app.use como en preflight (OPTIONS)
+const corsOptions = {
+  origin: (origin, cb) =>
+    isAllowedOrigin(origin)
+      ? cb(null, true)
+      : cb(new Error(`CORS no permitido para: ${origin}`)),
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  credentials: true,
+  allowedHeaders: [
+    "Authorization",
+    "Content-Type",
+    "X-Requested-With",
+    "Accept",
+    "Origin",
+    "X-Scanner-Key", // necesario para el escáner
+  ],
+  exposedHeaders: ["Authorization", "Content-Type"],
+};
+
+app.use(cors(corsOptions));
+// Responder preflight explícitamente con la MISMA config
+app.options("*", cors(corsOptions));
+// DEBUG temporal: ver headers y si llega Authorization/Cookie
+if (process.env.NODE_ENV !== 'production') {
+  app.all('/api/debug/echo', (req, res) => {
+    res.json({
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      cookies: req.cookies || null,
+    });
+  });
+}
 // Captura errores de CORS y responde JSON en lugar de romper la petición
 app.use((err, _req, res, next) => {
   if (err && /CORS no permitido/.test(String(err.message || ''))) {
@@ -1102,264 +1167,100 @@ app.use((err, _req, res, next) => {
   return next(err);
 });
 
-// ===== Webhook Stripe (RAW body) — debe ir ANTES de express.json() =====
-app.post(
-  "/api/webhooks/stripe",
-  bodyParser.raw({ type: "application/json" }),
-  async (req, res) => {
-    const sig = req.headers["stripe-signature"];
-    let event;
-
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        process.env.STRIPE_WEBHOOK_SECRET
-      );
-    } catch (err) {
-      console.error("❌ Webhook signature failed:", err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
-
-    // ===== EMISIÓN DE TICKETS + EMAIL =====
-    if (event.type === "checkout.session.completed") {
-      const sessionObj = event.data.object;
-      console.log(
-        "✅ Pago OK:",
-        sessionObj.id,
-        "email:",
-        sessionObj.customer_details?.email
-      );
-
-      try {
-        // 1) Datos base del pago (desde la Session)
-        const email  = sessionObj.customer_details?.email || null;
-        const name   = sessionObj.customer_details?.name  || "";
-        const eventId = sessionObj.metadata?.eventId || "EVT";
-        const clubId  = sessionObj.metadata?.clubId || null;
-        const userId  = sessionObj.metadata?.userId || null;
-        const phone   = sessionObj.metadata?.phone  || null;
-        const paymentIntentId = sessionObj.payment_intent || null;
-
-        // 2) Recuperar line items reales
-        const lineItems = await stripe.checkout.sessions.listLineItems(
-          sessionObj.id,
-          { limit: 100 }
-        );
-
-        // Calcular subtotal y moneda (a partir del primer item)
-        let subtotalCents = 0;
-        let currency = "eur";
-        for (const li of lineItems.data) {
-          const qty = li.quantity || 1;
-          const unit = li.amount_total
-            ? Math.floor(li.amount_total / qty)
-            : li.price?.unit_amount || 0;
-          subtotalCents += unit * qty;
-          currency = (li.price?.currency || currency || "eur").toLowerCase();
-        }
-
-        // 3) Opcional: recuperar PaymentIntent para capturar application_fee y destino Connect
-        let applicationFeeCents = 0;
-        let destinationAccount = null;
-        let chargeId = null;
-        let balanceTxId = null;
-
-        if (paymentIntentId) {
-          try {
-            const pi = await stripe.paymentIntents.retrieve(paymentIntentId, {
-              expand: ["latest_charge", "transfer_data"],
-            });
-            if (pi?.application_fee_amount) {
-              applicationFeeCents = pi.application_fee_amount;
-            }
-            if (pi?.transfer_data?.destination) {
-              destinationAccount = pi.transfer_data.destination; // acct_***
-            }
-            const charge = pi?.latest_charge;
-            if (typeof charge === "object") {
-              chargeId = charge.id || null;
-              balanceTxId = charge.balance_transaction || null;
-            }
-          } catch (e) {
-            console.warn("⚠️ No se pudo expandir PaymentIntent:", e?.message || e);
-          }
-        }
-
-        // 4) Crear/actualizar Order
-        const order = await Order.findOneAndUpdate(
-          { stripeSessionId: sessionObj.id },
-          {
-            stripeSessionId: sessionObj.id,
-            paymentIntentId,
-            chargeId,
-            balanceTxId,
-
-            // Comprador
-            userId,
-            phone,
-            email,
-            buyerName: name,
-
-            // Negocio / evento
-            clubId,
-            eventId,
-
-            // Items
-            items: lineItems.data.map((li) => ({
-              ticketTypeId: li.price?.product || null,
-              name:
-                li.description ||
-                li.price?.nickname ||
-                li.price?.product ||
-                "Entrada",
-              unitAmount: li.amount_total
-                ? Math.floor(li.amount_total / (li.quantity || 1))
-                : li.price?.unit_amount || 0,
-              qty: li.quantity || 1,
-              currency: (li.price?.currency || currency || "eur").toLowerCase(),
-            })),
-
-            // Totales / fees
-            currency,
-            subtotalCents,
-            applicationFeeCents,
-            destinationAccount,
-
-            // Metadatos
-            sessionMetadata: sessionObj.metadata || {},
-
-            status: "paid",
-          },
-          { upsert: true, new: true }
-        );
-
-        // (Opcional) título/fecha del evento para el email
-        const eventTitle = `Evento ${eventId}`;
-        const eventDate = "";
-
-        // 5) Emitir tickets: 1 por unidad
-        for (const li of lineItems.data) {
-          const qty = li.quantity || 1;
-          for (let i = 0; i < qty; i++) {
-            // token + firma HMAC
-            const token = crypto.randomBytes(16).toString("base64url"); // 128 bits
-            const hmac = crypto
-              .createHmac("sha256", process.env.QR_HMAC_KEY)
-              .update(`${token}|${eventId}`)
-              .digest("base64url");
-            const payload = `NV1:t=${token}&e=${eventId}&s=${hmac}`;
-
-            // solo guardamos hash del token
-            const tokenHash = await bcrypt.hash(token, 10);
-
-            // serial corto legible (p.ej. NV-AB12-3F)
-            const serial = `NV-${crypto
-              .randomBytes(2)
-              .toString("hex")
-              .toUpperCase()}-${crypto
-              .randomBytes(1)
-              .toString("hex")
-              .toUpperCase()}`;
-
-            // persistir ticket
-            const ticket = await Ticket.create({
-              eventId,
-              orderId: order._id,
-              ownerUserId: userId,
-              email,
-              ticketTypeId: li.price?.product || null,
-              serial,
-              tokenHash,
-              status: "issued",
-            });
-
-            // QR PNG (con el payload firmado)
-            const qrPng = await QRCode.toBuffer(payload, {
-              errorCorrectionLevel: "M",
-              width: 480,
-            });
-
-            // email con la entrada (si hay email)
-            if (email) {
-              await sendTicketEmail({
-                to: email,
-                eventTitle,
-                eventDate,
-                serial: ticket.serial,
-                qrPngBuffer: qrPng,
-              });
-            } else {
-              console.log(
-                "⚠️ Ticket emitido SIN email (no disponible): serial",
-                ticket.serial
-              );
-            }
-          }
-        }
-
-        console.log("🎟️  Tickets emitidos para order", order._id.toString());
-      } catch (err) {
-        console.error("❌ Error procesando checkout.session.completed:", err);
-      }
-    }
-
-    res.json({ received: true });
-  }
+// ===== Seguridad producción =====
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+  })
 );
 
-// === DEBUG: ver estado de una Checkout Session (y su PI) ===
-app.get("/api/debug/checkout-session/:sid", async (req, res) => {
-  try {
-    const sid = req.params.sid;
-    const sess = await stripe.checkout.sessions.retrieve(sid, {
-      expand: ["payment_intent", "payment_intent.latest_charge", "payment_intent.transfer_data"],
-    });
-    res.json({
-      id: sess.id,
-      payment_status: sess.payment_status,
-      mode: sess.mode,
-      amount_total: sess.amount_total,
-      currency: sess.currency,
-      metadata: sess.metadata,
-      payment_intent: sess.payment_intent && {
-        id: sess.payment_intent.id,
-        status: sess.payment_intent.status,
-        application_fee_amount: sess.payment_intent.application_fee_amount,
-        transfer_data: sess.payment_intent.transfer_data || null,
-        latest_charge: sess.payment_intent.latest_charge && {
-          id: sess.payment_intent.latest_charge.id,
-          balance_transaction: sess.payment_intent.latest_charge.balance_transaction,
-        },
-      },
-    });
-  } catch (e) {
-    res.status(400).json({ error: e.message });
-  }
+// Limitar ráfagas para endpoints sensibles
+const createLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minuto
+  max: 60,             // 60 peticiones por IP/min
+  standardHeaders: true,
+  legacyHeaders: false,
 });
+app.use(["/api/orders", "/api/webhooks/stripe"], createLimiter);
 
-// === DEBUG: ver PI por id (por si ya tienes el pi_...) ===
-app.get("/api/debug/payment-intent/:pi", async (req, res) => {
-  try {
-    const pi = await stripe.paymentIntents.retrieve(req.params.pi, {
-      expand: ["latest_charge", "transfer_data"],
-    });
-    res.json({
-      id: pi.id,
-      status: pi.status,
-      amount: pi.amount,
-      currency: pi.currency,
-      application_fee_amount: pi.application_fee_amount,
-      transfer_data: pi.transfer_data || null,
-      latest_charge: pi.latest_charge && {
-        id: pi.latest_charge.id,
-        balance_transaction: pi.latest_charge.balance_transaction,
-      },
-    });
-  } catch (e) {
-    res.status(400).json({ error: e.message });
-  }
-});
+// ===== Webhook Stripe (RAW body) — debe ir ANTES de express.json() =====
+// Soporte para ambos secretos de Stripe (plataforma y cuentas conectadas)
+const STRIPE_WEBHOOK_SECRET_PLATFORM = process.env.STRIPE_WEBHOOK_SECRET || "";
+const STRIPE_WEBHOOK_SECRET_CONNECT = process.env.STRIPE_WEBHOOK_SECRET_CONNECT || "";
+
+// Logs de configuración de los secretos (sin mostrar el valor completo)
+function safeSecret(secret) {
+  if (!secret) return "(no definido)";
+  return secret.slice(0, 6) + "***" + secret.slice(-4);
+}
+console.log("Stripe Webhook Secret (plataforma):", safeSecret(STRIPE_WEBHOOK_SECRET_PLATFORM));
+console.log("Stripe Webhook Secret (connect):   ", safeSecret(STRIPE_WEBHOOK_SECRET_CONNECT));
+if (!STRIPE_WEBHOOK_SECRET_PLATFORM) {
+  console.warn("❌ Falta STRIPE_WEBHOOK_SECRET (plataforma) en variables de entorno.");
+}
+if (!STRIPE_WEBHOOK_SECRET_CONNECT) {
+  console.warn("❌ Falta STRIPE_WEBHOOK_SECRET_CONNECT (connect) en variables de entorno.");
+}
+
+// Monta el router de webhooks (el módulo exporta un Router listo)
+const stripeWebhooksRouter = require('./routes/stripeWebhooks');
+app.use('/api/webhooks/stripe', stripeWebhooksRouter);
+
+
+if (process.env.NODE_ENV !== 'production') {
+  // === DEBUG: ver estado de una Checkout Session (y su PI) ===
+  app.get("/api/debug/checkout-session/:sid", async (req, res) => {
+    try {
+      const sid = req.params.sid;
+      const sess = await stripe.checkout.sessions.retrieve(sid, {
+        expand: ["payment_intent", "payment_intent.latest_charge", "payment_intent.transfer_data"],
+      });
+      res.json({
+        id: sess.id,
+        payment_status: sess.payment_status,
+        mode: sess.mode,
+        amount_total: sess.amount_total,
+        currency: sess.currency,
+        metadata: sess.metadata,
+        payment_intent: sess.payment_intent && {
+          id: sess.payment_intent.id,
+          status: sess.payment_intent.status,
+          application_fee_amount: sess.payment_intent.application_fee_amount,
+          transfer_data: sess.payment_intent.transfer_data || null,
+          latest_charge: sess.payment_intent.latest_charge && {
+            id: sess.payment_intent.latest_charge.id,
+            balance_transaction: sess.payment_intent.latest_charge.balance_transaction,
+          },
+        },
+      });
+    } catch (e) {
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  // === DEBUG: ver PI por id (por si ya tienes el pi_...) ===
+  app.get("/api/debug/payment-intent/:pi", async (req, res) => {
+    try {
+      const pi = await stripe.paymentIntents.retrieve(req.params.pi, {
+        expand: ["latest_charge", "transfer_data"],
+      });
+      res.json({
+        id: pi.id,
+        status: pi.status,
+        amount: pi.amount,
+        currency: pi.currency,
+        application_fee_amount: pi.application_fee_amount,
+        transfer_data: pi.transfer_data || null,
+        latest_charge: pi.latest_charge && {
+          id: pi.latest_charge.id,
+          balance_transaction: pi.latest_charge.balance_transaction,
+        },
+      });
+    } catch (e) {
+      res.status(400).json({ error: e.message });
+    }
+  });
+}
 
 // ===== Parsers & estáticos =====
 app.use(express.json());
@@ -1387,6 +1288,7 @@ app.use(
   })
 );
 
+app.use('/api/payments', paymentsRoutes);
 // ===== Passport (si lo usas) =====
 app.use(passport.initialize());
 app.use(passport.session());
@@ -1463,6 +1365,11 @@ function _extractClubIdFromEventDoc(ev) {
     if (id) return id;
   }
   return "";
+}
+
+// Normaliza email
+function _cleanEmail(e) {
+  return (e || '').toLowerCase().trim();
 }
 
 async function resolveConnectedAccount({ clubId, eventId }) {
@@ -1556,14 +1463,20 @@ app.post("/api/orders", async (req, res) => {
       };
     });
 
-    // Calcula application fee (opcional)
+    // Calcula application fee: 1,50 € por entrada (según env)
     const subtotal = line_items.reduce(
       (acc, li) => acc + li.price_data.unit_amount * li.quantity,
       0
     );
-    const bps = parseInt(process.env.PLATFORM_FEE_BPS || "0", 10);     // basis points
-    const fixed = parseInt(process.env.PLATFORM_FEE_FIXED || "0", 10); // céntimos
-    const applicationFee = Math.max(0, Math.round((subtotal * bps) / 10000) + fixed);
+
+    // total de entradas en el pedido
+    const qtyTotal = line_items.reduce((acc, li) => acc + (li.quantity || 0), 0);
+
+    // fee por ticket en céntimos (ej: 150 = 1,50 €)
+    const perTicketCents = parseInt(process.env.PLATFORM_FEE_PER_TICKET_CENTS || "0", 10);
+
+    // si no has puesto nada, cae a 0
+    const applicationFee = Math.max(0, qtyTotal * perTicketCents);
 
     // 🔎 Resolver cuenta Connect y clubId de forma robusta
     const resolved = await resolveConnectedAccount({ clubId, eventId });
@@ -1656,48 +1569,90 @@ app.get("/api/orders/:id", async (req, res) => {
 // ===== Check-in de tickets (escáner) =====
 app.post("/api/checkin", async (req, res) => {
   try {
-    // Seguridad básica por API key (MVP)
+    // Seguridad básica por API key (MVP) + rate limiting aplicado arriba
     const key = req.headers["x-scanner-key"];
     if (!key || key !== process.env.SCANNER_API_KEY) {
       return res.status(401).json({ ok: false, reason: "unauthorized" });
     }
 
-    const { token, eventId, hmac } = req.body || {};
-    if (!token || !eventId || !hmac) {
+    const { token, eventId, hmac, serial } = req.body || {};
+    console.log("[checkin] body:", req.body);
+
+    // Soportamos dos modos:
+    //  1) Formato nuevo  -> token + eventId + hmac  (NV1)
+    //  2) Formato legacy -> serial + token         (JSON antiguo)
+    const isNewFormat = !!(token && eventId && hmac);
+    const isLegacyFormat = !!(serial && token);
+
+    if (!isNewFormat && !isLegacyFormat) {
       return res.status(400).json({ ok: false, reason: "bad_request" });
     }
 
-    // Verificar firma HMAC
-    const expected = crypto
-      .createHmac("sha256", process.env.QR_HMAC_KEY)
-      .update(`${token}|${eventId}`)
-      .digest("base64url");
-    if (expected !== hmac) {
-      await CheckInLog.create({
-        ticketId: null,
-        eventId,
-        result: "bad_signature",
-      });
-      return res.status(400).json({ ok: false, reason: "bad_signature" });
-    }
-
-    // Buscar ticket por comparación de hash (MVP)
-    const candidates = await Ticket.find({
-      eventId,
-      status: { $in: ["issued", "checked_in"] },
-    }).limit(10000);
-
     let found = null;
-    for (const t of candidates) {
-      const ok = await bcrypt.compare(token, t.tokenHash);
-      if (ok) {
-        found = t;
-        break;
+    let effectiveEventId = eventId || null;
+
+    if (isNewFormat) {
+      // ---------- Modo nuevo: token + eventId + hmac ----------
+      // Verificar firma HMAC
+      const expected = crypto
+        .createHmac("sha256", process.env.QR_HMAC_KEY || "")
+        .update(`${token}|${eventId}`)
+        .digest("base64url");
+
+      if (expected !== hmac) {
+        await CheckInLog.create({
+          ticketId: null,
+          eventId,
+          result: "bad_signature",
+        });
+        return res.status(400).json({ ok: false, reason: "bad_signature" });
       }
+
+      // Buscar ticket por comparación de hash dentro del evento
+      const candidates = await Ticket.find({
+        eventId,
+        status: { $in: ["issued", "checked_in"] },
+      }).limit(10000);
+
+      for (const t of candidates) {
+        const ok = await bcrypt.compare(token, t.tokenHash);
+        if (ok) {
+          found = t;
+          break;
+        }
+      }
+
+      effectiveEventId = eventId;
+    } else if (isLegacyFormat) {
+      // ---------- Modo legacy: serial + token ----------
+      // Compatibilidad hacia atrás: algunas entradas antiguas codifican solo
+      // { serial, token } en el QR y no tienen un tokenHash verificable.
+      // Para estas, validamos únicamente por serial.
+      const cand = await Ticket.findOne({
+        serial,
+        status: { $in: ["issued", "checked_in"] },
+      });
+
+      if (!cand) {
+        await CheckInLog.create({
+          ticketId: null,
+          eventId: null,
+          result: "invalid",
+        });
+        return res.status(404).json({ ok: false, reason: "invalid" });
+      }
+
+      // A partir de aquí tratamos igual que en el formato nuevo
+      found = cand;
+      effectiveEventId = cand.eventId || null;
     }
 
     if (!found) {
-      await CheckInLog.create({ ticketId: null, eventId, result: "invalid" });
+      await CheckInLog.create({
+        ticketId: null,
+        eventId: effectiveEventId,
+        result: "invalid",
+      });
       return res.status(404).json({ ok: false, reason: "invalid" });
     }
 
@@ -1714,12 +1669,14 @@ app.post("/api/checkin", async (req, res) => {
           buyerEmail = ord.email || "";
         }
       }
-    } catch {  }
+    } catch {
+      // noop
+    }
 
     if (found.status === "checked_in") {
       await CheckInLog.create({
         ticketId: found._id,
-        eventId,
+        eventId: effectiveEventId,
         result: "duplicate",
       });
       return res.json({
@@ -1748,7 +1705,7 @@ app.post("/api/checkin", async (req, res) => {
     const result = updated ? "ok" : "duplicate";
     await CheckInLog.create({
       ticketId: found._id,
-      eventId,
+      eventId: effectiveEventId,
       result,
     });
 
@@ -1767,19 +1724,69 @@ app.post("/api/checkin", async (req, res) => {
 });
 
 // ===== Rutas de tu app =====
+
 const authRoutes = require("./routes/authRoutes");
 const eventRoutes = require("./routes/eventRoutes");
 const searchRoutes = require("./routes/searchRoutes");
 const userRoutes = require("./routes/userRoutes");
 const registrationRoutes = require("./routes/registrationRoutes"); // <-- MOVIDO AQUÍ
+const promotionsRoutes = require("./routes/promotionsRoutes");
+
+// Compat: clientes antiguos pueden llamar /start|/request|/requests
+// Normalizamos name -> clubName y reenviamos al router en /apply sin perder body
+const registrationRouter = require("./routes/registrationRoutes");
+app.post("/api/registration/start", (req, res, next) => {
+  if (!req.body?.clubName && req.body?.name) req.body.clubName = req.body.name;
+  req.url = "/apply";
+  return registrationRouter(req, res, next);
+});
+app.post("/api/registration/request", (req, res, next) => {
+  if (!req.body?.clubName && req.body?.name) req.body.clubName = req.body.name;
+  req.url = "/apply";
+  return registrationRouter(req, res, next);
+});
+app.post("/api/registration/requests", (req, res, next) => {
+  if (!req.body?.clubName && req.body?.name) req.body.clubName = req.body.name;
+  req.url = "/apply";
+  return registrationRouter(req, res, next);
+});
 
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/events", eventRoutes);
+app.use("/api/promotions", promotionsRoutes);
 app.use("/search", searchRoutes);
 app.use("/api/registration", registrationRoutes); // <-- Y montado AQUÍ
 app.use("/api/clubs", clubRoutes);
 app.use("/api/social", socialRoutes);
+
+// ===== DEBUG: enviar email de prueba con QR =====
+app.post('/api/debug/send-test-email', express.json(), async (req, res) => {
+  try {
+    const token = req.headers['x-debug-token'];
+    if (!process.env.DEBUG_ADMIN_TOKEN || token !== process.env.DEBUG_ADMIN_TOKEN) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    const { to } = req.body || {};
+    if (!to) return res.status(400).json({ error: 'missing_to' });
+
+    const qrPngBuffer = await QRCode.toBuffer('NV-TEST-' + Date.now(), { width: 300 });
+    const resp = await sendTicketEmail({
+      to,
+      eventTitle: 'Prueba NightVibe',
+      clubName: 'NightVibe',
+      eventDate: new Date().toLocaleString('es-ES'),
+      venue: '',
+      serial: 'NV-TEST',
+      qrPngBuffer,
+      buyerName: 'Tester',
+    });
+    return res.json({ ok: true, status: resp?.statusCode || 202 });
+  } catch (e) {
+    console.error('[debug send-test-email] error:', e?.response?.body || e?.message || e);
+    return res.status(500).json({ error: 'send_failed', message: e?.message || 'unknown' });
+  }
+});
 
 // ===== 404 =====
 app.use((_req, res) => res.status(404).send("Ruta no encontrada"));
@@ -1788,6 +1795,8 @@ app.use((_req, res) => res.status(404).send("Ruta no encontrada"));
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`✨ Servidor corriendo en el puerto ${PORT}`);
+  console.log("CORS FRONTEND_URL:", FRONTEND_URL || '(no definido)');
+  console.log("Webhook Stripe en:", "/api/webhooks/stripe");
 });
 
 module.exports = app;*/
