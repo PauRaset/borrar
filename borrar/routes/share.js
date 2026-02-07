@@ -5,11 +5,17 @@ const crypto = require('crypto');
 const { createHash } = require('crypto');
 
 const ShareLink = require('../models/ShareLink');
-const Event = require('../models/Event'); // ajusta ruta si cambia
+const Event = require('../models/Event');
 
-// Genera refCode corto
+// Genera refCode corto (compatible con Node antiguos)
 function genRefCode() {
-  return crypto.randomBytes(6).toString('base64url'); // ~8 chars
+  // base64url compatible sin depender de `toString('base64url')`
+  return crypto
+    .randomBytes(6)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
 }
 
 // Hash helper (privacy-friendly): we never store raw IP/UA
@@ -18,7 +24,6 @@ function sha256(input) {
 }
 
 function getClientIp(req) {
-  // Behind proxies, x-forwarded-for may contain a list
   const xff = req.headers['x-forwarded-for'];
   if (typeof xff === 'string' && xff.length) {
     return xff.split(',')[0].trim();
@@ -55,14 +60,12 @@ router.get('/r/:refCode', async (req, res) => {
     const day = new Date().toISOString().slice(0, 10);
     const uniqueKey = sha256(`${day}|${ip}|${ua}`);
 
-    // Store lastUniqueKey in session cookie to avoid recounting on refresh
-    // (We do not persist per-user identifiers in DB to keep it light.)
+    // cookie-based unique (24h)
     const cookieName = `nv_uc_${refCode}`;
     const hasCookie = typeof req.headers.cookie === 'string' && req.headers.cookie.includes(`${cookieName}=`);
 
     if (!hasCookie) {
       link.uniqueClicks = (link.uniqueClicks || 0) + 1;
-      // set cookie for 24h
       res.cookie(cookieName, uniqueKey, {
         maxAge: 24 * 60 * 60 * 1000,
         httpOnly: true,
@@ -90,7 +93,6 @@ router.get('/r/:refCode', async (req, res) => {
 
 // POST /api/share/create
 // body: { eventId, channel? }
-// auth opcional: si hay user, lo ligamos
 router.post('/create', async (req, res) => {
   try {
     const { eventId, channel } = req.body || {};
@@ -104,7 +106,6 @@ router.post('/create', async (req, res) => {
     // Si tienes middleware auth, aquí puedes sacar req.user?.id
     const createdByUserId = req.user?.id ? String(req.user.id) : null;
 
-    // Reutiliza link si ya existe para ese user+event+channel (evita duplicados)
     let link = await ShareLink.findOne({
       eventId: String(eventId),
       createdByUserId,
@@ -113,7 +114,6 @@ router.post('/create', async (req, res) => {
 
     if (!link) {
       let refCode = genRefCode();
-      // evita colisión
       while (await ShareLink.findOne({ refCode })) refCode = genRefCode();
 
       link = await ShareLink.create({
@@ -127,10 +127,10 @@ router.post('/create', async (req, res) => {
 
     const apiBase = process.env.API_BASE_URL || '';
 
-    // Prefer the tracking redirect URL when sharing
+    // Prefer tracking redirect URL when sharing
     const shareUrl = `${apiBase}/api/share/r/${encodeURIComponent(link.refCode)}`;
 
-    // Keep direct URL for compatibility (no click tracking)
+    // Keep direct URL for compatibility
     const directUrl = buildDirectUrl({
       apiBase,
       eventId: String(eventId),
