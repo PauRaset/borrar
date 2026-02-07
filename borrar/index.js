@@ -694,7 +694,8 @@ app.post("/api/orders", async (req, res) => {
 
     // fee por ticket en céntimos (ej: 150 = 1,50 €)
     // Default: 1,50€ si no hay env. Se puede sobrescribir por evento con `platformFeeEUR` en MongoDB.
-    let perTicketCents = parseInt(process.env.PLATFORM_FEE_PER_TICKET_CENTS || "150", 10);
+    const envFeeRaw = (process.env.PLATFORM_FEE_PER_TICKET_CENTS ?? '').toString().trim();
+    let perTicketCents = envFeeRaw === '' ? 150 : parseInt(envFeeRaw, 10);
     if (!Number.isFinite(perTicketCents) || perTicketCents < 0) perTicketCents = 150;
 
     // Override por evento (Mongo): platformFeeEUR (ej. 1, 1.5, 2.25). Si es 0 => sin comisión.
@@ -719,6 +720,7 @@ app.post("/api/orders", async (req, res) => {
     const applicationFee = Math.max(0, qtyTotal * perTicketCents);
 
     // Opción A: el comprador paga la comisión visible (service fee) como línea separada
+    let feeLineAdded = false;
     if (perTicketCents > 0 && qtyTotal > 0) {
       line_items.push({
         quantity: qtyTotal,
@@ -728,6 +730,7 @@ app.post("/api/orders", async (req, res) => {
           product_data: { name: 'Gastos de gestión · NightVibe' },
         },
       });
+      feeLineAdded = true;
     }
 
     // 🔎 Resolver cuenta Connect y clubId de forma robusta
@@ -754,6 +757,8 @@ app.post("/api/orders", async (req, res) => {
         clubId: clubId || "",
         destinationAccount: destinationAccount || "",
         applicationFeeCents: String(applicationFee || 0),
+        perTicketFeeCents: String(perTicketCents || 0),
+        feeLineAdded: feeLineAdded ? '1' : '0',
       },
       phone_number_collection: { enabled: true },
     };
@@ -1078,7 +1083,6 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
-
 
 /*// index.js (entrypoint)
 require("dotenv").config();
