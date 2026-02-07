@@ -23,12 +23,33 @@ function sha256(input) {
   return createHash('sha256').update(String(input || '')).digest('hex');
 }
 
+
 function getClientIp(req) {
   const xff = req.headers['x-forwarded-for'];
   if (typeof xff === 'string' && xff.length) {
     return xff.split(',')[0].trim();
   }
   return req.ip || req.connection?.remoteAddress || '';
+}
+
+function getRequestBaseUrl(req) {
+  // Works behind proxies (Vercel/NGINX) if `trust proxy` is enabled
+  const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').toString().split(',')[0].trim();
+  const host = (req.headers['x-forwarded-host'] || req.headers.host || '').toString().split(',')[0].trim();
+  if (!host) return '';
+  return `${proto}://${host}`;
+}
+
+function pickApiBase(req) {
+  const envBase = (process.env.API_BASE_URL || '').trim().replace(/\/$/, '');
+  if (envBase) return envBase;
+  return getRequestBaseUrl(req).replace(/\/$/, '');
+}
+
+function joinUrl(base, path) {
+  const b = (base || '').replace(/\/$/, '');
+  const p = (path || '').startsWith('/') ? path : `/${path}`;
+  return `${b}${p}`;
 }
 
 function buildDirectUrl({ apiBase, eventId, refCode, channel }) {
@@ -76,7 +97,7 @@ router.get('/r/:refCode', async (req, res) => {
 
     await link.save();
 
-    const apiBase = process.env.API_BASE_URL || '';
+    const apiBase = pickApiBase(req);
     const directUrl = buildDirectUrl({
       apiBase,
       eventId: String(link.eventId),
@@ -125,10 +146,10 @@ router.post('/create', async (req, res) => {
       });
     }
 
-    const apiBase = process.env.API_BASE_URL || '';
+    const apiBase = pickApiBase(req);
 
     // Prefer tracking redirect URL when sharing
-    const shareUrl = `${apiBase}/api/share/r/${encodeURIComponent(link.refCode)}`;
+    const shareUrl = joinUrl(apiBase, `/api/share/r/${encodeURIComponent(link.refCode)}`);
 
     // Keep direct URL for compatibility
     const directUrl = buildDirectUrl({
