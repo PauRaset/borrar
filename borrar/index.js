@@ -647,8 +647,57 @@ async function resolveConnectedAccount({ clubId, eventId }) {
 app.post("/api/orders", async (req, res) => {
   try {
     let { eventId, items, userId, phone, clubId } = req.body;
+    const quantityRaw = req.body?.quantity ?? req.body?.qty;
 
-    // Validaciones básicas
+    // ✅ Compat clubs flow: si no vienen items pero sí eventId + quantity, construimos items desde el Event
+    if ((!items || !Array.isArray(items) || items.length === 0) && eventId && quantityRaw) {
+      const qty = Math.max(1, Math.floor(Number(quantityRaw) || 1));
+
+      if (!EventModel) {
+        return res.status(400).json({
+          error: 'missing_items',
+          message: 'No hay items en la orden y no se puede derivar desde el evento (EventModel no disponible).',
+        });
+      }
+
+      const ev = await EventModel.findById(eventId)
+        .select('title price ticketPrice priceEUR currency platformFeeEUR clubId createdBy')
+        .lean();
+
+      if (!ev) {
+        return res.status(404).json({ error: 'event_not_found', message: 'Evento no encontrado.' });
+      }
+
+      // precio unitario (EUR) -> cents
+      const unitEur =
+        ev.priceEUR ??
+        ev.ticketPrice ??
+        ev.price ??
+        0;
+
+      const unitEurNum = Number(unitEur);
+      if (!Number.isFinite(unitEurNum) || unitEurNum <= 0) {
+        return res.status(400).json({
+          error: 'invalid_event_price',
+          message: 'El evento no tiene un precio válido para comprar entradas.',
+        });
+      }
+
+      const unitAmount = Math.round(unitEurNum * 100);
+      items = [
+        {
+          name: ev.title || 'Entrada NightVibe',
+          currency: (ev.currency || 'eur').toLowerCase(),
+          qty,
+          unitAmount,
+        },
+      ];
+
+      // Si no vino clubId, intentamos derivarlo del propio evento (no rompe nada)
+      if (!clubId && ev.clubId) clubId = String(ev.clubId);
+    }
+
+    // Validaciones básicas (flujo legacy y compat)
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res
         .status(400)
@@ -683,17 +732,12 @@ app.post("/api/orders", async (req, res) => {
       };
     });
 
-    // Calcula application fee y línea visible de gastos de gestión (Opción A)
-    const subtotal = line_items.reduce(
-      (acc, li) => acc + li.price_data.unit_amount * li.quantity,
-      0
-    );
+    // ===== Opción A: el comprador paga la comisión visible (service fee) =====
 
     // total de entradas en el pedido
     const qtyTotal = line_items.reduce((acc, li) => acc + (li.quantity || 0), 0);
 
-    // fee por ticket en céntimos (ej: 150 = 1,50 €)
-    // Default: 1,50€ si no hay env. Se puede sobrescribir por evento con `platformFeeEUR` en MongoDB.
+    // fee por ticket en céntimos. Default: 1,50€ si no hay env.
     const envFeeRaw = (process.env.PLATFORM_FEE_PER_TICKET_CENTS ?? '').toString().trim();
     let perTicketCents = envFeeRaw === '' ? 150 : parseInt(envFeeRaw, 10);
     if (!Number.isFinite(perTicketCents) || perTicketCents < 0) perTicketCents = 150;
@@ -719,7 +763,7 @@ app.post("/api/orders", async (req, res) => {
     // Total fee a cobrar (y a retener como application_fee en Connect)
     const applicationFee = Math.max(0, qtyTotal * perTicketCents);
 
-    // Opción A: el comprador paga la comisión visible (service fee) como línea separada
+    // Línea visible de fee para el comprador
     let feeLineAdded = false;
     if (perTicketCents > 0 && qtyTotal > 0) {
       line_items.push({
@@ -739,7 +783,7 @@ app.post("/api/orders", async (req, res) => {
     const destinationAccount = resolved.destinationAccount;
 
     console.log("🔎 resolveConnectedAccount:", resolved);
-    console.log('💸 Platform fee:', { perTicketCents, qtyTotal, applicationFee });
+    console.log('💸 Platform fee:', { perTicketCents, qtyTotal, applicationFee, feeLineAdded });
 
     const successBase = (process.env.FRONTEND_URL || "https://event-app-prod.vercel.app").replace(/\/+$/, "");
 
