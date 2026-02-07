@@ -118,7 +118,11 @@ router.get('/direct/:eventId', async (req, res) => {
         return res.status(400).send('Precio inválido');
       }
 
-      const qty = 1;
+      // Cantidad (opcional por query): /direct/:eventId?qty=3
+      const qtyParam = req.query.qty ?? req.query.q;
+      let qty = Math.floor(Number(qtyParam || 1));
+      if (!Number.isFinite(qty) || qty < 1) qty = 1;
+      if (qty > 20) qty = 20;
   
       // Stock (capacity 0 = sin límite)
       if (event.capacity && event.capacity > 0) {
@@ -190,12 +194,39 @@ router.get('/direct/:eventId', async (req, res) => {
       // - Por defecto: 1,50 €
       // - Si el evento tiene `platformFeeEUR`, se usa ese valor (en euros)
       const platformFeeEUR =
-        typeof event.platformFeeEUR === 'number'
-          ? event.platformFeeEUR
+        parsePrice(event.platformFeeEUR) !== null
+          ? parsePrice(event.platformFeeEUR)
           : 1.5;
 
-      const PLATFORM_FEE_CENTS = Math.round(platformFeeEUR * 100);
+      const PLATFORM_FEE_CENTS = Math.max(0, Math.round(platformFeeEUR * 100));
       const applicationFee = PLATFORM_FEE_CENTS * qty;
+
+      // Opción A: el comprador paga la comisión como línea separada en Checkout
+      // (y se retiene como application_fee_amount en Connect para que el club reciba solo el importe de entradas)
+      const feeLineItem =
+        PLATFORM_FEE_CENTS > 0
+          ? {
+              price_data: {
+                currency: 'eur',
+                unit_amount: PLATFORM_FEE_CENTS,
+                product_data: {
+                  name: 'Gastos de gestión · NightVibe',
+                },
+              },
+              quantity: qty,
+            }
+          : null;
+
+      console.log('💸 [direct] fee debug:', {
+        eventId: String(event._id),
+        qty,
+        platformFeeEUR,
+        PLATFORM_FEE_CENTS,
+        applicationFee,
+        feeLineAdded: !!feeLineItem,
+        refCode,
+        shareChannel,
+      });
   
       // Order "guest": sin userId ni email (Stripe nos dará el email)
       const order = await Order.create({
@@ -261,7 +292,6 @@ router.get('/direct/:eventId', async (req, res) => {
       const session = await stripe.checkout.sessions.create({
         mode: 'payment',
         locale: 'es',
-        currency: 'eur',
         line_items: [
           {
             price_data: {
@@ -282,6 +312,7 @@ router.get('/direct/:eventId', async (req, res) => {
             },
             quantity: qty,
           },
+          ...(feeLineItem ? [feeLineItem] : []),
         ],
         // Mismo success/cancel que el flujo normal
         success_url: `${process.env.APP_BASE_URL}/purchase/success?sid={CHECKOUT_SESSION_ID}`,
@@ -295,6 +326,8 @@ router.get('/direct/:eventId', async (req, res) => {
           // Share attribution (optional)
           ...(refCode ? { refCode } : {}),
           ...(shareChannel ? { shareChannel } : {}),
+          perTicketFeeCents: String(PLATFORM_FEE_CENTS),
+          feeLineAdded: feeLineItem ? '1' : '0',
         },
         allow_promotion_codes: true,
         automatic_tax: { enabled: false },
