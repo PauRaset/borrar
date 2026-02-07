@@ -135,7 +135,7 @@ router.post('/create', async (req, res) => {
       apiBase,
       eventId: String(eventId),
       refCode: link.refCode,
-      channel: link.channel ? String(link.channel) : null,
+      channel: link.channel ? String(channel) : null,
     });
 
     return res.json({ ok: true, refCode: link.refCode, shareUrl, directUrl });
