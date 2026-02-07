@@ -16,10 +16,16 @@ const socialRoutes = require("./routes/socialRoutes");
 // (opcional) Payments routes (links de compra / redirects)
 let paymentRoutes = null;
 try {
+  // En este repo el archivo suele llamarse routes/payments.js (plural)
   paymentRoutes = require('./routes/payment');
   console.log('✅ routes/payment cargado');
-} catch (e) {
-  console.error('❌ No se pudo cargar ./routes/payment (payments deshabilitado):', e);
+} catch (e1) {
+  try {
+    paymentRoutes = require('./routes/payments');
+    console.log('✅ routes/payments cargado');
+  } catch (e2) {
+    console.error('❌ No se pudo cargar ./routes/payment ni ./routes/payments (payments deshabilitado):', e2);
+  }
 }
 
 // (opcional) Share / referrals (tracking de compartidos)
