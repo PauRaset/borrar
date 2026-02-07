@@ -1,4 +1,4 @@
-/*// models/Order.js
+// models/Order.js
 const mongoose = require('mongoose');
 
 const OrderSchema = new mongoose.Schema(
@@ -73,9 +73,9 @@ OrderSchema.index({ clubId: 1, createdAt: -1 });
 OrderSchema.index({ eventId: 1, status: 1, createdAt: -1 });
 OrderSchema.index({ clubId: 1, eventId: 1, status: 1, refUserId: 1, createdAt: -1 });
 
-module.exports = mongoose.model('Order', OrderSchema);*/
+module.exports = mongoose.model('Order', OrderSchema);
 
-
+/*
 // models/Order.js
 const mongoose = require('mongoose');
 
@@ -145,4 +145,4 @@ OrderSchema.virtual('grossCents').get(function () {
 OrderSchema.index({ clubId: 1, createdAt: -1 });
 OrderSchema.index({ eventId: 1, status: 1, createdAt: -1 });
 
-module.exports = mongoose.model('Order', OrderSchema);
+module.exports = mongoose.model('Order', OrderSchema);*/
