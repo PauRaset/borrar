@@ -46,6 +46,15 @@ function pickApiBase(req) {
   return getRequestBaseUrl(req).replace(/\/$/, '');
 }
 
+function pickShareBase(req) {
+  // Prefer a public/share domain if provided (e.g. https://nightvibe.life)
+  const envShare = (process.env.SHARE_BASE_URL || '').trim().replace(/\/$/, '');
+  if (envShare) return envShare;
+
+  // Fallback: use API base (absolute)
+  return pickApiBase(req);
+}
+
 function joinUrl(base, path) {
   const b = (base || '').replace(/\/$/, '');
   const p = (path || '').startsWith('/') ? path : `/${path}`;
@@ -147,9 +156,10 @@ router.post('/create', async (req, res) => {
     }
 
     const apiBase = pickApiBase(req);
+    const shareBase = pickShareBase(req);
 
-    // Prefer tracking redirect URL when sharing
-    const shareUrl = joinUrl(apiBase, `/api/share/r/${encodeURIComponent(link.refCode)}`);
+    // Prefer tracking redirect URL when sharing (use public domain if available)
+    const shareUrl = joinUrl(shareBase, `/r/${encodeURIComponent(link.refCode)}`);
 
     // Keep direct URL for compatibility
     const directUrl = buildDirectUrl({
