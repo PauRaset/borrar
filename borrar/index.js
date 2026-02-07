@@ -13,6 +13,15 @@ const rateLimit = require("express-rate-limit");
 const clubRoutes = require("./routes/clubRoutes");
 const socialRoutes = require("./routes/socialRoutes");
 
+// (opcional) Payments routes (links de compra / redirects)
+let paymentRoutes = null;
+try {
+  paymentRoutes = require('./routes/payment');
+  console.log('✅ routes/payment cargado');
+} catch (e) {
+  console.error('❌ No se pudo cargar ./routes/payment (payments deshabilitado):', e);
+}
+
 // (opcional) Share / referrals (tracking de compartidos)
 let shareRoutes = null;
 try {
@@ -965,6 +974,14 @@ app.use("/search", searchRoutes);
 app.use("/api/registration", registrationRoutes); // <-- Y montado AQUÍ
 app.use("/api/clubs", clubRoutes);
 app.use("/api/social", socialRoutes);
+
+// Payments: endpoints para links directos de compra (compat)
+if (paymentRoutes) {
+  app.use('/api/payments', paymentRoutes);
+  console.log('✅ Mounted /api/payments');
+} else {
+  console.warn('⚠️ /api/payments NO montado (paymentRoutes=null).');
+}
 
 // Shares: generar links con refCode y redirects de tracking
 if (shareRoutes) {
