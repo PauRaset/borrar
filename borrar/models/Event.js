@@ -92,7 +92,23 @@ const eventSchema = new mongoose.Schema(
     // 🔥 NUEVO — relación con Club
     clubId: { type: String, index: true, default: "" }, // guardamos como string para flexibilidad
     club:   { type: mongoose.Schema.Types.ObjectId, ref: "Club", index: true, default: null },
+
+    // Comisión NightVibe por entrada (EUR). Si existe, sobrescribe el default (1.50€).
+    // Ej: 1.5 => 1,50€; 0 => sin comisión.
+    platformFeeEUR: { type: Number, default: null },
     ticketTheme: { type: String, default: "" },
+
+    // Activación del sistema de promociones/niveles para este evento.
+    // Si está a false, el frontend puede mostrar el bloque sutil de “promociones no activadas”.
+    promotionsEnabled: { type: Boolean, default: false },
+
+    // Token único del QR del evento. Servirá como base para generar/validar el QR
+    // sin depender de guardar necesariamente la imagen final en la base de datos.
+    qrToken: { type: String, index: true, default: "" },
+
+    // Texto corto opcional del evento, útil si más adelante se presenta también
+    // con formato tipo publicación/red social.
+    caption: { type: String, default: "" },
   },
   {
     timestamps: true,
@@ -178,6 +194,14 @@ eventSchema.pre("save", function (next) {
     this.image = onlyUploadPath(String(this.image).trim());
   }
 
+  // Normalizar textos opcionales nuevos
+  if (typeof this.caption === 'string') {
+    this.caption = this.caption.trim();
+  }
+  if (typeof this.qrToken === 'string') {
+    this.qrToken = this.qrToken.trim();
+  }
+
   // Normalizar galería (acepta strings legacy o objetos)
   if (Array.isArray(this.photos)) {
     this.photos = this.photos
@@ -226,6 +250,12 @@ eventSchema.pre("save", function (next) {
         ? raw.split(',').map((s) => s.trim()).filter(Boolean)
         : [];
     }
+  }
+
+  // Generar qrToken automáticamente si el evento aún no tiene uno.
+  // Así cada evento puede disponer de un identificador único estable para QR.
+  if (!this.qrToken) {
+    this.qrToken = new mongoose.Types.ObjectId().toString();
   }
 
   next();
