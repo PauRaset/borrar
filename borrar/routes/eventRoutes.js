@@ -570,58 +570,60 @@ router.post("/", anyAuth, ensureUserId, upload.single("image"), async (req, res)
   }
 });
 
+  /* ------------------------------------------------------------------
+    LISTAR SOLO EVENTOS DEL CLUB/AUTH ACTUAL (panel clubs)
+  ------------------------------------------------------------------- */
+
+router.get("/mine", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const events = await Event.find({
+      $or: [
+        { createdBy: userId },
+        { clubId: userId },
+        { club: userId },
+      ],
+    })
+      .sort({ startAt: -1, date: -1, createdAt: -1 })
+      .populate("createdBy", "username email profilePicture displayName")
+      .lean();
+
+    const formattedEvents = events.map((event) => {
+      const photos = approvedOnly(event.photos)
+        .map((p) => toPhotoTileAbs(req, p))
+        .filter(Boolean);
+
+      return {
+        ...event,
+        imageUrl: absUrlFromUpload(req, event.image),
+        photos,
+        createdBy: event.createdBy
+          ? {
+              ...event.createdBy,
+              profilePictureUrl: absUrlFromUpload(req, event.createdBy.profilePicture),
+            }
+          : null,
+        categories: Array.isArray(event.categories)
+          ? event.categories
+          : parseCategoriesMaybe(event.categories),
+      };
+    });
+
+    return res.json(formattedEvents);
+  } catch (error) {
+    console.error("[GET /events/mine] Error al obtener eventos del club:", error);
+    return res.status(500).json({
+      message: "Error al obtener los eventos del club",
+      error: error.message || String(error),
+    });
+  }
+});
+
 /* ------------------------------------------------------------------
    LISTAR EVENTOS (público)
 ------------------------------------------------------------------- */
 router.get("/", async (req, res) => {
-  /* ------------------------------------------------------------------
-    LISTAR SOLO EVENTOS DEL CLUB/AUTH ACTUAL (panel clubs)
-  ------------------------------------------------------------------- */
-  router.get("/mine", anyAuth, ensureUserId, async (req, res) => {
-    try {
-      const userId = req.user.id;
-
-      const events = await Event.find({
-        $or: [
-          { createdBy: userId },
-          { clubId: userId },
-          { club: userId },
-        ],
-      })
-        .sort({ startAt: -1, date: -1, createdAt: -1 })
-        .populate("createdBy", "username email profilePicture displayName")
-        .lean();
-
-      const formattedEvents = events.map((event) => {
-        const photos = approvedOnly(event.photos)
-          .map((p) => toPhotoTileAbs(req, p))
-          .filter(Boolean);
-
-        return {
-          ...event,
-          imageUrl: absUrlFromUpload(req, event.image),
-          photos,
-          createdBy: event.createdBy
-            ? {
-                ...event.createdBy,
-                profilePictureUrl: absUrlFromUpload(req, event.createdBy.profilePicture),
-              }
-            : null,
-          categories: Array.isArray(event.categories)
-            ? event.categories
-            : parseCategoriesMaybe(event.categories),
-        };
-      });
-
-      return res.json(formattedEvents);
-    } catch (error) {
-      console.error("[GET /events/mine] Error al obtener eventos del club:", error);
-      return res.status(500).json({
-        message: "Error al obtener los eventos del club",
-        error: error.message || String(error),
-      });
-    }
-  });
   try {
     const events = await Event.find().populate("createdBy", "username email profilePicture displayName").lean();
 
