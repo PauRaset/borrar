@@ -578,7 +578,7 @@ router.get("/mine", anyAuth, ensureUserId, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    const events = await Event.find({
+    const docs = await Event.find({
       $or: [
         { createdBy: userId },
         { clubId: userId },
@@ -586,8 +586,17 @@ router.get("/mine", anyAuth, ensureUserId, async (req, res) => {
       ],
     })
       .sort({ startAt: -1, date: -1, createdAt: -1 })
-      .populate("createdBy", "username email profilePicture displayName")
-      .lean();
+      .populate("createdBy", "username email profilePicture displayName");
+
+    // Backfill de qrToken para eventos antiguos que no lo tengan todavía.
+    for (const doc of docs) {
+      if (!doc.qrToken) {
+        doc.qrToken = new mongoose.Types.ObjectId().toString();
+        await doc.save();
+      }
+    }
+
+    const events = docs.map((doc) => doc.toObject());
 
     const formattedEvents = events.map((event) => {
       const photos = approvedOnly(event.photos)
@@ -774,6 +783,12 @@ router.get("/:id", async (req, res) => {
     );
     if (!event) return res.status(404).json({ message: "Evento no encontrado" });
 
+    // Backfill de qrToken para eventos antiguos que se crearon antes de añadir este campo.
+    if (!event.qrToken) {
+      event.qrToken = new mongoose.Types.ObjectId().toString();
+      await event.save();
+    }
+
     const obj = event.toObject();
 
     const formattedEvent = {
@@ -789,6 +804,7 @@ router.get("/:id", async (req, res) => {
       categories: Array.isArray(obj.categories)
         ? obj.categories
         : parseCategoriesMaybe(obj.categories),
+      qrPayload: `NV_EVENT:${obj._id}:${obj.qrToken || ""}`,
     };
 
     const userId = req.user ? req.user.id : null; // si algún middleware previo lo puso
