@@ -72,6 +72,16 @@ function joinUrl(base, rel) {
   return `${b}/${r}`;
 }
 
+function buildEventPhotoAccessUrl(req, eventId, photoId) {
+  return joinUrl(backendBase(req), `/api/events/${eventId}/photos/${photoId}/file`);
+}
+
+function rawPhotoValue(entry) {
+  if (!entry) return "";
+  if (typeof entry === "string") return entry;
+  return entry.url || entry.path || entry.href || entry.secure_url || entry.photo || entry.image || "";
+}
+
 /* Utils de ficheros */
 const ROOT_UPLOADS_DIR = path.join(__dirname, "..", "uploads");
 function ensureDir(dir) {
@@ -896,7 +906,8 @@ router.get("/:id/photos/moderation", anyAuth, ensureUserId, async (req, res) => 
 
     const out = filtered.map((p) => ({
       photoId: p.photoId || "",
-      url: absUrlFromUpload(req, p.url),
+      url: buildEventPhotoAccessUrl(req, id, p.photoId || ""),
+      rawUrl: rawPhotoValue(p),
       by: p.by || null,
       byUsername: p.byUsername || null,
       uploadedAt: p.uploadedAt || null,
@@ -951,7 +962,8 @@ router.post("/:id/photos/:photoId/approve", anyAuth, ensureUserId, async (req, r
       ok: true,
       photo: {
         photoId: event.photos[idx].photoId,
-        url: absUrlFromUpload(req, event.photos[idx].url),
+        url: buildEventPhotoAccessUrl(req, id, event.photos[idx].photoId),
+        rawUrl: rawPhotoValue(event.photos[idx]),
         status: event.photos[idx].status,
         reviewedBy: event.photos[idx].reviewedBy,
         reviewedAt: event.photos[idx].reviewedAt,
@@ -995,7 +1007,8 @@ router.post("/:id/photos/:photoId/reject", anyAuth, ensureUserId, async (req, re
       ok: true,
       photo: {
         photoId: event.photos[idx].photoId,
-        url: absUrlFromUpload(req, event.photos[idx].url),
+        url: buildEventPhotoAccessUrl(req, id, event.photos[idx].photoId),
+        rawUrl: rawPhotoValue(event.photos[idx]),
         status: event.photos[idx].status,
         reviewedBy: event.photos[idx].reviewedBy,
         reviewedAt: event.photos[idx].reviewedAt,
@@ -1005,6 +1018,79 @@ router.post("/:id/photos/:photoId/reject", anyAuth, ensureUserId, async (req, re
   } catch (e) {
     console.error("[POST /events/:id/photos/:photoId/reject] error:", e);
     return res.status(500).json({ message: "Error rechazando foto" });
+  }
+});
+
+// Acceso/proxy a una foto concreta del evento para evitar problemas de CORS
+router.get("/:id/photos/:photoId/file", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const { id, photoId } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    const event = await Event.findById(id).lean();
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    if (event.createdBy?.toString?.() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para ver fotos de este evento" });
+    }
+
+    const photo = (event.photos || []).find(
+      (p) => p && typeof p === "object" && String(p.photoId || "") === String(photoId)
+    );
+    if (!photo) {
+      return res.status(404).json({ message: "Foto no encontrada" });
+    }
+
+    let raw = rawPhotoValue(photo);
+    if (!raw) {
+      return res.status(404).json({ message: "Ruta de foto no disponible" });
+    }
+
+    if (typeof raw !== "string") raw = String(raw);
+    raw = raw.trim();
+
+    // Si es una URL del propio backend que apunta a /uploads, la convertimos a path local.
+    if (raw.startsWith("http")) {
+      const idx = raw.indexOf("/uploads/");
+      if (idx !== -1) {
+        raw = raw.substring(idx + 1); // -> uploads/...
+      }
+    }
+
+    // Caso 1: archivo local dentro de /uploads
+    if (!raw.startsWith("http")) {
+      const rel = raw.replace(/^\/+/, "");
+      const abs = path.join(__dirname, "..", rel);
+      const uploadsRoot = path.join(__dirname, "..", "uploads");
+
+      if (!abs.startsWith(uploadsRoot)) {
+        return res.status(400).json({ message: "Ruta de foto inválida" });
+      }
+      if (!fs.existsSync(abs)) {
+        return res.status(404).json({ message: "Archivo no encontrado" });
+      }
+
+      return res.sendFile(abs);
+    }
+
+    // Caso 2: URL externa -> proxy server-side para evitar CORS en el frontend
+    const upstream = await fetch(raw);
+    if (!upstream.ok) {
+      return res.status(404).json({ message: "No se pudo obtener la foto remota" });
+    }
+
+    const contentType = upstream.headers.get("content-type") || "application/octet-stream";
+    const arrayBuffer = await upstream.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "public, max-age=300");
+    return res.send(buffer);
+  } catch (e) {
+    console.error("[GET /events/:id/photos/:photoId/file] error:", e);
+    return res.status(500).json({ message: "Error obteniendo la foto" });
   }
 });
 
