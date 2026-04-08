@@ -118,10 +118,145 @@ function computeLevelProgress(level) {
   return Math.max(0, Math.min(1, avg));
 }
 
+
 function normalizeEvidence(evidence) {
   if (!evidence) return [];
   if (Array.isArray(evidence)) return evidence;
   return [evidence];
+}
+
+function normalizeMissionInput(mission = {}, idx = 0) {
+  const type = String(mission.type || '').trim();
+  const title = String(mission.title || '').trim();
+  const description = String(mission.description || '').trim();
+  const target = Number.isFinite(Number(mission.target)) ? Number(mission.target) : 1;
+  const order = Number.isFinite(Number(mission.order)) ? Number(mission.order) : idx + 1;
+  const active = typeof mission.active === 'boolean' ? mission.active : true;
+  const requiresApproval =
+    typeof mission.requiresApproval === 'boolean'
+      ? mission.requiresApproval
+      : String(mission.validationType || '').trim() === 'manual';
+
+  return {
+    ...(mission._id ? { _id: mission._id } : {}),
+    type,
+    title,
+    description,
+    target,
+    unit: String(mission.unit || '').trim(),
+    params: mission.params && typeof mission.params === 'object' ? mission.params : {},
+    validationType: String(mission.validationType || (requiresApproval ? 'manual' : 'automatic')).trim() || 'automatic',
+    requiresApproval,
+    order,
+    active,
+  };
+}
+
+function normalizeRewardInput(reward = {}) {
+  return {
+    type: String(reward.type || 'custom').trim() || 'custom',
+    title: String(reward.title || '').trim(),
+    description: String(reward.description || '').trim(),
+    value: reward.value && typeof reward.value === 'object' ? reward.value : {},
+    active: typeof reward.active === 'boolean' ? reward.active : true,
+  };
+}
+
+function normalizeLevelInput(level = {}, idx = 0) {
+  const levelNumber = Number.isFinite(Number(level.levelNumber)) ? Number(level.levelNumber) : idx + 1;
+  const order = Number.isFinite(Number(level.order)) ? Number(level.order) : levelNumber;
+  const status = String(level.status || (level.active === false ? 'paused' : 'active')).trim() || 'active';
+  const active = typeof level.active === 'boolean' ? level.active : status === 'active';
+
+  return {
+    levelNumber,
+    order,
+    title: String(level.title || `Nivel ${levelNumber}`).trim(),
+    description: String(level.description || '').trim(),
+    difficulty: String(level.difficulty || 'medium').trim() || 'medium',
+    missions: Array.isArray(level.missions)
+      ? level.missions.map((mission, missionIdx) => normalizeMissionInput(mission, missionIdx))
+      : [],
+    reward: normalizeRewardInput(level.reward || {}),
+    status,
+    active,
+    visibleInApp: typeof level.visibleInApp === 'boolean' ? level.visibleInApp : true,
+    version: Number.isFinite(Number(level.version)) ? Number(level.version) : 1,
+  };
+}
+
+function serializeLevelDoc(doc) {
+  const obj = doc && typeof doc.toObject === 'function' ? doc.toObject() : doc;
+  return {
+    id: obj._id?.toString?.() || null,
+    scope: obj.scope,
+    club: obj.club ? obj.club.toString() : null,
+    levelNumber: obj.levelNumber,
+    order: obj.order,
+    title: obj.title,
+    description: obj.description || '',
+    difficulty: obj.difficulty || 'medium',
+    reward: obj.reward || null,
+    status: obj.status || (obj.active ? 'active' : 'paused'),
+    active: !!obj.active,
+    visibleInApp: obj.visibleInApp !== false,
+    version: obj.version || 1,
+    missions: Array.isArray(obj.missions)
+      ? obj.missions
+          .map((mission) => {
+            const m = mission && typeof mission.toObject === 'function' ? mission.toObject() : mission;
+            return {
+              id: m?._id?.toString?.() || null,
+              type: m?.type || '',
+              title: m?.title || '',
+              description: m?.description || '',
+              target: Number(m?.target || 1),
+              unit: m?.unit || '',
+              params: m?.params || {},
+              validationType: m?.validationType || (m?.requiresApproval ? 'manual' : 'automatic'),
+              requiresApproval: !!m?.requiresApproval,
+              order: Number(m?.order || 0),
+              active: m?.active !== false,
+            };
+          })
+          .sort((a, b) => a.order - b.order)
+      : [],
+  };
+}
+
+async function ensureClubTemplates(clubId) {
+  let clubTemplates = await PromotionLevelTemplate.find({ scope: 'club', club: clubId })
+    .sort({ order: 1, levelNumber: 1 })
+    .exec();
+
+  if (clubTemplates.length) return clubTemplates;
+
+  const globalTemplates = await PromotionLevelTemplate.find({ scope: 'global' })
+    .sort({ order: 1, levelNumber: 1 })
+    .lean();
+
+  const source = globalTemplates.length
+    ? globalTemplates
+    : PromotionLevelTemplate.getDefaultTemplates();
+
+  const docsToInsert = source.map((level, idx) => {
+    const normalized = normalizeLevelInput(level, idx);
+    return {
+      scope: 'club',
+      club: clubId,
+      ...normalized,
+    };
+  });
+
+  if (docsToInsert.length) {
+    await PromotionLevelTemplate.insertMany(docsToInsert, { ordered: true });
+  }
+
+  clubTemplates = await PromotionLevelTemplate.find({ scope: 'club', club: clubId })
+    .sort({ order: 1, levelNumber: 1 })
+    .exec();
+
+  return clubTemplates;
 }
 
 async function getTemplatesForClub(clubId) {
@@ -602,10 +737,73 @@ exports.rejectClaim = async (req, res) => {
   }
 };
 
+
+exports.getClubPromotionConfig = async (req, res) => {
+  try {
+    const { clubId } = req.params;
+    if (!isValidObjectId(clubId)) {
+      return res.status(400).json({ ok: false, error: 'Invalid clubId' });
+    }
+
+    if (!canManageClub(req, clubId)) {
+      return res.status(403).json({ ok: false, error: 'Forbidden' });
+    }
+
+    const templates = await ensureClubTemplates(clubId);
+
+    return res.json({
+      ok: true,
+      clubId,
+      levels: templates.map(serializeLevelDoc).sort((a, b) => a.order - b.order),
+    });
+  } catch (e) {
+    console.error('[promotions] getClubPromotionConfig error:', e);
+    return res.status(500).json({ ok: false, error: 'Server error' });
+  }
+};
+
 exports.upsertClubLevelOverrides = async (req, res) => {
-  // Esto lo implementamos cuando lleguemos a “clubs pueden editar premios/misiones”.
-  return res.status(501).json({
-    ok: false,
-    error: 'Not implemented yet: club level overrides',
-  });
+  try {
+    const { clubId } = req.params;
+    if (!isValidObjectId(clubId)) {
+      return res.status(400).json({ ok: false, error: 'Invalid clubId' });
+    }
+
+    if (!canManageClub(req, clubId)) {
+      return res.status(403).json({ ok: false, error: 'Forbidden' });
+    }
+
+    const payloadLevels = Array.isArray(req.body?.levels) ? req.body.levels : null;
+    if (!payloadLevels) {
+      return res.status(400).json({ ok: false, error: 'Missing levels array' });
+    }
+
+    await ensureClubTemplates(clubId);
+
+    // Reemplazo completo de la configuración del club para simplificar la primera versión.
+    await PromotionLevelTemplate.deleteMany({ scope: 'club', club: clubId });
+
+    const docsToInsert = payloadLevels.map((level, idx) => ({
+      scope: 'club',
+      club: clubId,
+      ...normalizeLevelInput(level, idx),
+    }));
+
+    if (docsToInsert.length) {
+      await PromotionLevelTemplate.insertMany(docsToInsert, { ordered: true });
+    }
+
+    const saved = await PromotionLevelTemplate.find({ scope: 'club', club: clubId })
+      .sort({ order: 1, levelNumber: 1 })
+      .exec();
+
+    return res.json({
+      ok: true,
+      clubId,
+      levels: saved.map(serializeLevelDoc).sort((a, b) => a.order - b.order),
+    });
+  } catch (e) {
+    console.error('[promotions] upsertClubLevelOverrides error:', e);
+    return res.status(500).json({ ok: false, error: 'Server error' });
+  }
 };
