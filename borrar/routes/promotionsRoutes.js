@@ -41,7 +41,11 @@ router.post('/claims/:claimId/approve', requireFirebase, promotionsController.ap
 // POST /api/promotions/claims/:claimId/reject
 router.post('/claims/:claimId/reject', requireFirebase, promotionsController.rejectClaim);
 
-// Editar niveles/premios del club (override) — lo dejamos preparado
+// Obtener configuración editable de promociones del club
+// GET /api/promotions/clubs/:clubId/levels
+router.get('/clubs/:clubId/levels', requireFirebase, promotionsController.getClubPromotionConfig);
+
+// Guardar niveles/premios/misiones del club
 // PUT /api/promotions/clubs/:clubId/levels
 router.put('/clubs/:clubId/levels', requireFirebase, promotionsController.upsertClubLevelOverrides);
 
