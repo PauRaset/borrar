@@ -4,6 +4,7 @@ const router = express.Router();
 
 const promotionsController = require('../controllers/promotionsController');
 const requireFirebase = require('../middlewares/requireFirebase');
+const { anyAuthWithId } = require('../middlewares/authMiddleware');
 
 // ===========================
 // USER (app)
@@ -31,22 +32,22 @@ router.post('/claims/:claimId/cancel', requireFirebase, promotionsController.can
 
 // Listar claims pendientes para un club (opcional pero MUY útil para el panel)
 // GET /api/promotions/clubs/:clubId/claims?status=pending
-router.get('/clubs/:clubId/claims', requireFirebase, promotionsController.listClubClaims);
+router.get('/clubs/:clubId/claims', anyAuthWithId, promotionsController.listClubClaims);
 
 // Aprobar claim (club valida)
 // POST /api/promotions/claims/:claimId/approve
-router.post('/claims/:claimId/approve', requireFirebase, promotionsController.approveClaim);
+router.post('/claims/:claimId/approve', anyAuthWithId, promotionsController.approveClaim);
 
 // Rechazar claim (club valida)
 // POST /api/promotions/claims/:claimId/reject
-router.post('/claims/:claimId/reject', requireFirebase, promotionsController.rejectClaim);
+router.post('/claims/:claimId/reject', anyAuthWithId, promotionsController.rejectClaim);
 
 // Obtener configuración editable de promociones del club
 // GET /api/promotions/clubs/:clubId/levels
-router.get('/clubs/:clubId/levels', requireFirebase, promotionsController.getClubPromotionConfig);
+router.get('/clubs/:clubId/levels', anyAuthWithId, promotionsController.getClubPromotionConfig);
 
 // Guardar niveles/premios/misiones del club
 // PUT /api/promotions/clubs/:clubId/levels
-router.put('/clubs/:clubId/levels', requireFirebase, promotionsController.upsertClubLevelOverrides);
+router.put('/clubs/:clubId/levels', anyAuthWithId, promotionsController.upsertClubLevelOverrides);
 
 module.exports = router;
