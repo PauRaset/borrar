@@ -153,11 +153,24 @@ function normalizeMissionInput(mission = {}, idx = 0) {
 }
 
 function normalizeRewardInput(reward = {}) {
+  const rawValue = reward?.value;
+
+  let numericValue = null;
+  if (typeof rawValue === 'number' && Number.isFinite(rawValue)) {
+    numericValue = rawValue;
+  } else if (
+    typeof rawValue === 'string' &&
+    rawValue.trim() !== '' &&
+    !Number.isNaN(Number(rawValue))
+  ) {
+    numericValue = Number(rawValue);
+  }
+
   return {
     type: String(reward.type || 'custom').trim() || 'custom',
     title: String(reward.title || '').trim(),
     description: String(reward.description || '').trim(),
-    value: reward.value && typeof reward.value === 'object' ? reward.value : {},
+    value: numericValue,
     active: typeof reward.active === 'boolean' ? reward.active : true,
   };
 }
