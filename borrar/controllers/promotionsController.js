@@ -345,6 +345,70 @@ function refreshCurrentSnapshot(progress) {
   progress.currentRewardTitle = curLevel.reward?.title || '';
 }
 
+function updatePhotoMissionsForLevel(level, { countApproved = 1 }) {
+  if (!level || !Array.isArray(level.missions)) return false;
+
+  let changed = false;
+
+  for (const mission of level.missions) {
+    if (!mission || mission.active === false) continue;
+    if (mission.status === 'completed') continue;
+
+    const type = String(mission.type || '');
+
+    if (type !== 'approved_event_photo') {
+      continue;
+    }
+
+    const prev = Number(mission.current || 0);
+    const target = Number(mission.target || 1);
+    const next = Math.min(target, prev + countApproved);
+
+    if (next !== prev) {
+      mission.current = next;
+      mission.updatedAt = now();
+      changed = true;
+    }
+
+    if (next >= target && mission.status !== 'completed') {
+      mission.status = 'completed';
+      mission.completedAt = now();
+      mission.updatedAt = now();
+      changed = true;
+    } else if (mission.status === 'locked') {
+      mission.status = 'in_progress';
+      mission.updatedAt = now();
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    level.progress = computeLevelProgress(level);
+  }
+
+  return changed;
+}
+
+function finalizeLevelIfCompleted(progress, level) {
+  if (!level || !Array.isArray(level.missions)) return false;
+
+  const allDone =
+    level.missions.length > 0 &&
+    level.missions.every((m) => m.status === 'completed');
+
+  if (!allDone) return false;
+
+  if (level.status !== 'completed') {
+    level.status = 'completed';
+    level.completedAt = now();
+    level.progress = 1;
+    unlockNextLevel(progress, level.levelNumber);
+    return true;
+  }
+
+  return false;
+}
+
 async function updatePendingClaimsCount(userId, clubId) {
   const count = await PromotionClaim.countDocuments({ user: userId, club: clubId, status: 'pending' });
   await UserClubPromotionProgress.updateOne(
@@ -352,6 +416,65 @@ async function updatePendingClaimsCount(userId, clubId) {
     { $set: { pendingClaimsCount: count } }
   );
 }
+
+exports.syncPromotionAfterPhotoApproved = async function syncPromotionAfterPhotoApproved({
+  userId,
+  clubId,
+  eventId = null,
+}) {
+  try {
+    if (!isValidObjectId(userId) || !isValidObjectId(clubId)) {
+      return { ok: false, error: 'Invalid userId or clubId' };
+    }
+
+    const templates = await getTemplatesForClub(clubId);
+    if (!templates.length) {
+      return { ok: false, error: 'No templates found' };
+    }
+
+    const progress = await ensureProgressDoc({
+      userId,
+      clubId,
+      templates,
+    });
+
+    let changed = false;
+
+    for (const level of progress.levels || []) {
+      if (!level) continue;
+      if (level.status === 'locked') continue;
+      if (level.status === 'completed') continue;
+
+      const levelChanged = updatePhotoMissionsForLevel(level, { countApproved: 1 });
+      if (levelChanged) {
+        changed = true;
+        finalizeLevelIfCompleted(progress, level);
+      }
+    }
+
+    if (!changed) {
+      return { ok: true, changed: false };
+    }
+
+    progress.counters = progress.counters || {};
+    progress.counters.photosUploadedInClub = Number(progress.counters.photosUploadedInClub || 0) + 1;
+    progress.lastEventId = isValidObjectId(eventId) ? eventId : progress.lastEventId;
+    progress.lastActivityAt = now();
+
+    refreshCurrentSnapshot(progress);
+    await progress.save();
+
+    return {
+      ok: true,
+      changed: true,
+      currentLevel: progress.currentLevel,
+      currentProgress: progress.currentProgress,
+    };
+  } catch (e) {
+    console.error('[promotions] syncPromotionAfterPhotoApproved error:', e);
+    return { ok: false, error: 'Server error' };
+  }
+};
 
 // ===========================
 // CONTROLLERS
