@@ -82,6 +82,33 @@ function rawPhotoValue(entry) {
   return entry.url || entry.path || entry.href || entry.secure_url || entry.photo || entry.image || "";
 }
 
+function parseLevelNumberMaybe(v) {
+  if (v === undefined || v === null || v === "") return null;
+  const n = Number(v);
+  return Number.isNaN(n) ? null : n;
+}
+
+function extractPhotoMissionMeta(body = {}) {
+  return {
+    missionType: (body.missionType || body.photoMissionType || body.targetMissionType || "").toString().trim() || null,
+    missionId: (body.missionId || body.photoMissionId || body.targetMissionId || "").toString().trim() || null,
+    missionTitle: (body.missionTitle || body.photoMissionTitle || body.targetMissionTitle || "").toString().trim() || null,
+    levelNumber: parseLevelNumberMaybe(body.levelNumber || body.photoLevelNumber || body.targetLevelNumber),
+  };
+}
+
+function extractPhotoValidationMeta(body = {}) {
+  return {
+    validatedForMissionType: (body.validatedForMissionType || body.missionType || "").toString().trim() || null,
+    validatedForMissionId: (body.validatedForMissionId || body.missionId || "").toString().trim() || null,
+    validatedForMissionTitle: (body.validatedForMissionTitle || body.missionTitle || "").toString().trim() || null,
+    validatedForLevelNumber: parseLevelNumberMaybe(
+      body.validatedForLevelNumber || body.levelNumber
+    ),
+    validationResult: (body.validationResult || "").toString().trim() || null,
+  };
+}
+
 /* Utils de ficheros */
 const ROOT_UPLOADS_DIR = path.join(__dirname, "..", "uploads");
 function ensureDir(dir) {
@@ -915,6 +942,15 @@ router.get("/:id/photos/moderation", anyAuth, ensureUserId, async (req, res) => 
       reviewedBy: p.reviewedBy || null,
       reviewedAt: p.reviewedAt || null,
       reviewNote: p.reviewNote || "",
+      missionType: p.missionType || null,
+      missionId: p.missionId || null,
+      missionTitle: p.missionTitle || null,
+      levelNumber: p.levelNumber ?? null,
+      validatedForMissionType: p.validatedForMissionType || null,
+      validatedForMissionId: p.validatedForMissionId || null,
+      validatedForMissionTitle: p.validatedForMissionTitle || null,
+      validatedForLevelNumber: p.validatedForLevelNumber ?? null,
+      validationResult: p.validationResult || null,
     }));
 
     return res.json({ eventId: id, status, photos: out, count: out.length });
@@ -943,11 +979,17 @@ router.post("/:id/photos/:photoId/approve", anyAuth, ensureUserId, async (req, r
     if (idx === -1) return res.status(404).json({ message: "Foto no encontrada" });
 
     const note = (req.body?.reviewNote || "").toString();
+    const validationMeta = extractPhotoValidationMeta(req.body || {});
 
     event.photos[idx].status = "approved";
     event.photos[idx].reviewedBy = req.user.id;
     event.photos[idx].reviewedAt = new Date();
     event.photos[idx].reviewNote = note;
+    event.photos[idx].validatedForMissionType = validationMeta.validatedForMissionType;
+    event.photos[idx].validatedForMissionId = validationMeta.validatedForMissionId;
+    event.photos[idx].validatedForMissionTitle = validationMeta.validatedForMissionTitle;
+    event.photos[idx].validatedForLevelNumber = validationMeta.validatedForLevelNumber;
+    event.photos[idx].validationResult = validationMeta.validationResult || "matched";
 
     await event.save();
 
@@ -968,6 +1010,15 @@ router.post("/:id/photos/:photoId/approve", anyAuth, ensureUserId, async (req, r
         reviewedBy: event.photos[idx].reviewedBy,
         reviewedAt: event.photos[idx].reviewedAt,
         reviewNote: event.photos[idx].reviewNote,
+        missionType: event.photos[idx].missionType || null,
+        missionId: event.photos[idx].missionId || null,
+        missionTitle: event.photos[idx].missionTitle || null,
+        levelNumber: event.photos[idx].levelNumber ?? null,
+        validatedForMissionType: event.photos[idx].validatedForMissionType || null,
+        validatedForMissionId: event.photos[idx].validatedForMissionId || null,
+        validatedForMissionTitle: event.photos[idx].validatedForMissionTitle || null,
+        validatedForLevelNumber: event.photos[idx].validatedForLevelNumber ?? null,
+        validationResult: event.photos[idx].validationResult || null,
       },
     });
   } catch (e) {
@@ -995,11 +1046,17 @@ router.post("/:id/photos/:photoId/reject", anyAuth, ensureUserId, async (req, re
     if (idx === -1) return res.status(404).json({ message: "Foto no encontrada" });
 
     const note = (req.body?.reviewNote || "").toString();
+    const validationMeta = extractPhotoValidationMeta(req.body || {});
 
     event.photos[idx].status = "rejected";
     event.photos[idx].reviewedBy = req.user.id;
     event.photos[idx].reviewedAt = new Date();
     event.photos[idx].reviewNote = note;
+    event.photos[idx].validatedForMissionType = validationMeta.validatedForMissionType;
+    event.photos[idx].validatedForMissionId = validationMeta.validatedForMissionId;
+    event.photos[idx].validatedForMissionTitle = validationMeta.validatedForMissionTitle;
+    event.photos[idx].validatedForLevelNumber = validationMeta.validatedForLevelNumber;
+    event.photos[idx].validationResult = validationMeta.validationResult || "not_matched";
 
     await event.save();
 
@@ -1013,6 +1070,15 @@ router.post("/:id/photos/:photoId/reject", anyAuth, ensureUserId, async (req, re
         reviewedBy: event.photos[idx].reviewedBy,
         reviewedAt: event.photos[idx].reviewedAt,
         reviewNote: event.photos[idx].reviewNote,
+        missionType: event.photos[idx].missionType || null,
+        missionId: event.photos[idx].missionId || null,
+        missionTitle: event.photos[idx].missionTitle || null,
+        levelNumber: event.photos[idx].levelNumber ?? null,
+        validatedForMissionType: event.photos[idx].validatedForMissionType || null,
+        validatedForMissionId: event.photos[idx].validatedForMissionId || null,
+        validatedForMissionTitle: event.photos[idx].validatedForMissionTitle || null,
+        validatedForLevelNumber: event.photos[idx].validatedForLevelNumber ?? null,
+        validationResult: event.photos[idx].validationResult || null,
       },
     });
   } catch (e) {
@@ -1116,6 +1182,7 @@ async function postPhotosHandler(req, res) {
       return res.status(400).json({ message: "No se recibieron archivos" });
     }
 
+    const missionMeta = extractPhotoMissionMeta(req.body || {});
     // Datos del usuario que sube
     let byUsername = "usuario";
     try {
@@ -1147,6 +1214,16 @@ async function postPhotosHandler(req, res) {
         reviewedBy: null,
         reviewedAt: null,
         reviewNote: "",
+
+        missionType: missionMeta.missionType,
+        missionId: missionMeta.missionId,
+        missionTitle: missionMeta.missionTitle,
+        levelNumber: missionMeta.levelNumber,
+        validatedForMissionType: null,
+        validatedForMissionId: null,
+        validatedForMissionTitle: null,
+        validatedForLevelNumber: null,
+        validationResult: null,
       };
 
       event.photos = Array.isArray(event.photos) ? event.photos : [];
@@ -1164,6 +1241,15 @@ async function postPhotosHandler(req, res) {
       byUsername: m.byUsername,
       uploadedAt: m.uploadedAt,
       status: m.status,
+      missionType: m.missionType || null,
+      missionId: m.missionId || null,
+      missionTitle: m.missionTitle || null,
+      levelNumber: m.levelNumber ?? null,
+      validatedForMissionType: m.validatedForMissionType || null,
+      validatedForMissionId: m.validatedForMissionId || null,
+      validatedForMissionTitle: m.validatedForMissionTitle || null,
+      validatedForLevelNumber: m.validatedForLevelNumber ?? null,
+      validationResult: m.validationResult || null,
     }));
 
     const allPhotos = approvedOnly(event.photos)
