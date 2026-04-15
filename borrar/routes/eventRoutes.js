@@ -650,6 +650,8 @@ router.post("/", anyAuth, ensureUserId, upload.single("image"), async (req, res)
       club: userId,
 
       // photos se inicializa por schema ([])
+      // QR subir foto a evento
+      qrToken: new mongoose.Types.ObjectId().toString(),
     });
 
     const savedEvent = await newEvent.save();
