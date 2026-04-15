@@ -655,7 +655,10 @@ router.post("/", anyAuth, ensureUserId, upload.single("image"), async (req, res)
     });
 
     const savedEvent = await newEvent.save();
-    res.status(201).json(savedEvent);
+    res.status(201).json({
+      ...savedEvent.toObject(),
+      qrPayload: `NV_EVENT:${savedEvent._id}:${savedEvent.qrToken}`,
+    });
   } catch (error) {
     console.error("Error al guardar el evento:", error);
     res.status(500).json({ message: "Error al guardar el evento", error: error.message });
