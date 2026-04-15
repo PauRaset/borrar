@@ -639,11 +639,10 @@ exports.getMyPromotions = async (req, res) => {
 
     const docs = await UserClubPromotionProgress.find({ user: mongoUser._id })
       .sort({ updatedAt: -1 })
-      .lean();
+      .exec();
 
     if (!docs.length) return res.json({ ok: true, promotions: [] });
 
-    // Cargar clubs (si modelo existe) para nombre/avatar
     const clubIds = docs.map((d) => d.club).filter(Boolean);
     let clubsById = {};
     if (ClubModel && clubIds.length) {
@@ -651,23 +650,80 @@ exports.getMyPromotions = async (req, res) => {
       clubsById = Object.fromEntries(clubs.map((c) => [c._id.toString(), c]));
     }
 
-    const promotions = docs.map((d) => {
-      const clubDoc = clubsById[d.club?.toString()] || null;
+    const promotions = [];
 
-      return {
-        id: d._id.toString(),
-        clubId: d.club?.toString(),
+    for (const doc of docs) {
+      const clubId = doc.club?.toString?.();
+      const clubDoc = clubId ? (clubsById[clubId] || null) : null;
+
+      const templates = clubId && isValidObjectId(clubId)
+        ? await getTemplatesForClub(clubId)
+        : [];
+
+      if (templates.length) {
+        syncProgressWithTemplates(doc, templates);
+        refreshCurrentSnapshot(doc);
+        doc.lastActivityAt = now();
+        await doc.save();
+      }
+
+      promotions.push({
+        id: doc._id.toString(),
+        clubId: clubId || null,
         clubName: pickClubName(clubDoc),
         clubAvatarUrl: pickClubAvatar(clubDoc),
-        level: d.currentLevel || 1,
-        progress: Number(d.currentProgress || 0),
+
+        currentLevel: Number(doc.currentLevel || 1),
+        currentProgress: Number(doc.currentProgress || 0),
+
+        // compatibilidad con pantallas antiguas
+        level: Number(doc.currentLevel || 1),
+        progress: Number(doc.currentProgress || 0),
+
         description:
-          d.pendingClaimsCount > 0
-            ? `Tienes ${d.pendingClaimsCount} validación(es) pendiente(s)`
-            : (d.currentRewardTitle ? `Premio: ${d.currentRewardTitle}` : ''),
-        pendingClaimsCount: d.pendingClaimsCount || 0,
-      };
-    });
+          doc.pendingClaimsCount > 0
+            ? `Tienes ${doc.pendingClaimsCount} validación(es) pendiente(s)`
+            : (doc.currentRewardTitle ? `Premio: ${doc.currentRewardTitle}` : ''),
+
+        pendingClaimsCount: Number(doc.pendingClaimsCount || 0),
+
+        levels: Array.isArray(doc.levels)
+          ? doc.levels.map((level) => ({
+              levelNumber: Number(level.levelNumber || 1),
+              order: Number(level.order || level.levelNumber || 1),
+              title: level.title || `Nivel ${level.levelNumber || 1}`,
+              description: level.description || '',
+              difficulty: level.difficulty || 'medium',
+              status: level.status || 'locked',
+              active: level.active !== false,
+              visibleInApp: level.visibleInApp !== false,
+              progress: Number(level.progress || 0),
+              reward: level.reward || null,
+              missions: Array.isArray(level.missions)
+                ? level.missions
+                    .map((mission) => ({
+                      missionKey: mission.missionKey || '',
+                      type: mission.type || '',
+                      title: mission.title || '',
+                      description: mission.description || '',
+                      target: Number(mission.target || 1),
+                      current: Number(mission.current || 0),
+                      unit: mission.unit || '',
+                      status: mission.status || 'locked',
+                      requiresApproval: !!mission.requiresApproval,
+                      validationType:
+                        mission.validationType ||
+                        (mission.requiresApproval ? 'manual' : 'automatic'),
+                      order: Number(mission.order || 0),
+                      active: mission.active !== false,
+                      claimId: mission.claimId || null,
+                    }))
+                    .sort((a, b) => a.order - b.order)
+                : [],
+            }))
+          : [],
+      });
+    }
 
     return res.json({ ok: true, promotions });
   } catch (e) {
