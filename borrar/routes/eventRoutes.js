@@ -898,12 +898,18 @@ router.post("/scan/resolve", anyAuth, ensureUserId, async (req, res) => {
 
 router.get("/scan/:token/resolve", anyAuth, ensureUserId, async (req, res) => {
   try {
-    const token = (req.params.token || "").toString().trim();
-    if (!token) {
+    const parsed = parseQrPayloadValue(req.params.token);
+
+    if (!parsed || !parsed.qrToken) {
       return res.status(400).json({ message: "QR inválido" });
     }
 
-    const event = await Event.findOne({ qrToken: token }).lean();
+    const query = { qrToken: parsed.qrToken };
+    if (parsed.eventId && mongoose.isValidObjectId(parsed.eventId)) {
+      query._id = parsed.eventId;
+    }
+
+    const event = await Event.findOne(query).lean();
     if (!event) {
       return res.status(404).json({ message: "Evento no encontrado para este QR" });
     }
@@ -917,12 +923,18 @@ router.get("/scan/:token/resolve", anyAuth, ensureUserId, async (req, res) => {
 
 router.post("/scan/:token/photo", anyAuth, ensureUserId, uploadAny.any(), async (req, res, next) => {
   try {
-    const token = (req.params.token || "").toString().trim();
-    if (!token) {
+    const parsed = parseQrPayloadValue(req.params.token);
+
+    if (!parsed || !parsed.qrToken) {
       return res.status(400).json({ message: "QR inválido" });
     }
 
-    const event = await Event.findOne({ qrToken: token }).select("_id").lean();
+    const query = { qrToken: parsed.qrToken };
+    if (parsed.eventId && mongoose.isValidObjectId(parsed.eventId)) {
+      query._id = parsed.eventId;
+    }
+
+    const event = await Event.findOne(query).select("_id").lean();
     if (!event) {
       return res.status(404).json({ message: "Evento no encontrado para este QR" });
     }
