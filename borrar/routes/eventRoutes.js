@@ -127,7 +127,7 @@ function parseQrPayloadValue(value) {
   };
 }
 
-function buildQrResolveResponse(req, event) {
+function buildQrResolveResponse(req, event, activePhotoMission = null) {
   const eventId = String(event._id);
   return {
     ok: true,
@@ -136,6 +136,21 @@ function buildQrResolveResponse(req, event) {
     tokenUploadUrl: joinUrl(backendBase(req), `/api/events/scan/${event.qrToken}/photo`),
     uploadUrl: joinUrl(backendBase(req), `/api/events/scan/${event.qrToken}/photo`),
     photoUploadUrl: joinUrl(backendBase(req), `/api/events/scan/${event.qrToken}/photo`),
+    mission: activePhotoMission
+      ? {
+          missionKey: activePhotoMission.missionKey || null,
+          missionId: activePhotoMission.missionId || activePhotoMission.missionKey || null,
+          type: activePhotoMission.type || null,
+          title: activePhotoMission.title || "",
+          levelNumber: activePhotoMission.levelNumber ?? null,
+          status: activePhotoMission.status || null,
+          requiresApproval: !!activePhotoMission.requiresApproval,
+        }
+      : null,
+    missionType: activePhotoMission?.type || null,
+    missionId: activePhotoMission?.missionId || activePhotoMission?.missionKey || null,
+    missionTitle: activePhotoMission?.title || "",
+    levelNumber: activePhotoMission?.levelNumber ?? null,
     event: {
       _id: eventId,
       id: eventId,
@@ -373,6 +388,7 @@ function updatePhotoMissionsForLevel(level, eventId, counters) {
   }
 }
 
+
 async function ensurePromotionProgressDoc({ userId, clubId }) {
   let progress = await UserClubPromotionProgress.findOne({ user: userId, club: clubId });
   if (progress) return progress;
@@ -388,6 +404,68 @@ async function ensurePromotionProgressDoc({ userId, clubId }) {
   });
 
   return progress;
+}
+
+function isPhotoMissionType(type) {
+  const normalized = (type || "").toString().trim().toLowerCase();
+  return [
+    "upload_event_photo",
+    "event_photo",
+    "upload_photo",
+    "photo_upload",
+    "upload-photo",
+    "event-photo",
+  ].includes(normalized);
+}
+
+function isActivePhotoMissionStatus(status) {
+  const normalized = (status || "").toString().trim().toLowerCase();
+  return ["in_progress", "pending", "rejected"].includes(normalized);
+}
+
+async function resolveActivePhotoMissionForUser({ userId, event }) {
+  if (!userId || !event) return null;
+
+  const clubId =
+    event.createdBy ||
+    event.clubId ||
+    event.club ||
+    null;
+
+  if (!clubId) return null;
+
+  const progress = await UserClubPromotionProgress.findOne({
+    user: userId,
+    club: clubId,
+  }).lean();
+
+  if (!progress) return null;
+
+  const currentLevelNumber = Number(progress.currentLevel || 1);
+  const levels = Array.isArray(progress.levels) ? progress.levels : [];
+  const currentLevel = levels.find(
+    (level) => Number(level?.levelNumber) === currentLevelNumber
+  );
+
+  if (!currentLevel) return null;
+
+  const missions = Array.isArray(currentLevel.missions) ? currentLevel.missions : [];
+  const mission = missions.find((m) => {
+    if (!m) return false;
+    return isPhotoMissionType(m.type) && isActivePhotoMissionStatus(m.status);
+  });
+
+  if (!mission) return null;
+
+  return {
+    missionKey: mission.missionKey || null,
+    missionId: mission.missionKey || null,
+    type: mission.type || null,
+    title: mission.title || "",
+    levelNumber: currentLevel.levelNumber ?? currentLevelNumber,
+    status: mission.status || null,
+    requiresApproval: mission.requiresApproval !== false,
+  };
 }
 
 async function syncPromotionAfterAttend({ userId, clubId, eventId, attendedNow }) {
@@ -874,7 +952,7 @@ async function attendeesHandler(req, res, forceFull = false) {
    - El QR del evento abre la cámara dentro de la app
    - La app resuelve el token y sube la foto al evento correcto
 ------------------------------------------------------------------- */
-router.post("/scan/resolve", async (req, res) => {
+router.post("/scan/resolve", anyAuth, ensureUserId, async (req, res) => {
   try {
     const parsed = parseQrPayloadValue(
       req.body?.qrPayload || req.body?.payload || req.body?.qr || req.body?.token
@@ -894,14 +972,19 @@ router.post("/scan/resolve", async (req, res) => {
       return res.status(404).json({ message: "Evento no encontrado para este QR" });
     }
 
-    return res.json(buildQrResolveResponse(req, event));
+    const activePhotoMission = await resolveActivePhotoMissionForUser({
+      userId: req.user.id,
+      event,
+    });
+
+    return res.json(buildQrResolveResponse(req, event, activePhotoMission));
   } catch (e) {
     console.error("[POST /events/scan/resolve] error:", e);
     return res.status(500).json({ message: "Error resolviendo QR" });
   }
 });
 
-router.get("/scan/:token/resolve", async (req, res) => {
+router.get("/scan/:token/resolve", anyAuth, ensureUserId, async (req, res) => {
   try {
     const parsed = parseQrPayloadValue(req.params.token);
 
@@ -919,7 +1002,12 @@ router.get("/scan/:token/resolve", async (req, res) => {
       return res.status(404).json({ message: "Evento no encontrado para este QR" });
     }
 
-    return res.json(buildQrResolveResponse(req, event));
+    const activePhotoMission = await resolveActivePhotoMissionForUser({
+      userId: req.user.id,
+      event,
+    });
+
+    return res.json(buildQrResolveResponse(req, event, activePhotoMission));
   } catch (e) {
     console.error("[GET /events/scan/:token/resolve] error:", e);
     return res.status(500).json({ message: "Error resolviendo QR" });
