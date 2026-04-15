@@ -869,7 +869,7 @@ async function attendeesHandler(req, res, forceFull = false) {
    - El QR del evento abre la cámara dentro de la app
    - La app resuelve el token y sube la foto al evento correcto
 ------------------------------------------------------------------- */
-router.post("/scan/resolve", anyAuth, ensureUserId, async (req, res) => {
+router.post("/scan/resolve", async (req, res) => {
   try {
     const parsed = parseQrPayloadValue(
       req.body?.qrPayload || req.body?.payload || req.body?.qr || req.body?.token
@@ -896,7 +896,7 @@ router.post("/scan/resolve", anyAuth, ensureUserId, async (req, res) => {
   }
 });
 
-router.get("/scan/:token/resolve", anyAuth, ensureUserId, async (req, res) => {
+router.get("/scan/:token/resolve", async (req, res) => {
   try {
     const parsed = parseQrPayloadValue(req.params.token);
 
