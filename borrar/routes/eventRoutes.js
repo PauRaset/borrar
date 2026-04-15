@@ -1,1198 +1,1626 @@
+// routes/eventRoutes.js
+const express = require("express");
+const multer = require("multer");
+const path = require("path");
+const sharp = require("sharp");
+const fs = require("fs");
+const mongoose = require("mongoose");
 
+const router = express.Router();
 
-'use client';
+const Event = require("../models/Event");
+const User = require("../models/User");
+const PromotionLevelTemplate = require("../models/PromotionLevelTemplate");
+const UserClubPromotionProgress = require("../models/UserClubPromotionProgress");
 
-import { useEffect, useMemo, useState } from 'react';
-import RequireClub from '@/components/RequireClub';
+// Tu middleware JWT actual (export default)
+const authenticateToken = require("../middlewares/authMiddleware");
 
-const API_BASE = 'https://api.nightvibe.life';
+// Inicializa firebase-admin (y permite usar admin directamente)
+require("../middlewares/firebaseAdmin");
+const admin = require("firebase-admin");
 
-const CONTENT_MISSION_OPTIONS = [
-  {
-    type: 'approved_event_photo',
-    label: 'Foto aprobada del evento',
-    description: 'La foto es válida como contenido general aprobado del evento.',
-  },
-  {
-    type: 'theme_photo',
-    label: 'Foto temática',
-    description: 'La foto cumple una temática concreta del evento o de la sala.',
-  },
-  {
-    type: 'photocall_photo',
-    label: 'Foto en photocall',
-    description: 'La foto ha sido tomada en el photocall o punto visual definido.',
-  },
-  {
-    type: 'group_photo_with_followed',
-    label: 'Foto de grupo válida',
-    description: 'La foto muestra el contenido grupal requerido por la misión.',
-  },
-  {
-    type: 'show_prizes_photo',
-    label: 'Foto mostrando premio',
-    description: 'La foto demuestra correctamente la misión relacionada con premios.',
-  },
-];
+/* -------------------------------------------------------------
+   Helpers
+------------------------------------------------------------- */
+function extractIdToken(req) {
+  const h = req.headers || {};
+  const auth = h.authorization || h.Authorization || "";
 
-function getMissionMeta(type) {
+  if (auth.startsWith("Bearer ")) return auth.slice(7).trim();
+  if (auth.startsWith("Firebase ")) return auth.slice(8).trim();
+
   return (
-    CONTENT_MISSION_OPTIONS.find((item) => item.type === type) ||
-    CONTENT_MISSION_OPTIONS[0]
+    h["x-firebase-id-token"] ||
+    h["firebase-id-token"] ||
+    h["firebase_token"] ||
+    h["idtoken"] ||
+    (req.body && (req.body.firebaseIdToken || req.body.idToken)) ||
+    null
   );
 }
 
-function missionDisplayLabel(photo) {
-  if (photo?.missionTitle && String(photo.missionTitle).trim()) {
-    return String(photo.missionTitle).trim();
+function backendBase(req) {
+  return process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
+}
+
+/**
+ * Devuelve URL absoluta para cualquier path/URL de /uploads.
+ * - Si ya es http(s) y contiene /uploads/, lo re-mapea al dominio actual.
+ * - Si ya es http(s) y no es de /uploads, lo deja tal cual.
+ * - Si es relativo (p.ej. "uploads/..." o "/uploads/..."), lo normaliza.
+ */
+function absUrlFromUpload(req, p) {
+  if (!p) return null;
+  const base = backendBase(req);
+  if (typeof p !== "string") p = String(p);
+
+  if (p.startsWith("http")) {
+    const idx = p.indexOf("/uploads/");
+    if (idx !== -1) return `${base}${p.substring(idx)}`;
+    return p; // URL externa ajena a /uploads
   }
-  return getMissionMeta(photo?.missionType || 'approved_event_photo')?.label || 'Foto aprobada del evento';
+  const clean = p.startsWith("/") ? p : `/${p}`;
+  return `${base}${clean}`;
 }
 
-function validatedMissionDisplayLabel(photo) {
-  if (photo?.validatedForMissionTitle && String(photo.validatedForMissionTitle).trim()) {
-    return String(photo.validatedForMissionTitle).trim();
+function joinUrl(base, rel) {
+  if (!base) return rel || null;
+  if (!rel) return null;
+  const b = base.replace(/\/+$/, "");
+  const r = rel.replace(/^\/+/, "");
+  return `${b}/${r}`;
+}
+
+function buildEventPhotoAccessUrl(req, eventId, photoId) {
+  return joinUrl(backendBase(req), `/api/events/${eventId}/photos/${photoId}/file`);
+}
+
+function rawPhotoValue(entry) {
+  if (!entry) return "";
+  if (typeof entry === "string") return entry;
+  return entry.url || entry.path || entry.href || entry.secure_url || entry.photo || entry.image || "";
+}
+
+function parseLevelNumberMaybe(v) {
+  if (v === undefined || v === null || v === "") return null;
+  const n = Number(v);
+  return Number.isNaN(n) ? null : n;
+}
+
+function extractPhotoMissionMeta(body = {}) {
+  return {
+    missionType: (body.missionType || body.photoMissionType || body.targetMissionType || "").toString().trim() || null,
+    missionId: (body.missionId || body.photoMissionId || body.targetMissionId || "").toString().trim() || null,
+    missionTitle: (body.missionTitle || body.photoMissionTitle || body.targetMissionTitle || "").toString().trim() || null,
+    levelNumber: parseLevelNumberMaybe(body.levelNumber || body.photoLevelNumber || body.targetLevelNumber),
+  };
+}
+
+function extractPhotoValidationMeta(body = {}) {
+  return {
+    validatedForMissionType: (body.validatedForMissionType || body.missionType || "").toString().trim() || null,
+    validatedForMissionId: (body.validatedForMissionId || body.missionId || "").toString().trim() || null,
+    validatedForMissionTitle: (body.validatedForMissionTitle || body.missionTitle || "").toString().trim() || null,
+    validatedForLevelNumber: parseLevelNumberMaybe(
+      body.validatedForLevelNumber || body.levelNumber
+    ),
+    validationResult: (body.validationResult || "").toString().trim() || null,
+  };
+}
+
+/* Utils de ficheros */
+const ROOT_UPLOADS_DIR = path.join(__dirname, "..", "uploads");
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+/* -------------------------------------------------------------
+   Normalizadores de payload
+------------------------------------------------------------- */
+function parseDateMaybe(v) {
+  if (!v) return undefined;
+  if (v instanceof Date) return v;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? undefined : d;
+}
+
+function parseNumberMaybe(v) {
+  if (v === undefined || v === null || v === "") return undefined;
+  const n = Number(v);
+  return Number.isNaN(n) ? undefined : n;
+}
+
+function parseCategoriesMaybe(value) {
+  if (Array.isArray(value)) return value.map(String);
+  if (typeof value === "string") {
+    // Soporta JSON string o "a,b,c"
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed.map(String);
+    } catch (_) {
+      return value
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map(String);
+    }
   }
-  return getMissionMeta(photo?.validatedForMissionType || photo?.missionType || 'approved_event_photo')?.label || 'Foto aprobada del evento';
+  return [];
 }
 
-function getAuthHeaders() {
-  if (typeof window === 'undefined') return {};
-  const token =
-    localStorage.getItem('token') ||
-    localStorage.getItem('nv_token') ||
-    localStorage.getItem('authToken') ||
-    '';
-  return token ? { Authorization: `Bearer ${token}` } : {};
+/* ------------------------------------------------------------------
+   AUTH BRIDGE
+------------------------------------------------------------------- */
+
+// decide en tiempo real si verificar Firebase o JWT
+async function anyAuth(req, res, next) {
+  const token = extractIdToken(req);
+  if (!token) {
+    // no hubo token Firebase -> probamos tu JWT clásico
+    return authenticateToken(req, res, next);
+  }
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.firebaseUser = {
+      uid: decoded.uid,
+      phone: decoded.phone_number || decoded.phoneNumber || null,
+    };
+    return next();
+  } catch (_) {
+    // No era (o no válido) como Firebase -> usar tu JWT clásico
+    return authenticateToken(req, res, next);
+  }
 }
 
-async function apiJson(url, opts = {}) {
-  const res = await fetch(url, {
-    ...opts,
-    headers: {
-      ...(opts.headers || {}),
-      ...getAuthHeaders(),
-      ...(opts.body ? { 'Content-Type': 'application/json' } : {}),
-    },
-    credentials: 'include',
-    cache: 'no-store',
+// a partir de lo que haya puesto anyAuth, garantizamos req.user.id
+async function ensureUserId(req, res, next) {
+  if (req.user && req.user.id) return next(); // ya viene de tu JWT
+
+  if (req.firebaseUser && req.firebaseUser.uid) {
+    try {
+      const user = await User.findOrCreateFromFirebase({
+        uid: req.firebaseUser.uid,
+        phoneNumber: req.firebaseUser.phone,
+      });
+
+      req.user = { id: user._id.toString() };
+      return next();
+    } catch (err) {
+      console.error("[ensureUserId] fallo resolviendo usuario desde Firebase:", err);
+      return res.status(401).json({ message: "No autorizado" });
+    }
+  }
+
+  // No hubo ni JWT ni Firebase
+  return res.status(401).json({ message: "Usuario no autenticado" });
+}
+
+/* ------------------------------------------------------------------
+   PROMOTIONS BRIDGE (auto-progress levels)
+------------------------------------------------------------------- */
+
+async function getGlobalPromotionTemplates() {
+  const templates = await PromotionLevelTemplate.find({ scope: "global", active: true })
+    .sort({ levelNumber: 1 })
+    .lean();
+  return templates || [];
+}
+
+function computeLevelProgress(level) {
+  const missions = Array.isArray(level?.missions) ? level.missions : [];
+  if (!missions.length) return 0;
+  const ratios = missions.map((m) => {
+    const target = Number(m.target || 1);
+    const cur = Number(m.current || 0);
+    if (!target || target <= 0) return 0;
+    return Math.max(0, Math.min(1, cur / target));
+  });
+  return Math.max(0, Math.min(1, ratios.reduce((a, b) => a + b, 0) / ratios.length));
+}
+
+function allMissionsCompleted(level) {
+  const missions = Array.isArray(level?.missions) ? level.missions : [];
+  if (!missions.length) return false;
+  return missions.every((m) => m.status === "completed");
+}
+
+function unlockNextLevel(progress, completedLevelNumber) {
+  const nextLevelNumber = Number(completedLevelNumber) + 1;
+  const next = (progress.levels || []).find((l) => Number(l.levelNumber) === nextLevelNumber);
+  if (!next) return;
+
+  if (next.status === "locked") {
+    next.status = "in_progress";
+    for (const m of next.missions || []) {
+      if (m.status === "locked") m.status = "in_progress";
+      if (!m.startedAt) m.startedAt = new Date();
+      m.updatedAt = new Date();
+    }
+  }
+
+  progress.currentLevel = nextLevelNumber;
+  progress.currentRewardTitle = next.reward?.title || "";
+}
+
+function refreshCurrentSnapshot(progress) {
+  const cur = (progress.levels || []).find((l) => Number(l.levelNumber) === Number(progress.currentLevel));
+  if (!cur) {
+    progress.currentProgress = 0;
+    return;
+  }
+  cur.progress = computeLevelProgress(cur);
+  progress.currentProgress = cur.progress;
+  progress.currentRewardTitle = cur.reward?.title || "";
+}
+
+function clampNonNegative(n) {
+  const x = Number(n || 0);
+  return x < 0 ? 0 : x;
+}
+
+function updateAttendMissionsForLevel(level, counters) {
+  for (const m of level.missions || []) {
+    if (m.type !== "attend_event") continue;
+
+    const platformWide = !!(m.params && m.params.platformWide) || !!(m.meta && m.meta.platformWide);
+    const count = platformWide ? Number(counters.attendancesPlatform || 0) : Number(counters.attendancesInClub || 0);
+
+    m.current = Math.min(count, Number(m.target || 1));
+
+    if (level.status === "locked") continue;
+
+    if (m.current >= Number(m.target || 1)) {
+      m.status = "completed";
+      m.completedAt = m.completedAt || new Date();
+    } else {
+      if (m.status !== "pending") m.status = "in_progress";
+      m.completedAt = null;
+    }
+
+    m.updatedAt = new Date();
+  }
+}
+
+function updatePhotoMissionsForLevel(level, eventId, counters) {
+  for (const m of level.missions || []) {
+    if (m.type !== "upload_event_photo") continue;
+
+    const perEvent = !!(m.params && m.params.perEvent) || !!(m.meta && m.meta.perEvent);
+
+    if (perEvent) {
+      const list = Array.isArray(m.meta?.eventIds) ? m.meta.eventIds : [];
+      const set = new Set(list.map(String));
+      if (eventId) set.add(String(eventId));
+      const updated = Array.from(set);
+      m.meta = { ...(m.meta || {}), eventIds: updated, perEvent: true };
+      m.current = Math.min(updated.length, Number(m.target || 1));
+    } else {
+      const count = Number(counters.photosUploadedInClub || 0);
+      m.current = Math.min(count, Number(m.target || 1));
+    }
+
+    if (level.status === "locked") continue;
+
+    if (m.current >= Number(m.target || 1)) {
+      m.status = "completed";
+      m.completedAt = m.completedAt || new Date();
+    } else {
+      if (m.status !== "pending") m.status = "in_progress";
+      m.completedAt = null;
+    }
+
+    m.updatedAt = new Date();
+  }
+}
+
+async function ensurePromotionProgressDoc({ userId, clubId }) {
+  let progress = await UserClubPromotionProgress.findOne({ user: userId, club: clubId });
+  if (progress) return progress;
+
+  const templates = await getGlobalPromotionTemplates();
+  if (!templates.length) return null;
+
+  const built = UserClubPromotionProgress.buildFromTemplates({ templates, startLevel: 1 });
+  progress = await UserClubPromotionProgress.create({
+    user: userId,
+    club: clubId,
+    ...built,
   });
 
-  const text = await res.text().catch(() => '');
-  let data = null;
+  return progress;
+}
+
+async function syncPromotionAfterAttend({ userId, clubId, eventId, attendedNow }) {
   try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = text;
-  }
+    const progress = await ensurePromotionProgressDoc({ userId, clubId });
+    if (!progress) return;
 
-  if (!res.ok) {
-    const message =
-      (data && data.message) ||
-      (typeof data === 'string' && data) ||
-      `Error (HTTP ${res.status})`;
-    const err = new Error(message);
-    err.status = res.status;
-    err.data = data;
-    throw err;
-  }
+    progress.counters = progress.counters || {};
+    const delta = attendedNow ? 1 : -1;
 
-  return data;
-}
+    progress.counters.attendancesInClub = clampNonNegative((progress.counters.attendancesInClub || 0) + delta);
+    progress.counters.attendancesPlatform = clampNonNegative((progress.counters.attendancesPlatform || 0) + delta);
 
-function toAbsoluteMediaUrl(input) {
-  if (!input) return '';
-  const value = String(input).trim();
-  if (!value) return '';
+    for (const lvl of progress.levels || []) {
+      updateAttendMissionsForLevel(lvl, progress.counters);
+      lvl.progress = computeLevelProgress(lvl);
+    }
 
-  if (/^https?:\/\//i.test(value)) {
-    try {
-      const url = new URL(value);
-      const path = `${url.pathname || ''}${url.search || ''}${url.hash || ''}`;
-      if (path.startsWith('/uploads/')) {
-        return `${API_BASE}${path}`;
+    let guard = 0;
+    while (guard++ < 15) {
+      const cur = (progress.levels || []).find((l) => Number(l.levelNumber) === Number(progress.currentLevel));
+      if (!cur) break;
+
+      cur.progress = computeLevelProgress(cur);
+      if (cur.status !== "completed" && allMissionsCompleted(cur)) {
+        cur.status = "completed";
+        cur.completedAt = new Date();
+        unlockNextLevel(progress, cur.levelNumber);
+        continue;
       }
-      return value;
-    } catch {
-      return value;
+      break;
     }
-  }
 
-  return `${API_BASE}${value.startsWith('/') ? value : `/${value}`}`;
+    refreshCurrentSnapshot(progress);
+    progress.lastEventId = eventId || progress.lastEventId;
+    progress.lastActivityAt = new Date();
+    await progress.save();
+  } catch (e) {
+    console.warn("[promotions] syncPromotionAfterAttend failed:", e?.message || e);
+  }
 }
 
-function buildPhotoCandidates(photo) {
-  const rawValues = [
-    photo?.url,
-    photo?.image,
-    photo?.path,
-    photo?.photoUrl,
-    photo?.src,
-    photo?.filename,
-    photo?.fileName,
-    photo?.rawUrl,
-  ].filter(Boolean);
+async function syncPromotionAfterPhotoApproved({ userId, clubId, eventId }) {
+  try {
+    const progress = await ensurePromotionProgressDoc({ userId, clubId });
+    if (!progress) return;
 
-  const expanded = [];
+    progress.counters = progress.counters || {};
+    progress.counters.photosUploadedInClub = clampNonNegative((progress.counters.photosUploadedInClub || 0) + 1);
 
-  for (const raw of rawValues) {
-    const value = String(raw).trim();
-    if (!value) continue;
-
-    expanded.push(value);
-    expanded.push(toAbsoluteMediaUrl(value));
-
-    const filename = value.split('/').filter(Boolean).pop() || value;
-    const clean = value.replace(/^\/+/, '');
-
-    if (!/^https?:\/\//i.test(value)) {
-      expanded.push(`${API_BASE}/${clean}`);
-      expanded.push(`${API_BASE}/uploads/${clean}`);
-      expanded.push(`${API_BASE}/uploads/event-photos/${clean}`);
-      expanded.push(`${API_BASE}/uploads/eventPhotos/${clean}`);
-      expanded.push(`${API_BASE}/uploads/events/${clean}`);
-      expanded.push(`${API_BASE}/uploads/${value}`);
-      expanded.push(`${API_BASE}/uploads/event-photos/${filename}`);
-      expanded.push(`${API_BASE}/uploads/eventPhotos/${filename}`);
-      expanded.push(`${API_BASE}/uploads/events/${filename}`);
-    } else {
-      try {
-        const url = new URL(value);
-        const path = url.pathname || '';
-        const remoteFilename = path.split('/').filter(Boolean).pop() || filename;
-        if (path.startsWith('/uploads/')) {
-          expanded.push(`${API_BASE}${path}`);
-        }
-        expanded.push(`${API_BASE}/uploads/event-photos/${remoteFilename}`);
-        expanded.push(`${API_BASE}/uploads/eventPhotos/${remoteFilename}`);
-        expanded.push(`${API_BASE}/uploads/events/${remoteFilename}`);
-      } catch {}
+    for (const lvl of progress.levels || []) {
+      updatePhotoMissionsForLevel(lvl, eventId, progress.counters);
+      lvl.progress = computeLevelProgress(lvl);
     }
-  }
 
-  return Array.from(new Set(expanded.filter(Boolean)));
+    let guard = 0;
+    while (guard++ < 15) {
+      const cur = (progress.levels || []).find((l) => Number(l.levelNumber) === Number(progress.currentLevel));
+      if (!cur) break;
+
+      cur.progress = computeLevelProgress(cur);
+      if (cur.status !== "completed" && allMissionsCompleted(cur)) {
+        cur.status = "completed";
+        cur.completedAt = new Date();
+        unlockNextLevel(progress, cur.levelNumber);
+        continue;
+      }
+      break;
+    }
+
+    refreshCurrentSnapshot(progress);
+    progress.lastEventId = eventId || progress.lastEventId;
+    progress.lastActivityAt = new Date();
+    await progress.save();
+  } catch (e) {
+    console.warn("[promotions] syncPromotionAfterPhotoApproved failed:", e?.message || e);
+  }
 }
 
-function statusStyles(status) {
-  if (status === 'approved') {
+/* ------------------------------------------------------------------
+   Configuración de multer
+------------------------------------------------------------------- */
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    ensureDir(ROOT_UPLOADS_DIR);
+    cb(null, ROOT_UPLOADS_DIR);
+  },
+  filename: (req, file, cb) => cb(null, Date.now() + "_" + file.originalname),
+});
+const upload = multer({ storage });
+// Para aceptar múltiples campos/arrays con nombres distintos:
+const uploadAny = multer({ storage });
+
+/* Proceso de imagen (resize → .jpg) */
+async function processImageToJpg(srcPath, outDir, baseName) {
+  ensureDir(outDir);
+  const outPath = path.join(outDir, `${baseName}.jpg`);
+  try {
+    await sharp(srcPath)
+      .rotate()
+      .resize(1600, 1600, { fit: "inside", withoutEnlargement: true })
+      .jpeg({ quality: 82 })
+      .toFile(outPath);
+    return outPath;
+  } catch (e) {
+    // fallback: copia tal cual si sharp falla (p.ej., formato raro)
+    const fallback = path.join(outDir, `${baseName}${path.extname(srcPath) || ""}`);
+    fs.copyFileSync(srcPath, fallback);
+    return fallback;
+  } finally {
+    try { fs.unlinkSync(srcPath); } catch {}
+  }
+}
+
+/* -------------------------------------------------------------
+   Helpers de normalización de fotos con metadatos
+------------------------------------------------------------- */
+function usernameFromUserDoc(u) {
+  if (!u) return null;
+  return (
+    u.username ||
+    (u.phoneNumber ? u.phoneNumber.replace("+", "") : null) ||
+    null
+  );
+}
+
+function toPhotoTileAbs(req, entry) {
+  // Acepta string o objeto y devuelve objeto { url, byUsername?, uploadedAt? } con URL absoluta
+  if (!entry) return null;
+
+  if (typeof entry === "string") {
+    return { url: absUrlFromUpload(req, entry) };
+  }
+  if (typeof entry === "object") {
+    const url =
+      absUrlFromUpload(req, entry.url || entry.path || entry.href || entry.secure_url || entry.photo || entry.image);
+    const byUsername =
+      entry.byUsername ||
+      (entry.byUser && entry.byUser.username) ||
+      (entry.user && entry.user.username) ||
+      entry.username ||
+      null;
+
     return {
-      background: 'rgba(34,197,94,0.12)',
-      border: '1px solid rgba(34,197,94,0.24)',
-      color: '#86efac',
+      url,
+      ...(byUsername ? { byUsername } : {}),
+      ...(entry.uploadedAt ? { uploadedAt: entry.uploadedAt } : {}),
     };
   }
-  if (status === 'rejected') {
-    return {
-      background: 'rgba(244,63,94,0.10)',
-      border: '1px solid rgba(244,63,94,0.22)',
-      color: '#fda4af',
-    };
+  return null;
+}
+
+function isApprovedPhotoEntry(p) {
+  if (!p) return false;
+  if (typeof p === "string") return true; // legacy
+  if (typeof p === "object") {
+    const st = String(p.status || "approved");
+    return st === "approved";
   }
+  return false;
+}
+
+function approvedOnly(list) {
+  return Array.isArray(list) ? list.filter(isApprovedPhotoEntry) : [];
+}
+
+/* -------------------------------------------------------------
+   Normalizador público de usuario (para asistentes)
+------------------------------------------------------------- */
+function shapePublicUser(req, u) {
+  if (!u) return null;
+  const username =
+    u.username ||
+    (u.phoneNumber ? String(u.phoneNumber).replace("+", "") : "") ||
+    "";
+  const displayName = u.displayName || u.name || "";
+  const profilePicture = u.profilePicture || null; // relativo (frontend lo sabe resolver)
   return {
-    background: 'rgba(250,204,21,0.10)',
-    border: '1px solid rgba(250,204,21,0.20)',
-    color: '#fde68a',
+    _id: u._id,
+    id: String(u._id || ""),
+    username,
+    displayName,
+    profilePicture,                             // 👈 clave que busca el front
+    avatarUrl: absUrlFromUpload(req, profilePicture), // comodidad
   };
 }
 
-function SmartPhoto({ photo, alt, style }) {
-  const candidates = useMemo(() => buildPhotoCandidates(photo), [photo]);
-  const [index, setIndex] = useState(0);
+/* ------------------------------------------------------------------
+   CREAR EVENTO  (requiere usuario)
+------------------------------------------------------------------- */
+router.post("/", anyAuth, ensureUserId, upload.single("image"), async (req, res) => {
+  try {
+    const {
+      title,
+      description,
+      // fechas (compat: si solo viene "date", la usamos como startAt)
+      startAt: startAtRaw,
+      endAt: endAtRaw,
+      date: legacyDate,
 
-  useEffect(() => {
-    setIndex(0);
-  }, [candidates]);
+      // ubicación
+      city,
+      street,
+      postalCode,
 
-  const currentSrc = candidates[index] || '';
+      // extras
+      categories, // puede venir string o array
+      age,
+      dressCode,
+      price,
+    } = req.body;
 
-  if (!candidates.length) {
-    return (
-      <div
-        style={{
-          width: '100%',
-          height: '100%',
-          display: 'grid',
-          placeItems: 'center',
-          color: '#94a3b8',
-          fontSize: 13,
-          textAlign: 'center',
-          padding: 12,
-        }}
-      >
-        Imagen no disponible
-      </div>
-    );
-  }
+    let image = null;
+    const userId = req.user.id;
 
-  return (
-    <img
-      src={currentSrc}
-      alt={alt}
-      style={style}
-      loading="lazy"
-      onError={() => {
-        if (index < candidates.length - 1) {
-          setIndex((prev) => prev + 1);
-        }
-      }}
-    />
-  );
-}
-
-export default function ContentPage() {
-  const [events, setEvents] = useState([]);
-  const [selectedEventId, setSelectedEventId] = useState('all');
-  const [statusFilter, setStatusFilter] = useState('pending');
-  const [photos, setPhotos] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [photosLoading, setPhotosLoading] = useState(false);
-  const [notice, setNotice] = useState('');
-  const [selectedPhoto, setSelectedPhoto] = useState(null);
-  const [reviewNote, setReviewNote] = useState('');
-  const [selectedMissionType, setSelectedMissionType] = useState('approved_event_photo');
-  const [selectedLevelNumber, setSelectedLevelNumber] = useState('');
-  const [actionBusy, setActionBusy] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadEvents() {
-      setLoading(true);
-      setNotice('');
-      try {
-        const data = await apiJson(`${API_BASE}/api/events/mine`);
-        if (!cancelled) {
-          setEvents(Array.isArray(data) ? data : []);
-        }
-      } catch (e) {
-        if (!cancelled) {
-          setEvents([]);
-          setNotice(e?.message || 'No se pudieron cargar los eventos del club.');
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    }
-
-    loadEvents();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadPhotos() {
-      if (loading) return;
-      if (!events.length) {
-        setPhotos([]);
-        return;
-      }
-
-      setPhotosLoading(true);
-      setNotice('');
-
-      try {
-        const targetEvents =
-          selectedEventId === 'all'
-            ? events
-            : events.filter((event) => (event._id || event.id) === selectedEventId);
-
-        const results = await Promise.all(
-          targetEvents.map(async (event) => {
-            const eventId = event._id || event.id;
-            if (!eventId) return [];
-            try {
-              const data = await apiJson(
-                `${API_BASE}/api/events/${eventId}/photos/moderation?status=${statusFilter}`
-              );
-              const list = Array.isArray(data?.photos) ? data.photos : [];
-              return list.map((photo) => ({
-                ...photo,
-                rawUrl: photo.url || photo.image || photo.path || photo.photoUrl || photo.src || photo.filename || photo.fileName || '',
-                eventId,
-                eventTitle: event.title || 'Evento sin título',
-                eventImage: toAbsoluteMediaUrl(event.imageUrl || event.image || event.heroImage || ''),
-              }));
-            } catch {
-              return [];
-            }
-          })
-        );
-
-        const merged = results.flat().sort((a, b) => {
-          const aTime = a?.uploadedAt ? new Date(a.uploadedAt).getTime() : 0;
-          const bTime = b?.uploadedAt ? new Date(b.uploadedAt).getTime() : 0;
-          return bTime - aTime;
-        });
-
-        if (!cancelled) {
-          setPhotos(merged);
-          if (selectedPhoto) {
-            const stillExists = merged.find((p) => p.photoId === selectedPhoto.photoId);
-            if (!stillExists) {
-              setSelectedPhoto(null);
-              setReviewNote('');
-              setSelectedMissionType('approved_event_photo');
-              setSelectedLevelNumber('');
-            }
-          }
-        }
-      } catch (e) {
-        if (!cancelled) {
-          setPhotos([]);
-          setNotice(e?.message || 'No se pudieron cargar las fotos.');
-        }
-      } finally {
-        if (!cancelled) setPhotosLoading(false);
-      }
-    }
-
-    loadPhotos();
-    return () => {
-      cancelled = true;
-    };
-  }, [loading, events, selectedEventId, statusFilter]);
-
-  const counts = useMemo(() => {
-    const pending = photos.filter((p) => p.status === 'pending').length;
-    const approved = photos.filter((p) => p.status === 'approved').length;
-    const rejected = photos.filter((p) => p.status === 'rejected').length;
-    return {
-      total: photos.length,
-      pending,
-      approved,
-      rejected,
-    };
-  }, [photos]);
-
-  const selectedEvent = useMemo(() => {
-    if (selectedEventId === 'all') return null;
-    return events.find((event) => (event._id || event.id) === selectedEventId) || null;
-  }, [events, selectedEventId]);
-
-  const selectedMissionMeta = useMemo(() => {
-    return getMissionMeta(selectedMissionType);
-  }, [selectedMissionType]);
-
-  const selectedTargetMissionMeta = useMemo(() => {
-    return getMissionMeta(selectedPhoto?.missionType || 'approved_event_photo');
-  }, [selectedPhoto]);
-
-  async function refreshCurrentPhotos() {
-    if (!events.length) return;
-    setPhotosLoading(true);
-    try {
-      const targetEvents =
-        selectedEventId === 'all'
-          ? events
-          : events.filter((event) => (event._id || event.id) === selectedEventId);
-
-      const results = await Promise.all(
-        targetEvents.map(async (event) => {
-          const eventId = event._id || event.id;
-          if (!eventId) return [];
-          try {
-            const data = await apiJson(
-              `${API_BASE}/api/events/${eventId}/photos/moderation?status=${statusFilter}`
-            );
-            const list = Array.isArray(data?.photos) ? data.photos : [];
-            return list.map((photo) => ({
-              ...photo,
-              rawUrl: photo.url || photo.image || photo.path || photo.photoUrl || photo.src || photo.filename || photo.fileName || '',
-              eventId,
-              eventTitle: event.title || 'Evento sin título',
-              eventImage: toAbsoluteMediaUrl(event.imageUrl || event.image || event.heroImage || ''),
-            }));
-          } catch {
-            return [];
-          }
-        })
+    if (req.file) {
+      const processedDir = ROOT_UPLOADS_DIR;
+      const processedImagePath = await processImageToJpg(
+        req.file.path,
+        processedDir,
+        `resized-${Date.now()}-${path.parse(req.file.originalname).name}`
       );
-
-      const merged = results.flat().sort((a, b) => {
-        const aTime = a?.uploadedAt ? new Date(a.uploadedAt).getTime() : 0;
-        const bTime = b?.uploadedAt ? new Date(b.uploadedAt).getTime() : 0;
-        return bTime - aTime;
-      });
-
-      setPhotos(merged);
-    } finally {
-      setPhotosLoading(false);
+      // Guardamos path relativo desde /uploads
+      image = path.relative(path.join(__dirname, ".."), processedImagePath).replace(/\\/g, "/");
     }
-  }
 
-  async function approvePhoto() {
-    if (!selectedPhoto?.eventId || !selectedPhoto?.photoId || actionBusy) return;
-    setActionBusy(true);
-    setNotice('Aprobando foto...');
-    try {
-      await apiJson(`${API_BASE}/api/events/${selectedPhoto.eventId}/photos/${selectedPhoto.photoId}/approve`, {
-        method: 'POST',
-        body: JSON.stringify({
-          reviewNote: reviewNote || '',
-          missionType: selectedPhoto?.missionType || selectedMissionType || 'approved_event_photo',
-          missionId: selectedPhoto?.missionId || null,
-          missionTitle: selectedPhoto?.missionTitle || missionDisplayLabel(selectedPhoto),
-          validatedForMissionType: selectedMissionType || selectedPhoto?.missionType || 'approved_event_photo',
-          validatedForMissionId: selectedPhoto?.missionId || null,
-          validatedForMissionTitle: selectedMissionMeta?.label || 'Foto aprobada del evento',
-          validatedForLevelNumber:
-            selectedLevelNumber.trim() !== '' && !Number.isNaN(Number(selectedLevelNumber))
-              ? Number(selectedLevelNumber)
-              : selectedPhoto?.levelNumber != null
-                ? Number(selectedPhoto.levelNumber)
-                : null,
-          validationResult: 'matched',
-        }),
-      });
-      setSelectedPhoto(null);
-      setReviewNote('');
-      setSelectedMissionType('approved_event_photo');
-      setSelectedLevelNumber('');
-      setNotice('Foto aprobada correctamente para la misión seleccionada.');
-      await refreshCurrentPhotos();
-    } catch (e) {
-      setNotice(e?.message || 'No se pudo aprobar la foto.');
-    } finally {
-      setActionBusy(false);
+    // Normalizar fechas
+    const startAt = parseDateMaybe(startAtRaw || legacyDate);
+    const endAt   = parseDateMaybe(endAtRaw);
+
+    // Normalizar categorías
+    const parsedCategories = parseCategoriesMaybe(categories);
+
+    // age/price a número (si vienen string)
+    const ageNum   = parseNumberMaybe(age);
+    const priceNum = parseNumberMaybe(price);
+
+    const newEvent = new Event({
+      title,
+      description,
+
+      // fechas
+      startAt,
+      endAt,
+      date: startAt || undefined, // compat con código legacy que mire "date"
+
+      // ubicación
+      city,
+      street,
+      postalCode,
+
+      // imagen principal
+      image,
+
+      // extras
+      categories: parsedCategories,
+      age: typeof ageNum === "number" ? ageNum : age,
+      dressCode,
+      price: typeof priceNum === "number" ? priceNum : price,
+
+      // Relación del evento con el usuario/club autenticado.
+      // Por ahora usamos el mismo userId como owner del panel club.
+      createdBy: userId,
+      clubId: userId,
+      club: userId,
+
+      // photos se inicializa por schema ([])
+    });
+
+    const savedEvent = await newEvent.save();
+    res.status(201).json(savedEvent);
+  } catch (error) {
+    console.error("Error al guardar el evento:", error);
+    res.status(500).json({ message: "Error al guardar el evento", error: error.message });
+  }
+});
+
+  /* ------------------------------------------------------------------
+    LISTAR SOLO EVENTOS DEL CLUB/AUTH ACTUAL (panel clubs)
+  ------------------------------------------------------------------- */
+
+router.get("/mine", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const docs = await Event.find({
+      $or: [
+        { createdBy: userId },
+        { clubId: userId },
+        { club: userId },
+      ],
+    })
+      .sort({ startAt: -1, date: -1, createdAt: -1 })
+      .populate("createdBy", "username email profilePicture displayName");
+
+    // Backfill de qrToken para eventos antiguos que no lo tengan todavía.
+    for (const doc of docs) {
+      if (!doc.qrToken) {
+        doc.qrToken = new mongoose.Types.ObjectId().toString();
+        await doc.save();
+      }
     }
-  }
 
-  async function rejectPhoto() {
-    if (!selectedPhoto?.eventId || !selectedPhoto?.photoId || actionBusy) return;
-    setActionBusy(true);
-    setNotice('Rechazando foto...');
-    try {
-      await apiJson(`${API_BASE}/api/events/${selectedPhoto.eventId}/photos/${selectedPhoto.photoId}/reject`, {
-        method: 'POST',
-        body: JSON.stringify({
-          reviewNote: reviewNote || '',
-          missionType: selectedPhoto?.missionType || selectedMissionType || 'approved_event_photo',
-          missionId: selectedPhoto?.missionId || null,
-          missionTitle: selectedPhoto?.missionTitle || missionDisplayLabel(selectedPhoto),
-          validatedForMissionType: selectedMissionType || selectedPhoto?.missionType || 'approved_event_photo',
-          validatedForMissionId: selectedPhoto?.missionId || null,
-          validatedForMissionTitle: selectedMissionMeta?.label || 'Foto aprobada del evento',
-          validatedForLevelNumber:
-            selectedLevelNumber.trim() !== '' && !Number.isNaN(Number(selectedLevelNumber))
-              ? Number(selectedLevelNumber)
-              : selectedPhoto?.levelNumber != null
-                ? Number(selectedPhoto.levelNumber)
-                : null,
-          validationResult: 'not_matched',
-        }),
-      });
-      setSelectedPhoto(null);
-      setReviewNote('');
-      setSelectedMissionType('approved_event_photo');
-      setSelectedLevelNumber('');
-      setNotice('Foto rechazada correctamente para la misión revisada.');
-      await refreshCurrentPhotos();
-    } catch (e) {
-      setNotice(e?.message || 'No se pudo rechazar la foto.');
-    } finally {
-      setActionBusy(false);
+    const events = docs.map((doc) => doc.toObject());
+
+    const formattedEvents = events.map((event) => {
+      const photos = approvedOnly(event.photos)
+        .map((p) => toPhotoTileAbs(req, p))
+        .filter(Boolean);
+
+      return {
+        ...event,
+        imageUrl: absUrlFromUpload(req, event.image),
+        photos,
+        createdBy: event.createdBy
+          ? {
+              ...event.createdBy,
+              profilePictureUrl: absUrlFromUpload(req, event.createdBy.profilePicture),
+            }
+          : null,
+        categories: Array.isArray(event.categories)
+          ? event.categories
+          : parseCategoriesMaybe(event.categories),
+      };
+    });
+
+    return res.json(formattedEvents);
+  } catch (error) {
+    console.error("[GET /events/mine] Error al obtener eventos del club:", error);
+    return res.status(500).json({
+      message: "Error al obtener los eventos del club",
+      error: error.message || String(error),
+    });
+  }
+});
+
+/* ------------------------------------------------------------------
+   LISTAR EVENTOS (público)
+------------------------------------------------------------------- */
+router.get("/", async (req, res) => {
+  try {
+    const events = await Event.find().populate("createdBy", "username email profilePicture displayName").lean();
+
+    const formattedEvents = events.map((event) => {
+      // normaliza fotos a objetos con url absoluta (manteniendo compatibilidad)
+      const photos = approvedOnly(event.photos)
+        .map((p) => toPhotoTileAbs(req, p))
+        .filter(Boolean);
+
+      return {
+        ...event,
+        imageUrl: absUrlFromUpload(req, event.image),
+        photos,
+        createdBy: event.createdBy
+          ? {
+              ...event.createdBy,
+              profilePictureUrl: absUrlFromUpload(req, event.createdBy.profilePicture),
+            }
+          : null,
+        categories: Array.isArray(event.categories)
+          ? event.categories
+          : parseCategoriesMaybe(event.categories),
+      };
+    });
+
+    res.json(formattedEvents);
+  } catch (error) {
+    console.error("Error al obtener los eventos:", error);
+    res.status(500).json({ message: "Error al obtener los eventos", error });
+  }
+});
+
+/* ------------------------------------------------------------------
+   BUSCAR EVENTOS (público)
+   GET /api/events/search?q=...
+   ⚠️ IMPORTANTE: esta ruta debe ir ANTES que cualquier /:id
+------------------------------------------------------------------- */
+router.get("/search", async (req, res) => {
+  try {
+    const qRaw = (req.query.q || req.query.query || req.query.search || "").toString();
+    const q = qRaw.trim();
+
+    if (!q) {
+      return res.json([]);
     }
-  }
 
-  async function deletePhoto() {
-    if (!selectedPhoto?.eventId || !selectedPhoto?.photoId || actionBusy) return;
-    if (!confirm('¿Eliminar esta foto definitivamente?')) return;
-    setActionBusy(true);
-    setNotice('Eliminando foto...');
-    try {
-      await apiJson(`${API_BASE}/api/events/${selectedPhoto.eventId}/photos/${selectedPhoto.photoId}`, {
-        method: 'DELETE',
-      });
-      setSelectedPhoto(null);
-      setReviewNote('');
-      setSelectedMissionType('approved_event_photo');
-      setSelectedLevelNumber('');
-      setNotice('Foto eliminada correctamente.');
-      await refreshCurrentPhotos();
-    } catch (e) {
-      setNotice(e?.message || 'No se pudo eliminar la foto.');
-    } finally {
-      setActionBusy(false);
+    // Escapar regex para evitar caracteres especiales.
+    const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const rx = new RegExp(escapeRegExp(q), "i");
+
+    // Busca por campos comunes.
+    // (Si quieres afinar luego: categorías, clubName/entityName, etc.)
+    const filter = {
+      $or: [
+        { title: rx },
+        { description: rx },
+        { city: rx },
+        { street: rx },
+        { postalCode: rx },
+        { categories: rx }, // categories suele ser array; Mongoose soporta regex sobre arrays de strings
+      ],
+    };
+
+    const events = await Event.find(filter)
+      .sort({ startAt: 1, date: 1, createdAt: -1 })
+      .limit(40)
+      .populate("createdBy", "username email profilePicture displayName")
+      .lean();
+
+    const formattedEvents = events.map((event) => {
+      const photos = approvedOnly(event.photos)
+        .map((p) => toPhotoTileAbs(req, p))
+        .filter(Boolean);
+
+      return {
+        ...event,
+        imageUrl: absUrlFromUpload(req, event.image),
+        photos,
+        createdBy: event.createdBy
+          ? {
+              ...event.createdBy,
+              profilePictureUrl: absUrlFromUpload(req, event.createdBy.profilePicture),
+            }
+          : null,
+        categories: Array.isArray(event.categories)
+          ? event.categories
+          : parseCategoriesMaybe(event.categories),
+      };
+    });
+
+    return res.json(formattedEvents);
+  } catch (error) {
+    console.error("[GET /events/search] Error al buscar eventos:", error);
+    return res.status(500).json({
+      message: "Error al buscar eventos",
+      error: error.message || String(error),
+    });
+  }
+});
+
+/* ------------------------------------------------------------------
+   Devuelve asistentes
+   - ?full=1 -> lista plana de usuarios (frontend la admite)
+   - sin ?full -> { attendees: [...] } (compat)
+   - alias: /:id/attendees/populated -> fuerza full
+------------------------------------------------------------------- */
+async function attendeesHandler(req, res, forceFull = false) {
+  try {
+    const id = req.params.id;
+    const full = forceFull || req.query.full === "1" || req.query.full === "true";
+
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
     }
+
+    const event = await Event.findById(id)
+      .populate("attendees", "username displayName profilePicture phoneNumber")
+      .lean();
+
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    const list = (event.attendees || []).map((u) => shapePublicUser(req, u)).filter(Boolean);
+
+
+    if (full) {
+      // lista directa (frontend lo soporta)
+      return res.json(list);
+    }
+    // compat: objeto con clave attendees
+    return res.json({ attendees: list });
+  } catch (err) {
+    console.error("[GET /events/:id/attendees] error:", err);
+    res.status(500).json({ message: "Error obteniendo asistentes" });
   }
-
-  const pageStyle = {
-    padding: '28px 24px 44px',
-    color: '#e5e7eb',
-    background: 'radial-gradient(circle at top, rgba(0,229,255,0.08), transparent 0 24%), #0b0f19',
-    minHeight: '100vh',
-  };
-
-  const shellStyle = {
-    width: '100%',
-    maxWidth: 1280,
-    margin: '0 auto',
-    display: 'grid',
-    gap: 22,
-  };
-
-  const heroStyle = {
-    display: 'grid',
-    gridTemplateColumns: 'minmax(0, 1.2fr) auto',
-    gap: 18,
-    alignItems: 'center',
-    padding: 26,
-    borderRadius: 24,
-    background: 'linear-gradient(135deg, rgba(0,229,255,0.12), rgba(15,22,41,0.96))',
-    border: '1px solid rgba(0,229,255,0.18)',
-    boxShadow: '0 18px 50px rgba(0,0,0,0.24)',
-  };
-
-  const panelStyle = {
-    background: '#0f1629',
-    border: '1px solid rgba(255,255,255,0.06)',
-    borderRadius: 22,
-    padding: 20,
-    boxShadow: '0 14px 40px rgba(0,0,0,0.20)',
-  };
-
-  const ghostBtn = {
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    minHeight: 44,
-    padding: '0 14px',
-    borderRadius: 12,
-    border: '1px solid rgba(255,255,255,0.12)',
-    background: 'rgba(255,255,255,0.03)',
-    color: '#e5e7eb',
-    textDecoration: 'none',
-    cursor: 'pointer',
-    fontWeight: 700,
-  };
-
-  const primaryBtn = {
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    minHeight: 46,
-    padding: '0 16px',
-    borderRadius: 14,
-    background: '#00e5ff',
-    color: '#001018',
-    fontWeight: 800,
-    textDecoration: 'none',
-    border: '1px solid #00d4eb',
-    cursor: 'pointer',
-    boxShadow: '0 12px 32px rgba(0,229,255,0.22)',
-    whiteSpace: 'nowrap',
-  };
-
-  return (
-    <RequireClub>
-      <main style={pageStyle}>
-        <div style={shellStyle}>
-          <section style={heroStyle}>
-            <div>
-              <div
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  padding: '8px 12px',
-                  borderRadius: 999,
-                  border: '1px solid rgba(0,229,255,0.2)',
-                  background: 'rgba(0,229,255,0.08)',
-                  color: '#7dd3fc',
-                  fontWeight: 800,
-                  fontSize: 13,
-                  marginBottom: 14,
-                }}
-              >
-                Contenido del club
-              </div>
-              <h1 style={{ margin: 0, fontSize: 'clamp(28px, 4vw, 42px)', lineHeight: 1.02, letterSpacing: '-0.03em', fontWeight: 900 }}>
-                Validación de fotos
-              </h1>
-              <p style={{ color: '#cbd5e1', lineHeight: 1.65, fontSize: 15, margin: '12px 0 0', maxWidth: 760 }}>
-                Revisa el contenido subido por asistentes, filtra por evento o estado y aprueba o rechaza cada foto según la misión o contexto del evento.
-              </p>
-            </div>
-
-            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-              <button type="button" onClick={refreshCurrentPhotos} style={ghostBtn}>
-                ↻ Recargar contenido
-              </button>
-            </div>
-          </section>
-
-          {notice && (
-            <section
-              style={{
-                ...panelStyle,
-                border: '1px solid rgba(0,229,255,0.14)',
-                background: 'rgba(0,229,255,0.05)',
-                color: '#dff9ff',
-              }}
-            >
-              {notice}
-            </section>
-          )}
-
-          <section
-            style={{
-              display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
-              gap: 14,
-            }}
-          >
-            <article style={panelStyle}>
-              <div style={{ color: '#94a3b8', fontSize: 13, marginBottom: 10 }}>Fotos visibles</div>
-              <div style={{ fontSize: 32, fontWeight: 900, letterSpacing: '-0.03em' }}>{counts.total}</div>
-            </article>
-            <article style={panelStyle}>
-              <div style={{ color: '#94a3b8', fontSize: 13, marginBottom: 10 }}>Pendientes</div>
-              <div style={{ fontSize: 32, fontWeight: 900, letterSpacing: '-0.03em' }}>{counts.pending}</div>
-            </article>
-            <article style={panelStyle}>
-              <div style={{ color: '#94a3b8', fontSize: 13, marginBottom: 10 }}>Aprobadas</div>
-              <div style={{ fontSize: 32, fontWeight: 900, letterSpacing: '-0.03em' }}>{counts.approved}</div>
-            </article>
-            <article style={panelStyle}>
-              <div style={{ color: '#94a3b8', fontSize: 13, marginBottom: 10 }}>Rechazadas</div>
-              <div style={{ fontSize: 32, fontWeight: 900, letterSpacing: '-0.03em' }}>{counts.rejected}</div>
-            </article>
-          </section>
-
-          <section
-            style={{
-              ...panelStyle,
-              display: 'grid',
-              gridTemplateColumns: 'minmax(0, 1fr) auto auto',
-              gap: 14,
-              alignItems: 'end',
-            }}
-          >
-            <label style={{ display: 'grid', gap: 8 }}>
-              <span style={{ fontSize: 13, color: '#94a3b8', fontWeight: 700 }}>Evento</span>
-              <select
-                value={selectedEventId}
-                onChange={(e) => setSelectedEventId(e.target.value)}
-                style={{
-                  width: '100%',
-                  minHeight: 48,
-                  borderRadius: 12,
-                  border: '1px solid rgba(255,255,255,0.08)',
-                  background: 'rgba(255,255,255,0.03)',
-                  color: '#e5e7eb',
-                  padding: '0 14px',
-                  outline: 'none',
-                }}
-              >
-                <option value="all">Todos mis eventos</option>
-                {events.map((event) => (
-                  <option key={event._id || event.id} value={event._id || event.id}>
-                    {event.title || 'Evento sin título'}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-              {[
-                { key: 'pending', label: 'Pendientes' },
-                { key: 'approved', label: 'Aprobadas' },
-                { key: 'rejected', label: 'Rechazadas' },
-              ].map((item) => (
-                <button
-                  key={item.key}
-                  type="button"
-                  onClick={() => setStatusFilter(item.key)}
-                  style={{
-                    ...ghostBtn,
-                    background: statusFilter === item.key ? '#111827' : 'rgba(255,255,255,0.03)',
-                  }}
-                >
-                  {item.label}
-                </button>
-              ))}
-            </div>
-
-            <div style={{ color: '#94a3b8', fontSize: 13, whiteSpace: 'nowrap' }}>
-              {selectedEvent ? `Evento: ${selectedEvent.title}` : 'Vista global del club'}
-            </div>
-          </section>
-
-          <section style={panelStyle}>
-            {loading || photosLoading ? (
-              <div style={{ color: '#cbd5e1' }}>Cargando fotos...</div>
-            ) : photos.length === 0 ? (
-              <div>
-                <div style={{ fontSize: 22, fontWeight: 800, marginBottom: 10 }}>No hay fotos en esta vista</div>
-                <div style={{ color: '#94a3b8', fontSize: 14, lineHeight: 1.6 }}>
-                  Prueba con otro evento o cambia el filtro de estado para revisar más contenido.
-                </div>
-              </div>
-            ) : (
-              <div
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
-                  gap: 14,
-                }}
-              >
-                {photos.map((photo) => (
-                  <button
-                    key={`${photo.eventId}-${photo.photoId}`}
-                    type="button"
-                    /*onClick={() => {
-                      setSelectedPhoto(photo);
-                      setReviewNote(photo.reviewNote || '');
-                    }}*/
-                    onClick={() => {
-                      setSelectedPhoto(photo);
-                      setReviewNote(photo.reviewNote || '');
-                      setSelectedMissionType(
-                        photo.validatedForMissionType ||
-                          photo.missionType ||
-                          'approved_event_photo'
-                      );
-                      setSelectedLevelNumber(
-                        photo.validatedForLevelNumber != null
-                          ? String(photo.validatedForLevelNumber)
-                          : photo.levelNumber != null
-                            ? String(photo.levelNumber)
-                            : ''
-                      );
-                    }}
-                    style={{
-                      textAlign: 'left',
-                      border: '1px solid rgba(255,255,255,0.10)',
-                      borderRadius: 18,
-                      overflow: 'hidden',
-                      background: 'rgba(255,255,255,0.02)',
-                      color: '#e5e7eb',
-                      cursor: 'pointer',
-                    }}
-                  >
-                    <div style={{ width: '100%', height: 210, background: 'rgba(255,255,255,0.03)' }}>
-                      <SmartPhoto
-                        photo={photo}
-                        alt="Foto subida por asistente"
-                        style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                      />
-                    </div>
-                    <div style={{ padding: 12, display: 'grid', gap: 8 }}>
-                      <div style={{ fontWeight: 800, fontSize: 15, lineHeight: 1.45 }}>
-                        {photo.eventTitle || 'Evento sin título'}
-                      </div>
-                      <div style={{ color: '#94a3b8', fontSize: 12.5, lineHeight: 1.5 }}>
-                        @{photo.byUsername || 'usuario'}
-                      </div>
-                      <div
-                        style={{
-                          display: 'grid',
-                          gap: 6,
-                          padding: '10px 12px',
-                          borderRadius: 14,
-                          background: 'rgba(255,255,255,0.03)',
-                          border: '1px solid rgba(255,255,255,0.06)',
-                        }}
-                      >
-                        <div style={{ color: '#94a3b8', fontSize: 11, fontWeight: 800, textTransform: 'uppercase', letterSpacing: '.04em' }}>
-                          Misión objetivo
-                        </div>
-                        <div style={{ fontSize: 13, fontWeight: 800, color: '#e5e7eb', lineHeight: 1.4 }}>
-                          {missionDisplayLabel(photo)}
-                        </div>
-                        {photo.levelNumber != null && photo.levelNumber !== '' && (
-                          <div style={{ color: '#7dd3fc', fontSize: 12, fontWeight: 700 }}>
-                            Nivel {photo.levelNumber}
-                          </div>
-                        )}
-                      </div>
-                      <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.45, wordBreak: 'break-all' }}>
-                        {photo.rawUrl || photo.url || photo.path || photo.photoUrl || 'sin ruta'}
-                      </div>
-                      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                        <div
-                          style={{
-                            ...statusStyles(photo.status),
-                            display: 'inline-flex',
-                            alignItems: 'center',
-                            width: 'fit-content',
-                            minHeight: 28,
-                            padding: '0 10px',
-                            borderRadius: 999,
-                            fontSize: 11.5,
-                            fontWeight: 800,
-                          }}
-                        >
-                          {photo.status === 'approved'
-                            ? 'Aprobada'
-                            : photo.status === 'rejected'
-                              ? 'Rechazada'
-                              : 'Pendiente'}
-                        </div>
-
-                        {photo.validatedForMissionType && (
-                          <div
-                            style={{
-                              display: 'inline-flex',
-                              alignItems: 'center',
-                              width: 'fit-content',
-                              minHeight: 28,
-                              padding: '0 10px',
-                              borderRadius: 999,
-                              fontSize: 11.5,
-                              fontWeight: 800,
-                              background: 'rgba(0,229,255,0.10)',
-                              border: '1px solid rgba(0,229,255,0.20)',
-                              color: '#7dd3fc',
-                            }}
-                          >
-                            Validada como {validatedMissionDisplayLabel(photo)}
-                          </div>
-                        )}
-                      </div>
-                      <div style={{ color: '#94a3b8', fontSize: 12.5 }}>
-                        {photo.uploadedAt ? new Date(photo.uploadedAt).toLocaleString('es-ES') : ''}
-                      </div>
-                    </div>
-                  </button>
-                ))}
-              </div>
-            )}
-          </section>
-
-          {selectedPhoto && (
-            <div
-              onClick={() => {
-                if (actionBusy) return;
-                setSelectedPhoto(null);
-                setReviewNote('');
-                setSelectedMissionType('approved_event_photo');
-                setSelectedLevelNumber('');
-              }}
-              style={{
-                position: 'fixed',
-                inset: 0,
-                background: 'rgba(0,0,0,0.68)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                padding: 16,
-                zIndex: 80,
-              }}
-            >
-              <div
-                onClick={(e) => e.stopPropagation()}
-                style={{
-                  width: 'min(860px, 100%)',
-                  maxHeight: '84vh',
-                  background: '#0b0f19',
-                  border: '1px solid rgba(255,255,255,0.12)',
-                  borderRadius: 20,
-                  overflow: 'hidden',
-                  display: 'grid',
-                  gridTemplateColumns: 'minmax(0, 0.95fr) 340px',
-                }}
-              >
-                <div style={{
-                  background: '#020617',
-                  minHeight: 320,
-                  maxHeight: '84vh',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  padding: 12,
-                }}>
-                  <SmartPhoto
-                    photo={selectedPhoto}
-                    alt="Foto seleccionada"
-                    style={{ width: '100%', height: '100%', objectFit: 'contain', borderRadius: 14 }}
-                  />
-                </div>
-
-                <div style={{
-                  padding: 16,
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: 12,
-                  maxHeight: '84vh',
-                  overflowY: 'auto',
-                }}>
-                  <div>
-                    <div style={{ fontSize: 22, fontWeight: 900, letterSpacing: '-0.02em' }}>
-                      {selectedPhoto.eventTitle || 'Evento sin título'}
-                    </div>
-                    <div style={{ color: '#94a3b8', fontSize: 14, marginTop: 6 }}>
-                      Subida por @{selectedPhoto.byUsername || 'usuario'}
-                    </div>
-                  </div>
-
-                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                    <div
-                      style={{
-                        ...statusStyles(selectedPhoto.status),
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        width: 'fit-content',
-                        minHeight: 30,
-                        padding: '0 10px',
-                        borderRadius: 999,
-                        fontSize: 12,
-                        fontWeight: 800,
-                      }}
-                    >
-                      {selectedPhoto.status === 'approved'
-                        ? 'Aprobada'
-                        : selectedPhoto.status === 'rejected'
-                          ? 'Rechazada'
-                          : 'Pendiente'}
-                    </div>
-                  </div>
-
-                  <div style={{ color: '#cbd5e1', fontSize: 14, lineHeight: 1.6 }}>
-                    Aquí ves la misión objetivo de la foto y puedes decidir si realmente la cumple. Solo debería aprobarse si encaja con la misión requerida por ese usuario en ese momento.
-                  </div>
-
-                  <div
-                    style={{
-                      padding: 14,
-                      borderRadius: 16,
-                      background: 'rgba(255,255,255,0.03)',
-                      border: '1px solid rgba(255,255,255,0.08)',
-                      display: 'grid',
-                      gap: 10,
-                    }}
-                  >
-                    <div style={{ color: '#94a3b8', fontSize: 12, fontWeight: 800, textTransform: 'uppercase', letterSpacing: '.04em' }}>
-                      Misión objetivo detectada en esta foto
-                    </div>
-                    <div style={{ fontSize: 18, fontWeight: 900, color: '#f8fafc', lineHeight: 1.3 }}>
-                      {selectedPhoto?.missionTitle || selectedTargetMissionMeta?.label || 'Foto aprobada del evento'}
-                    </div>
-                    <div style={{ color: '#cbd5e1', fontSize: 13.5, lineHeight: 1.6 }}>
-                      {selectedTargetMissionMeta?.description || 'La foto se validará como contenido general aprobado del evento.'}
-                    </div>
-                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                      {selectedPhoto?.levelNumber != null && selectedPhoto?.levelNumber !== '' && (
-                        <div
-                          style={{
-                            display: 'inline-flex',
-                            alignItems: 'center',
-                            minHeight: 30,
-                            padding: '0 10px',
-                            borderRadius: 999,
-                            background: 'rgba(0,229,255,0.10)',
-                            border: '1px solid rgba(0,229,255,0.20)',
-                            color: '#7dd3fc',
-                            fontSize: 12,
-                            fontWeight: 800,
-                          }}
-                        >
-                          Nivel objetivo {selectedPhoto.levelNumber}
-                        </div>
-                      )}
-
-                      {selectedPhoto?.validationResult && (
-                        <div
-                          style={{
-                            display: 'inline-flex',
-                            alignItems: 'center',
-                            minHeight: 30,
-                            padding: '0 10px',
-                            borderRadius: 999,
-                            background: 'rgba(255,255,255,0.04)',
-                            border: '1px solid rgba(255,255,255,0.08)',
-                            color: '#cbd5e1',
-                            fontSize: 12,
-                            fontWeight: 800,
-                          }}
-                        >
-                          {selectedPhoto.validationResult === 'matched' ? 'Coincide con la misión' : 'No coincide con la misión'}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  <div
-                    style={{
-                      padding: 14,
-                      borderRadius: 16,
-                      background: 'rgba(255,255,255,0.03)',
-                      border: '1px solid rgba(255,255,255,0.08)',
-                      display: 'grid',
-                      gap: 12,
-                    }}
-                  >
-                    <div>
-                      <div style={{ color: '#94a3b8', fontSize: 12, fontWeight: 800, marginBottom: 6 }}>
-                        Validar esta foto como
-                      </div>
-                      <select
-                        value={selectedMissionType}
-                        onChange={(e) => setSelectedMissionType(e.target.value)}
-                        style={{
-                          width: '100%',
-                          minHeight: 46,
-                          borderRadius: 12,
-                          border: '1px solid rgba(255,255,255,0.12)',
-                          background: 'rgba(255,255,255,0.03)',
-                          color: '#e5e7eb',
-                          padding: '0 12px',
-                          outline: 'none',
-                        }}
-                      >
-                        {CONTENT_MISSION_OPTIONS.map((item) => (
-                          <option key={item.type} value={item.type}>
-                            {item.label}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-
-                    <div>
-                      <div style={{ color: '#94a3b8', fontSize: 12, fontWeight: 800, marginBottom: 6 }}>
-                        Nivel relacionado (opcional)
-                      </div>
-                      <input
-                        type="number"
-                        min="1"
-                        value={selectedLevelNumber}
-                        onChange={(e) => setSelectedLevelNumber(e.target.value)}
-                        placeholder="Ej. 2"
-                        style={{
-                          width: '100%',
-                          minHeight: 46,
-                          borderRadius: 12,
-                          border: '1px solid rgba(255,255,255,0.12)',
-                          background: 'rgba(255,255,255,0.03)',
-                          color: '#e5e7eb',
-                          padding: '0 12px',
-                          outline: 'none',
-                        }}
-                      />
-                    </div>
-
-                    <div
-                      style={{
-                        padding: '12px 14px',
-                        borderRadius: 14,
-                        background: 'rgba(0,229,255,0.05)',
-                        border: '1px solid rgba(0,229,255,0.14)',
-                        color: '#dff9ff',
-                        fontSize: 13,
-                        lineHeight: 1.55,
-                      }}
-                    >
-                      <strong style={{ display: 'block', marginBottom: 6 }}>
-                        {selectedMissionMeta?.label || 'Foto aprobada del evento'}
-                      </strong>
-                      {selectedMissionMeta?.description || 'La foto se validará como contenido general aprobado.'}
-                      {selectedPhoto?.missionType && selectedMissionType !== selectedPhoto.missionType && (
-                        <div style={{ marginTop: 8, color: '#fcd34d', fontWeight: 700 }}>
-                          Atención: estás validando la foto con una misión distinta a la misión objetivo.
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  {selectedPhoto?.validatedForMissionType && (
-                    <div
-                      style={{
-                        padding: 14,
-                        borderRadius: 16,
-                        background: 'rgba(255,255,255,0.03)',
-                        border: '1px solid rgba(255,255,255,0.08)',
-                        display: 'grid',
-                        gap: 8,
-                      }}
-                    >
-                      <div style={{ color: '#94a3b8', fontSize: 12, fontWeight: 800, textTransform: 'uppercase', letterSpacing: '.04em' }}>
-                        Última validación guardada
-                      </div>
-                      <div style={{ fontSize: 15, fontWeight: 800, color: '#e5e7eb' }}>
-                        {validatedMissionDisplayLabel(selectedPhoto)}
-                      </div>
-                      {selectedPhoto?.validatedForLevelNumber != null && selectedPhoto?.validatedForLevelNumber !== '' && (
-                        <div style={{ color: '#7dd3fc', fontSize: 13, fontWeight: 700 }}>
-                          Nivel validado {selectedPhoto.validatedForLevelNumber}
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  <label style={{ display: 'grid', gap: 8 }}>
-                    <span style={{ fontSize: 13, color: '#94a3b8', fontWeight: 700 }}>Nota de revisión</span>
-                    <textarea
-                      value={reviewNote}
-                      onChange={(e) => setReviewNote(e.target.value)}
-                      rows={5}
-                      style={{
-                        width: '100%',
-                        border: '1px solid rgba(255,255,255,0.12)',
-                        borderRadius: 12,
-                        padding: 12,
-                        background: 'rgba(255,255,255,0.03)',
-                        color: '#e5e7eb',
-                        resize: 'vertical',
-                        outline: 'none',
-                      }}
-                    />
-                  </label>
-
-                  <div style={{ display: 'grid', gap: 10, marginTop: 'auto' }}>
-                    {selectedPhoto.status !== 'approved' && (
-                      <button
-                        type="button"
-                        onClick={approvePhoto}
-                        disabled={actionBusy}
-                        style={{
-                          ...primaryBtn,
-                          width: '100%',
-                        }}
-                      >
-                        {actionBusy ? 'Procesando...' : '✅ Aprobar porque sí cumple la misión'}
-                      </button>
-                    )}
-
-                    {selectedPhoto.status !== 'rejected' && (
-                      <button
-                        type="button"
-                        onClick={rejectPhoto}
-                        disabled={actionBusy}
-                        style={{
-                          ...ghostBtn,
-                          width: '100%',
-                        }}
-                      >
-                        {actionBusy ? 'Procesando...' : '❌ Rechazar porque no cumple la misión'}
-                      </button>
-                    )}
-
-                    <button
-                      type="button"
-                      onClick={deletePhoto}
-                      disabled={actionBusy}
-                      style={{
-                        width: '100%',
-                        minHeight: 44,
-                        borderRadius: 12,
-                        border: '1px solid rgba(239,68,68,0.55)',
-                        background: 'transparent',
-                        color: '#fca5a5',
-                        cursor: actionBusy ? 'not-allowed' : 'pointer',
-                        fontWeight: 700,
-                      }}
-                    >
-                      🗑 Eliminar foto
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-      </main>
-    </RequireClub>
-  );
 }
+
+router.get("/:id/attendees", (req, res) => attendeesHandler(req, res, false));
+router.get("/:id/attendees/populated", (req, res) => attendeesHandler(req, res, true));
+
+/* ------------------------------------------------------------------
+   DETALLE DE EVENTO (público; calcula isOwner si hay usuario)
+------------------------------------------------------------------- */
+router.get("/:id", async (req, res) => {
+  try {
+    const event = await Event.findById(req.params.id).populate(
+      "createdBy",
+      "username email profilePicture displayName"
+    );
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    // Backfill de qrToken para eventos antiguos que se crearon antes de añadir este campo.
+    if (!event.qrToken) {
+      event.qrToken = new mongoose.Types.ObjectId().toString();
+      await event.save();
+    }
+
+    const obj = event.toObject();
+
+    const formattedEvent = {
+      ...obj,
+      imageUrl: absUrlFromUpload(req, obj.image),
+      photos: approvedOnly(obj.photos).map((p) => toPhotoTileAbs(req, p)).filter(Boolean),
+      createdBy: obj.createdBy
+        ? {
+            ...obj.createdBy,
+            profilePictureUrl: absUrlFromUpload(req, obj.createdBy.profilePicture),
+          }
+        : null,
+      categories: Array.isArray(obj.categories)
+        ? obj.categories
+        : parseCategoriesMaybe(obj.categories),
+      qrPayload: `NV_EVENT:${obj._id}:${obj.qrToken || ""}`,
+    };
+
+    const userId = req.user ? req.user.id : null; // si algún middleware previo lo puso
+    const isOwner = userId && obj.createdBy?._id?.toString() === userId;
+
+    res.json({ ...formattedEvent, isOwner });
+  } catch (error) {
+    console.error("Error al obtener el evento:", error);
+    res.status(500).json({ message: "Error al obtener el evento", error });
+  }
+});
+
+/* ------------------------------------------------------------------
+   ELIMINAR EVENTO (requiere usuario y ser owner)
+------------------------------------------------------------------- */
+router.delete("/:id", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const event = await Event.findById(req.params.id);
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    if (event.createdBy.toString() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para eliminar este evento" });
+    }
+
+    await Event.findByIdAndDelete(req.params.id);
+    res.json({ message: "Evento eliminado correctamente" });
+  } catch (error) {
+    console.error("Error al eliminar el evento:", error);
+    res.status(500).json({ message: "Error interno del servidor" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   GALERÍA: GET fotos (y alias)
+------------------------------------------------------------------- */
+async function getPhotosHandler(req, res) {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+    const event = await Event.findById(id).lean();
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    const photos = approvedOnly(event.photos)
+      .map((p) => toPhotoTileAbs(req, p))
+      .filter(Boolean);
+
+    return res.json({ photos });
+  } catch (e) {
+    console.error("[GET photos] error:", e);
+    return res.status(500).json({ message: "Error obteniendo fotos" });
+  }
+}
+
+router.get("/:id/photos", getPhotosHandler);
+router.get("/:id/gallery", getPhotosHandler);
+router.get("/:id/images", getPhotosHandler);
+router.get("/:id/media", getPhotosHandler);
+
+/* ------------------------------------------------------------------
+   MODERACIÓN DE FOTOS (solo propietario/club)
+------------------------------------------------------------------- */
+
+// Listar fotos por estado (default: pending)
+router.get("/:id/photos/moderation", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    const event = await Event.findById(id).lean();
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    // Solo propietario puede moderar
+    if (event.createdBy?.toString?.() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para moderar fotos de este evento" });
+    }
+
+    const status = (req.query.status || "pending").toString();
+    const all = Array.isArray(event.photos) ? event.photos : [];
+
+    const filtered = all.filter((p) => {
+      if (!p || typeof p !== "object") return false;
+      const st = String(p.status || "approved");
+      return st === status;
+    });
+
+    const out = filtered.map((p) => ({
+      photoId: p.photoId || "",
+      url: buildEventPhotoAccessUrl(req, id, p.photoId || ""),
+      rawUrl: rawPhotoValue(p),
+      by: p.by || null,
+      byUsername: p.byUsername || null,
+      uploadedAt: p.uploadedAt || null,
+      status: p.status || "approved",
+      reviewedBy: p.reviewedBy || null,
+      reviewedAt: p.reviewedAt || null,
+      reviewNote: p.reviewNote || "",
+      missionType: p.missionType || null,
+      missionId: p.missionId || null,
+      missionTitle: p.missionTitle || null,
+      levelNumber: p.levelNumber ?? null,
+      validatedForMissionType: p.validatedForMissionType || null,
+      validatedForMissionId: p.validatedForMissionId || null,
+      validatedForMissionTitle: p.validatedForMissionTitle || null,
+      validatedForLevelNumber: p.validatedForLevelNumber ?? null,
+      validationResult: p.validationResult || null,
+    }));
+
+    return res.json({ eventId: id, status, photos: out, count: out.length });
+  } catch (e) {
+    console.error("[GET /events/:id/photos/moderation] error:", e);
+    return res.status(500).json({ message: "Error obteniendo fotos para moderación" });
+  }
+});
+
+// Aprobar foto (cuenta para subir de nivel)
+router.post("/:id/photos/:photoId/approve", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const { id, photoId } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    const event = await Event.findById(id);
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    if (event.createdBy?.toString?.() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para moderar fotos de este evento" });
+    }
+
+    const idx = (event.photos || []).findIndex((p) => p && typeof p === "object" && String(p.photoId || "") === String(photoId));
+    if (idx === -1) return res.status(404).json({ message: "Foto no encontrada" });
+
+    const note = (req.body?.reviewNote || "").toString();
+    const validationMeta = extractPhotoValidationMeta(req.body || {});
+
+    event.photos[idx].status = "approved";
+    event.photos[idx].reviewedBy = req.user.id;
+    event.photos[idx].reviewedAt = new Date();
+    event.photos[idx].reviewNote = note;
+    event.photos[idx].validatedForMissionType = validationMeta.validatedForMissionType;
+    event.photos[idx].validatedForMissionId = validationMeta.validatedForMissionId;
+    event.photos[idx].validatedForMissionTitle = validationMeta.validatedForMissionTitle;
+    event.photos[idx].validatedForLevelNumber = validationMeta.validatedForLevelNumber;
+    event.photos[idx].validationResult = validationMeta.validationResult || "matched";
+
+    await event.save();
+
+    // Promotions: solo cuenta cuando está aprobada
+    const clubId = event.createdBy ? event.createdBy.toString() : null;
+    const uploaderId = event.photos[idx].by ? event.photos[idx].by.toString() : null;
+    if (clubId && uploaderId) {
+      await syncPromotionAfterPhotoApproved({ userId: uploaderId, clubId, eventId: id });
+    }
+
+    return res.json({
+      ok: true,
+      photo: {
+        photoId: event.photos[idx].photoId,
+        url: buildEventPhotoAccessUrl(req, id, event.photos[idx].photoId),
+        rawUrl: rawPhotoValue(event.photos[idx]),
+        status: event.photos[idx].status,
+        reviewedBy: event.photos[idx].reviewedBy,
+        reviewedAt: event.photos[idx].reviewedAt,
+        reviewNote: event.photos[idx].reviewNote,
+        missionType: event.photos[idx].missionType || null,
+        missionId: event.photos[idx].missionId || null,
+        missionTitle: event.photos[idx].missionTitle || null,
+        levelNumber: event.photos[idx].levelNumber ?? null,
+        validatedForMissionType: event.photos[idx].validatedForMissionType || null,
+        validatedForMissionId: event.photos[idx].validatedForMissionId || null,
+        validatedForMissionTitle: event.photos[idx].validatedForMissionTitle || null,
+        validatedForLevelNumber: event.photos[idx].validatedForLevelNumber ?? null,
+        validationResult: event.photos[idx].validationResult || null,
+      },
+    });
+  } catch (e) {
+    console.error("[POST /events/:id/photos/:photoId/approve] error:", e);
+    return res.status(500).json({ message: "Error aprobando foto" });
+  }
+});
+
+// Rechazar foto (NO cuenta para subir de nivel)
+router.post("/:id/photos/:photoId/reject", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const { id, photoId } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    const event = await Event.findById(id);
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    if (event.createdBy?.toString?.() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para moderar fotos de este evento" });
+    }
+
+    const idx = (event.photos || []).findIndex((p) => p && typeof p === "object" && String(p.photoId || "") === String(photoId));
+    if (idx === -1) return res.status(404).json({ message: "Foto no encontrada" });
+
+    const note = (req.body?.reviewNote || "").toString();
+    const validationMeta = extractPhotoValidationMeta(req.body || {});
+
+    event.photos[idx].status = "rejected";
+    event.photos[idx].reviewedBy = req.user.id;
+    event.photos[idx].reviewedAt = new Date();
+    event.photos[idx].reviewNote = note;
+    event.photos[idx].validatedForMissionType = validationMeta.validatedForMissionType;
+    event.photos[idx].validatedForMissionId = validationMeta.validatedForMissionId;
+    event.photos[idx].validatedForMissionTitle = validationMeta.validatedForMissionTitle;
+    event.photos[idx].validatedForLevelNumber = validationMeta.validatedForLevelNumber;
+    event.photos[idx].validationResult = validationMeta.validationResult || "not_matched";
+
+    await event.save();
+
+    return res.json({
+      ok: true,
+      photo: {
+        photoId: event.photos[idx].photoId,
+        url: buildEventPhotoAccessUrl(req, id, event.photos[idx].photoId),
+        rawUrl: rawPhotoValue(event.photos[idx]),
+        status: event.photos[idx].status,
+        reviewedBy: event.photos[idx].reviewedBy,
+        reviewedAt: event.photos[idx].reviewedAt,
+        reviewNote: event.photos[idx].reviewNote,
+        missionType: event.photos[idx].missionType || null,
+        missionId: event.photos[idx].missionId || null,
+        missionTitle: event.photos[idx].missionTitle || null,
+        levelNumber: event.photos[idx].levelNumber ?? null,
+        validatedForMissionType: event.photos[idx].validatedForMissionType || null,
+        validatedForMissionId: event.photos[idx].validatedForMissionId || null,
+        validatedForMissionTitle: event.photos[idx].validatedForMissionTitle || null,
+        validatedForLevelNumber: event.photos[idx].validatedForLevelNumber ?? null,
+        validationResult: event.photos[idx].validationResult || null,
+      },
+    });
+  } catch (e) {
+    console.error("[POST /events/:id/photos/:photoId/reject] error:", e);
+    return res.status(500).json({ message: "Error rechazando foto" });
+  }
+});
+
+// Acceso/proxy a una foto concreta del evento para evitar problemas de CORS
+router.get("/:id/photos/:photoId/file", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const { id, photoId } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    const event = await Event.findById(id).lean();
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    if (event.createdBy?.toString?.() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para ver fotos de este evento" });
+    }
+
+    const photo = (event.photos || []).find(
+      (p) => p && typeof p === "object" && String(p.photoId || "") === String(photoId)
+    );
+    if (!photo) {
+      return res.status(404).json({ message: "Foto no encontrada" });
+    }
+
+    let raw = rawPhotoValue(photo);
+    if (!raw) {
+      return res.status(404).json({ message: "Ruta de foto no disponible" });
+    }
+
+    if (typeof raw !== "string") raw = String(raw);
+    raw = raw.trim();
+
+    // Si es una URL del propio backend que apunta a /uploads, la convertimos a path local.
+    if (raw.startsWith("http")) {
+      const idx = raw.indexOf("/uploads/");
+      if (idx !== -1) {
+        raw = raw.substring(idx + 1); // -> uploads/...
+      }
+    }
+
+    // Caso 1: archivo local dentro de /uploads
+    if (!raw.startsWith("http")) {
+      const rel = raw.replace(/^\/+/, "");
+      const abs = path.join(__dirname, "..", rel);
+      const uploadsRoot = path.join(__dirname, "..", "uploads");
+
+      if (!abs.startsWith(uploadsRoot)) {
+        return res.status(400).json({ message: "Ruta de foto inválida" });
+      }
+      if (!fs.existsSync(abs)) {
+        return res.status(404).json({ message: "Archivo no encontrado" });
+      }
+
+      return res.sendFile(abs);
+    }
+
+    // Caso 2: URL externa -> proxy server-side para evitar CORS en el frontend
+    const upstream = await fetch(raw);
+    if (!upstream.ok) {
+      return res.status(404).json({ message: "No se pudo obtener la foto remota" });
+    }
+
+    const contentType = upstream.headers.get("content-type") || "application/octet-stream";
+    const arrayBuffer = await upstream.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "public, max-age=300");
+    return res.send(buffer);
+  } catch (e) {
+    console.error("[GET /events/:id/photos/:photoId/file] error:", e);
+    return res.status(500).json({ message: "Error obteniendo la foto" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   GALERÍA: POST subir fotos (y alias)
+   - Acepta múltiples campos: file/files/files[]/photo/photos/photos[]/image/images/images[]
+   - Requiere usuario
+------------------------------------------------------------------- */
+async function postPhotosHandler(req, res) {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+    const event = await Event.findById(id);
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    // Recoge archivos subidos, sin importar el nombre del campo
+    const files = (req.files && Array.isArray(req.files) ? req.files : [])
+      .concat(req.file ? [req.file] : []);
+
+    if (!files.length) {
+      return res.status(400).json({ message: "No se recibieron archivos" });
+    }
+
+    const missionMeta = extractPhotoMissionMeta(req.body || {});
+    // Datos del usuario que sube
+    let byUsername = "usuario";
+    try {
+      const userDoc = await User.findById(req.user.id).lean();
+      const u = usernameFromUserDoc(userDoc);
+      if (u) byUsername = u;
+    } catch (_) {}
+
+    // Carpeta para fotos de evento
+    const eventPhotosDir = path.join(ROOT_UPLOADS_DIR, "event-photos");
+    ensureDir(eventPhotosDir);
+
+    const savedMeta = [];
+    for (const f of files) {
+      const base = `event-${id}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const processed = await processImageToJpg(f.path, eventPhotosDir, base);
+      const rel = path
+        .relative(path.join(__dirname, ".."), processed)
+        .replace(/\\/g, "/"); // ej: "uploads/event-photos/event-xxx.jpg"
+
+      const meta = {
+        photoId: `evtphoto_${new mongoose.Types.ObjectId().toString()}`,
+        url: rel,
+        by: req.user.id,
+        byUsername,
+        uploadedAt: new Date(),
+
+        status: "pending",
+        reviewedBy: null,
+        reviewedAt: null,
+        reviewNote: "",
+
+        missionType: missionMeta.missionType,
+        missionId: missionMeta.missionId,
+        missionTitle: missionMeta.missionTitle,
+        levelNumber: missionMeta.levelNumber,
+        validatedForMissionType: null,
+        validatedForMissionId: null,
+        validatedForMissionTitle: null,
+        validatedForLevelNumber: null,
+        validationResult: null,
+      };
+
+      event.photos = Array.isArray(event.photos) ? event.photos : [];
+      event.photos.push(meta);
+      savedMeta.push(meta);
+    }
+
+    await event.save();
+    // NO promociones aquí; solo al aprobar
+
+    // Respuesta: objetos con url absoluta + byUsername
+    const uploaded = savedMeta.map((m) => ({
+      photoId: m.photoId,
+      url: absUrlFromUpload(req, m.url),
+      byUsername: m.byUsername,
+      uploadedAt: m.uploadedAt,
+      status: m.status,
+      missionType: m.missionType || null,
+      missionId: m.missionId || null,
+      missionTitle: m.missionTitle || null,
+      levelNumber: m.levelNumber ?? null,
+      validatedForMissionType: m.validatedForMissionType || null,
+      validatedForMissionId: m.validatedForMissionId || null,
+      validatedForMissionTitle: m.validatedForMissionTitle || null,
+      validatedForLevelNumber: m.validatedForLevelNumber ?? null,
+      validationResult: m.validationResult || null,
+    }));
+
+    const allPhotos = approvedOnly(event.photos)
+      .map((p) => toPhotoTileAbs(req, p))
+      .filter(Boolean);
+
+    return res.status(201).json({
+      uploaded,        // recién subidas (con autor)
+      photos: allPhotos, // estado completo de galería (con autor cuando exista)
+      count: uploaded.length,
+    });
+  } catch (e) {
+    console.error("[POST photos] error:", e);
+    return res.status(500).json({ message: "Error subiendo fotos", error: e.message });
+  }
+}
+
+// Acepta cualquier campo / array (evita que Flutter tenga que adivinar)
+router.post("/:id/photos", anyAuth, ensureUserId, uploadAny.any(), postPhotosHandler);
+router.post("/:id/photos/upload", anyAuth, ensureUserId, uploadAny.any(), postPhotosHandler);
+router.post("/:id/upload-photo", anyAuth, ensureUserId, uploadAny.any(), postPhotosHandler);
+
+/* ------------------------------------------------------------------
+   GALERÍA: DELETE foto(s) (solo propietario)
+------------------------------------------------------------------- */
+router.delete("/:id/photos/:pid?", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    const event = await Event.findById(id);
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    // Solo el propietario puede borrar fotos
+    if (event.createdBy?.toString() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para borrar fotos de este evento" });
+    }
+
+    // Normalizar parámetros
+    const q = { ...req.query, ...req.body };
+    const pid = req.params.pid; // opcional
+    let idx = q.idx ?? undefined;
+    let url = q.url ?? undefined;
+    if (typeof idx === "string" && idx.trim() !== "") idx = Number(idx);
+
+    const photos = Array.isArray(event.photos) ? event.photos : [];
+
+    // Resolver índice a borrar
+    let targetIndex = -1;
+
+    if (Number.isInteger(idx) && idx >= 0 && idx < photos.length) {
+      targetIndex = idx;
+    } else {
+      // Por URL o photoId (soportar absoluta o relativa)
+      const search = (pid && pid !== "undefined") ? pid : url;
+      if (!search) {
+        return res.status(400).json({ message: "Debes proporcionar idx o url" });
+      }
+      const toRel = (v) => {
+        if (!v) return "";
+        if (typeof v !== "string") v = String(v);
+        if (v.startsWith("http")) {
+          const i = v.indexOf("/uploads/");
+          return i !== -1 ? v.substring(i + 1) : v; // quitar leading slash luego
+        }
+        return v.replace(/^\/+/, "");
+      };
+      const needle = toRel(search);
+      targetIndex = photos.findIndex((p) => {
+        // Match by photoId (new schema)
+        if (pid && typeof p === "object" && String(p.photoId || "") === String(needle)) {
+          return true;
+        }
+        const cand = typeof p === "string"
+          ? toRel(p)
+          : toRel(p?.url || p?.path || p?.image || p?.photo);
+        return cand === needle;
+      });
+      if (targetIndex === -1) {
+        return res.status(404).json({ message: "Foto no encontrada" });
+      }
+    }
+
+    // Extraer info de la foto a borrar
+    const removedEntry = photos[targetIndex];
+    const relPath = (typeof removedEntry === "string")
+      ? removedEntry
+      : (removedEntry?.url || removedEntry?.path || removedEntry?.image || removedEntry?.photo || "");
+
+    // Borrar archivo físico si está dentro de /uploads
+    try {
+      const ROOT = path.join(__dirname, "..");
+      const abs = path.join(ROOT, relPath.replace(/^\/+/, ""));
+      const uploadsRoot = path.join(ROOT, "uploads");
+      if (abs.startsWith(uploadsRoot) && fs.existsSync(abs)) {
+        fs.unlinkSync(abs);
+      }
+    } catch (e) {
+      console.warn("[DELETE photo] no se pudo eliminar archivo físico:", e?.message || e);
+    }
+
+    // Quitar del array y guardar
+    event.photos.splice(targetIndex, 1);
+    await event.save();
+
+    // Devolver listado normalizado
+    const outPhotos = (event.photos || [])
+      .map((p) => toPhotoTileAbs(req, p))
+      .filter(Boolean);
+
+    return res.json({
+      removed: (typeof removedEntry === "string")
+        ? { url: absUrlFromUpload(req, removedEntry) }
+        : {
+            url: absUrlFromUpload(req, removedEntry?.url || removedEntry?.path || removedEntry?.image || removedEntry?.photo),
+            byUsername: removedEntry?.byUsername || null,
+            uploadedAt: removedEntry?.uploadedAt || null,
+          },
+      photos: outPhotos,
+    });
+  } catch (e) {
+    console.error("[DELETE /events/:id/photos] error:", e);
+    return res.status(500).json({ message: "Error borrando foto", error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------
+   ALTERNAR ASISTENCIA (requiere usuario)
+   - Alterna en Mongo (campo attendees)
+   - Escribe/borra doc en Firestore: attendances/{uid}_{eventId}
+------------------------------------------------------------------- */
+router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
+  const eventId = req.params.id;
+
+  try {
+    // 1) Recuperar evento
+    if (!mongoose.isValidObjectId(eventId)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+    const event = await Event.findById(eventId);
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    event.attendees = Array.isArray(event.attendees) ? event.attendees : [];
+
+    // 2) Usuario (Mongo id ya garantizado)
+    const userId = req.user.id;
+
+    // 3) Alternar asistencia en Mongo (comparando como string)
+    const idx = event.attendees.findIndex((a) => a?.toString?.() === userId);
+    let attendedNow = false;
+
+    if (idx !== -1) {
+      event.attendees.splice(idx, 1); // quitar
+      attendedNow = false;
+    } else {
+      event.attendees.push(userId); // añadir
+      attendedNow = true;
+    }
+
+    await event.save();
+
+    // 4) Si viene además como Firebase (teléfono), refleja en Firestore
+    const firebaseToken = extractIdToken(req);
+    if (firebaseToken) {
+      try {
+        const decoded = await admin.auth().verifyIdToken(firebaseToken);
+        const uid = decoded.uid;
+        const phone = decoded.phone_number || decoded.phoneNumber || null;
+
+        const db = admin.firestore();
+        const docId = `${uid}_${eventId}`;
+        const docRef = db.collection("attendances").doc(docId);
+
+        if (attendedNow) {
+          await docRef.set(
+            {
+              userId: uid,
+              userPhone: phone || null,
+              eventId,
+              eventTitle: event.title || "",
+              eventDate: event.date ? new Date(event.date) : null,
+              eventImageUrl: absUrlFromUpload(req, event.image),
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+        } else {
+          await docRef.delete().catch(() => {});
+        }
+      } catch (e) {
+        console.warn("[attend] No se pudo reflejar en Firestore:", e?.message || e);
+      }
+    }
+
+    // 4.5) Promotions: actualizar progreso por asistencia
+    const clubId = event.createdBy ? event.createdBy.toString() : null;
+    if (clubId) {
+      await syncPromotionAfterAttend({ userId, clubId, eventId, attendedNow });
+    }
+
+    // 5) Responder
+    return res.json({
+      _id: event._id,
+      attendees: event.attendees,
+    });
+  } catch (error) {
+    console.error("Error al alternar asistencia:", error);
+    res.status(500).json({ message: "Error interno del servidor", error: error.message });
+  }
+});
+
+/* ==================================================================
+   🚀 UPDATE + IMAGEN PRINCIPAL
+================================================================== */
+
+// Helpers para update
+function sanitizeUpdate(payload) {
+  const clean = { ...payload };
+  [
+    "_id",
+    "id",
+    "createdAt",
+    "updatedAt",
+    "__v",
+    "createdBy",
+    "attendees",
+    "photos",
+  ].forEach((k) => delete clean[k]);
+  return clean;
+}
+
+async function updateEventHandler(req, res) {
+  try {
+    const id = req.params.id;
+
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    // 1) Buscar evento y verificar ownership
+    const event = await Event.findById(id);
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    if (event.createdBy.toString() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para editar este evento" });
+    }
+
+    // 2) Construir update
+    const update = sanitizeUpdate(req.body);
+
+    // Normalizar fechas
+    const startAt = parseDateMaybe(req.body.startAt || req.body.date);
+    const endAt   = parseDateMaybe(req.body.endAt);
+    if (startAt) {
+      update.startAt = startAt;
+      // por compat, si alguien en front aún mira "date"
+      update.date = startAt;
+    }
+    if (endAt) update.endAt = endAt;
+
+    // Normalizar categorías
+    if (typeof req.body.categories !== "undefined") {
+      update.categories = parseCategoriesMaybe(req.body.categories);
+    }
+
+    // age/price a número si aplica
+    if (typeof req.body.age !== "undefined") {
+      const ageNum = parseNumberMaybe(req.body.age);
+      update.age = typeof ageNum === "number" ? ageNum : req.body.age;
+    }
+    if (typeof req.body.price !== "undefined") {
+      const priceNum = parseNumberMaybe(req.body.price);
+      update.price = typeof priceNum === "number" ? priceNum : req.body.price;
+    }
+    // Mantener asociacion owner/club si por algun motivo faltaba en eventos antiguos
+    if (!event.clubId) update.clubId = event.createdBy;
+    if (!event.club) update.club = event.createdBy;
+
+    // 3) Imagen (si viene multipart)
+    if (req.file) {
+      const processedDir = ROOT_UPLOADS_DIR;
+      const processedImagePath = await processImageToJpg(
+        req.file.path,
+        processedDir,
+        `resized-${Date.now()}-${path.parse(req.file.originalname).name}`
+      );
+      update.image = path
+        .relative(path.join(__dirname, ".."), processedImagePath)
+        .replace(/\\/g, "/");
+    }
+
+    // 4) Actualizar y devolver formateado
+    const updated = await Event.findByIdAndUpdate(id, update, { new: true })
+      .populate("createdBy", "username email profilePicture displayName")
+      .lean();
+
+    const formatted = {
+      ...updated,
+      imageUrl: absUrlFromUpload(req, updated.image),
+      photos: approvedOnly(updated.photos).map((p) => toPhotoTileAbs(req, p)).filter(Boolean),
+      createdBy: updated.createdBy
+        ? {
+            ...updated.createdBy,
+            profilePictureUrl: absUrlFromUpload(req, updated.createdBy.profilePicture),
+          }
+        : null,
+      categories: Array.isArray(updated.categories)
+        ? updated.categories
+        : parseCategoriesMaybe(updated.categories),
+    };
+
+    return res.json(formatted);
+  } catch (err) {
+    console.error("[UPDATE /events/:id] error:", err);
+    return res
+      .status(500)
+      .json({ message: "Error actualizando el evento", error: err.message });
+  }
+}
+
+// PATCH y PUT -> mismo handler
+router.patch("/:id", anyAuth, ensureUserId, upload.single("image"), updateEventHandler);
+router.put("/:id",   anyAuth, ensureUserId, upload.single("image"), updateEventHandler);
+
+// Subir/cambiar imagen principal
+router.post("/:id/image", anyAuth, ensureUserId, upload.single("image"), async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    const event = await Event.findById(id);
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    if (event.createdBy.toString() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para cambiar la imagen" });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ message: 'Falta el archivo "image"' });
+    }
+
+    const processedDir = ROOT_UPLOADS_DIR;
+    const processedImagePath = await processImageToJpg(
+      req.file.path,
+      processedDir,
+      `resized-${Date.now()}-${path.parse(req.file.originalname).name}`
+    );
+
+    const rel = path
+      .relative(path.join(__dirname, ".."), processedImagePath)
+      .replace(/\\/g, "/");
+
+    event.image = rel;
+    await event.save();
+
+    return res.json({
+      _id: event._id,
+      image: rel,
+      imageUrl: absUrlFromUpload(req, rel),
+    });
+  } catch (err) {
+    console.error("[POST /events/:id/image] error:", err);
+    return res
+      .status(500)
+      .json({ message: "Error subiendo imagen", error: err.message });
+  }
+});
+
+module.exports = router;
