@@ -109,6 +109,59 @@ function extractPhotoValidationMeta(body = {}) {
   };
 }
 
+function parseQrPayloadValue(value) {
+  const raw = (value || "").toString().trim();
+  if (!raw) return null;
+
+  if (raw.startsWith("NV_EVENT:")) {
+    const parts = raw.split(":");
+    return {
+      eventId: (parts[1] || "").trim() || null,
+      qrToken: (parts[2] || "").trim() || null,
+    };
+  }
+
+  return {
+    eventId: null,
+    qrToken: raw,
+  };
+}
+
+function buildQrResolveResponse(req, event) {
+  const eventId = String(event._id);
+  return {
+    ok: true,
+    eventId,
+    qrToken: event.qrToken || null,
+    event: {
+      _id: eventId,
+      id: eventId,
+      title: event.title || "Evento",
+      imageUrl: absUrlFromUpload(req, event.image),
+      startAt: event.startAt || event.date || null,
+      date: event.date || event.startAt || null,
+      city: event.city || "",
+      street: event.street || "",
+      postalCode: event.postalCode || "",
+      categories: Array.isArray(event.categories)
+        ? event.categories
+        : parseCategoriesMaybe(event.categories),
+    },
+    flow: {
+      type: "event_qr_camera_upload",
+      cameraOnly: true,
+      allowGallery: false,
+      allowRetake: true,
+    },
+    upload: {
+      method: "POST",
+      url: joinUrl(backendBase(req), `/api/events/${eventId}/photos`),
+      tokenUploadUrl: joinUrl(backendBase(req), `/api/events/scan/${event.qrToken}/photo`),
+      fieldNames: ["file", "files", "photo", "image"],
+    },
+  };
+}
+
 /* Utils de ficheros */
 const ROOT_UPLOADS_DIR = path.join(__dirname, "..", "uploads");
 function ensureDir(dir) {
@@ -805,6 +858,77 @@ async function attendeesHandler(req, res, forceFull = false) {
     res.status(500).json({ message: "Error obteniendo asistentes" });
   }
 }
+
+/* ------------------------------------------------------------------
+   QR SCAN FLOW
+   - El QR del evento abre la cámara dentro de la app
+   - La app resuelve el token y sube la foto al evento correcto
+------------------------------------------------------------------- */
+router.post("/scan/resolve", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const parsed = parseQrPayloadValue(
+      req.body?.qrPayload || req.body?.payload || req.body?.qr || req.body?.token
+    );
+
+    if (!parsed || !parsed.qrToken) {
+      return res.status(400).json({ message: "QR inválido" });
+    }
+
+    const query = { qrToken: parsed.qrToken };
+    if (parsed.eventId && mongoose.isValidObjectId(parsed.eventId)) {
+      query._id = parsed.eventId;
+    }
+
+    const event = await Event.findOne(query).lean();
+    if (!event) {
+      return res.status(404).json({ message: "Evento no encontrado para este QR" });
+    }
+
+    return res.json(buildQrResolveResponse(req, event));
+  } catch (e) {
+    console.error("[POST /events/scan/resolve] error:", e);
+    return res.status(500).json({ message: "Error resolviendo QR" });
+  }
+});
+
+router.get("/scan/:token/resolve", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const token = (req.params.token || "").toString().trim();
+    if (!token) {
+      return res.status(400).json({ message: "QR inválido" });
+    }
+
+    const event = await Event.findOne({ qrToken: token }).lean();
+    if (!event) {
+      return res.status(404).json({ message: "Evento no encontrado para este QR" });
+    }
+
+    return res.json(buildQrResolveResponse(req, event));
+  } catch (e) {
+    console.error("[GET /events/scan/:token/resolve] error:", e);
+    return res.status(500).json({ message: "Error resolviendo QR" });
+  }
+});
+
+router.post("/scan/:token/photo", anyAuth, ensureUserId, uploadAny.any(), async (req, res, next) => {
+  try {
+    const token = (req.params.token || "").toString().trim();
+    if (!token) {
+      return res.status(400).json({ message: "QR inválido" });
+    }
+
+    const event = await Event.findOne({ qrToken: token }).select("_id").lean();
+    if (!event) {
+      return res.status(404).json({ message: "Evento no encontrado para este QR" });
+    }
+
+    req.params.id = String(event._id);
+    return postPhotosHandler(req, res, next);
+  } catch (e) {
+    console.error("[POST /events/scan/:token/photo] error:", e);
+    return res.status(500).json({ message: "Error subiendo foto desde QR" });
+  }
+});
 
 router.get("/:id/attendees", (req, res) => attendeesHandler(req, res, false));
 router.get("/:id/attendees/populated", (req, res) => attendeesHandler(req, res, true));
