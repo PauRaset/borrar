@@ -304,6 +304,11 @@ async function ensureProgressDoc({ userId, clubId, templates }) {
     });
   }
 
+  syncProgressWithTemplates(progress, templates);
+  refreshCurrentSnapshot(progress);
+  progress.lastActivityAt = now();
+  await progress.save();
+
   return progress;
 }
 
@@ -313,6 +318,150 @@ function findLevel(progress, levelNumber) {
 
 function findMission(level, missionKey) {
   return (level?.missions || []).find((m) => m.missionKey === missionKey);
+}
+
+function getTemplateMissionKey(mission, fallbackIndex = 0) {
+  if (!mission) return `mission_${fallbackIndex + 1}`;
+  return (
+    mission.missionKey ||
+    mission.key ||
+    mission.slug ||
+    mission.code ||
+    mission._id?.toString?.() ||
+    `mission_${fallbackIndex + 1}`
+  ).toString();
+}
+
+function syncMissionWithTemplate(existingMission, templateMission, missionIndex = 0) {
+  const missionKey = getTemplateMissionKey(templateMission, missionIndex);
+
+  return {
+    missionKey,
+    type: String(templateMission.type || ''),
+    title: String(templateMission.title || ''),
+    description: String(templateMission.description || ''),
+    target: Number(templateMission.target || 1),
+    unit: String(templateMission.unit || ''),
+    params: templateMission.params && typeof templateMission.params === 'object' ? templateMission.params : {},
+    validationType:
+      String(
+        templateMission.validationType ||
+          (templateMission.requiresApproval ? 'manual' : 'automatic')
+      ) || 'automatic',
+    requiresApproval: !!templateMission.requiresApproval,
+    order: Number(templateMission.order || missionIndex + 1),
+    active: templateMission.active !== false,
+    status: existingMission?.status || 'in_progress',
+    current: Number(existingMission?.current || 0),
+    claimId: existingMission?.claimId || null,
+    startedAt: existingMission?.startedAt || now(),
+    completedAt: existingMission?.completedAt || null,
+    updatedAt: now(),
+  };
+}
+
+function syncLevelWithTemplate(existingLevel, templateLevel, levelIndex = 0) {
+  const existingMissions = Array.isArray(existingLevel?.missions) ? existingLevel.missions : [];
+  const missionsByKey = new Map(
+    existingMissions.map((mission, idx) => [getTemplateMissionKey(mission, idx), mission])
+  );
+
+  const nextLevelNumber = Number(templateLevel.levelNumber || levelIndex + 1);
+  const nextMissions = Array.isArray(templateLevel.missions)
+    ? templateLevel.missions
+        .map((mission, missionIndex) => {
+          const missionKey = getTemplateMissionKey(mission, missionIndex);
+          const existingMission =
+            missionsByKey.get(missionKey) ||
+            existingMissions[missionIndex] ||
+            null;
+          return syncMissionWithTemplate(existingMission, mission, missionIndex);
+        })
+        .sort((a, b) => a.order - b.order)
+    : [];
+
+  let nextStatus = existingLevel?.status || (nextLevelNumber === 1 ? 'in_progress' : 'locked');
+  if (nextMissions.length && nextMissions.every((mission) => mission.status === 'completed')) {
+    nextStatus = 'completed';
+  }
+
+  const syncedLevel = {
+    levelNumber: nextLevelNumber,
+    order: Number(templateLevel.order || nextLevelNumber),
+    title: String(templateLevel.title || `Nivel ${nextLevelNumber}`),
+    description: String(templateLevel.description || ''),
+    difficulty: String(templateLevel.difficulty || 'medium'),
+    reward: templateLevel.reward || null,
+    status: nextStatus,
+    active: templateLevel.active !== false,
+    visibleInApp: templateLevel.visibleInApp !== false,
+    version: Number(templateLevel.version || 1),
+    missions: nextMissions,
+    startedAt: existingLevel?.startedAt || now(),
+    completedAt: existingLevel?.completedAt || null,
+    updatedAt: now(),
+  };
+
+  syncedLevel.progress = computeLevelProgress(syncedLevel);
+  return syncedLevel;
+}
+
+function syncProgressWithTemplates(progress, templates) {
+  const sortedTemplates = [...(templates || [])].sort(
+    (a, b) => Number(a.order || a.levelNumber || 0) - Number(b.order || b.levelNumber || 0)
+  );
+
+  const existingLevels = Array.isArray(progress.levels) ? progress.levels : [];
+  const existingByLevelNumber = new Map(
+    existingLevels.map((level) => [Number(level.levelNumber), level])
+  );
+
+  const nextLevels = sortedTemplates.map((templateLevel, levelIndex) => {
+    const levelNumber = Number(templateLevel.levelNumber || levelIndex + 1);
+    const existingLevel = existingByLevelNumber.get(levelNumber) || null;
+    return syncLevelWithTemplate(existingLevel, templateLevel, levelIndex);
+  });
+
+  let firstActiveInProgressFound = false;
+  for (const level of nextLevels) {
+    if (level.status === 'completed') continue;
+    if (!firstActiveInProgressFound) {
+      level.status = 'in_progress';
+      for (const mission of level.missions || []) {
+        if (mission.status === 'locked' || !mission.status) {
+          mission.status = 'in_progress';
+        }
+      }
+      firstActiveInProgressFound = true;
+    } else if (level.status !== 'completed') {
+      level.status = 'locked';
+      for (const mission of level.missions || []) {
+        if (mission.status !== 'completed') {
+          mission.status = 'locked';
+        }
+      }
+    }
+    level.progress = computeLevelProgress(level);
+  }
+
+  if (!firstActiveInProgressFound && nextLevels.length) {
+    const lastLevel = nextLevels[nextLevels.length - 1];
+    lastLevel.status = 'completed';
+    lastLevel.progress = 1;
+  }
+
+  progress.levels = nextLevels;
+
+  const currentInProgress = nextLevels.find((level) => level.status === 'in_progress');
+  const lastCompleted = [...nextLevels].reverse().find((level) => level.status === 'completed');
+
+  if (currentInProgress) {
+    progress.currentLevel = currentInProgress.levelNumber;
+  } else if (lastCompleted) {
+    progress.currentLevel = lastCompleted.levelNumber;
+  } else {
+    progress.currentLevel = nextLevels[0]?.levelNumber || 1;
+  }
 }
 
 function unlockNextLevel(progress, completedLevelNumber) {
@@ -790,7 +939,8 @@ exports.approveClaim = async (req, res) => {
 
     if (mission) {
       mission.status = 'completed';
-      mission.current = mission.target || 1;
+      mission.current = Number(mission.target || 1);
+      mission.claimId = claim._id;
       mission.completedAt = now();
       mission.updatedAt = now();
     }
@@ -856,7 +1006,9 @@ exports.rejectClaim = async (req, res) => {
       const mission = findMission(level, claim.missionKey);
       if (mission) {
         mission.status = 'rejected';
+        mission.current = Number(mission.current || 0);
         mission.claimId = null;
+        mission.completedAt = null;
         mission.updatedAt = now();
       }
       if (level) level.progress = computeLevelProgress(level);
