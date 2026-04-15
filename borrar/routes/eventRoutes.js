@@ -133,6 +133,9 @@ function buildQrResolveResponse(req, event) {
     ok: true,
     eventId,
     qrToken: event.qrToken || null,
+    tokenUploadUrl: joinUrl(backendBase(req), `/api/events/scan/${event.qrToken}/photo`),
+    uploadUrl: joinUrl(backendBase(req), `/api/events/scan/${event.qrToken}/photo`),
+    photoUploadUrl: joinUrl(backendBase(req), `/api/events/scan/${event.qrToken}/photo`),
     event: {
       _id: eventId,
       id: eventId,
@@ -157,6 +160,8 @@ function buildQrResolveResponse(req, event) {
       method: "POST",
       url: joinUrl(backendBase(req), `/api/events/${eventId}/photos`),
       tokenUploadUrl: joinUrl(backendBase(req), `/api/events/scan/${event.qrToken}/photo`),
+      uploadUrl: joinUrl(backendBase(req), `/api/events/scan/${event.qrToken}/photo`),
+      photoUploadUrl: joinUrl(backendBase(req), `/api/events/scan/${event.qrToken}/photo`),
       fieldNames: ["file", "files", "photo", "image"],
     },
   };
