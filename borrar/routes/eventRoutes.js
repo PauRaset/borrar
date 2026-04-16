@@ -142,6 +142,8 @@ function buildQrResolveResponse(req, event, activePhotoMission = null) {
           missionId: activePhotoMission.missionId || activePhotoMission.missionKey || null,
           type: activePhotoMission.type || null,
           title: activePhotoMission.title || "",
+          target: activePhotoMission.target ?? 1,
+          current: activePhotoMission.current ?? 0,
           levelNumber: activePhotoMission.levelNumber ?? null,
           status: activePhotoMission.status || null,
           requiresApproval: !!activePhotoMission.requiresApproval,
@@ -150,6 +152,8 @@ function buildQrResolveResponse(req, event, activePhotoMission = null) {
     missionType: activePhotoMission?.type || null,
     missionId: activePhotoMission?.missionId || activePhotoMission?.missionKey || null,
     missionTitle: activePhotoMission?.title || "",
+    missionTarget: activePhotoMission?.target ?? 1,
+    missionCurrent: activePhotoMission?.current ?? 0,
     levelNumber: activePhotoMission?.levelNumber ?? null,
     event: {
       _id: eventId,
@@ -406,16 +410,43 @@ async function ensurePromotionProgressDoc({ userId, clubId }) {
   return progress;
 }
 
-function isPhotoMissionType(type) {
+function isPhotoMissionType(type, mission = null) {
   const normalized = (type || "").toString().trim().toLowerCase();
-  return [
+
+  const exactTypes = new Set([
     "upload_event_photo",
     "event_photo",
     "upload_photo",
     "photo_upload",
     "upload-photo",
     "event-photo",
-  ].includes(normalized);
+    "group_photo",
+    "photo_group",
+    "group-event-photo",
+    "selfie_photo",
+    "photo_selfie",
+  ]);
+
+  if (exactTypes.has(normalized)) return true;
+
+  if (
+    normalized.includes("photo") ||
+    normalized.includes("foto") ||
+    normalized.includes("selfie")
+  ) {
+    return true;
+  }
+
+  const title = (mission?.title || "").toString().trim().toLowerCase();
+  if (
+    title.includes("foto") ||
+    title.includes("photo") ||
+    title.includes("selfie")
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 function isActivePhotoMissionStatus(status) {
@@ -452,7 +483,7 @@ async function resolveActivePhotoMissionForUser({ userId, event }) {
   const missions = Array.isArray(currentLevel.missions) ? currentLevel.missions : [];
   const mission = missions.find((m) => {
     if (!m) return false;
-    return isPhotoMissionType(m.type) && isActivePhotoMissionStatus(m.status);
+    return isPhotoMissionType(m.type, m) && isActivePhotoMissionStatus(m.status);
   });
 
   if (!mission) return null;
@@ -462,6 +493,8 @@ async function resolveActivePhotoMissionForUser({ userId, event }) {
     missionId: mission.missionKey || null,
     type: mission.type || null,
     title: mission.title || "",
+    target: Number(mission.target || 1),
+    current: Number(mission.current || 0),
     levelNumber: currentLevel.levelNumber ?? currentLevelNumber,
     status: mission.status || null,
     requiresApproval: mission.requiresApproval !== false,
