@@ -483,6 +483,7 @@ function unlockNextLevel(progress, completedLevelNumber) {
   progress.currentRewardTitle = next.reward?.title || '';
 }
 
+
 function refreshCurrentSnapshot(progress) {
   const curLevel = findLevel(progress, progress.currentLevel);
   if (!curLevel) {
@@ -494,8 +495,31 @@ function refreshCurrentSnapshot(progress) {
   progress.currentRewardTitle = curLevel.reward?.title || '';
 }
 
-function updatePhotoMissionsForLevel(level, { countApproved = 1 }) {
+function isPhotoMissionType(type) {
+  const normalized = String(type || '').trim().toLowerCase();
+  if (!normalized) return false;
+
+  return (
+    normalized === 'approved_event_photo' ||
+    normalized.includes('photo') ||
+    normalized.includes('foto')
+  );
+}
+
+function updatePhotoMissionsForLevel(
+  level,
+  {
+    countApproved = 1,
+    missionType = null,
+    missionKey = null,
+    missionTitle = null,
+  } = {}
+) {
   if (!level || !Array.isArray(level.missions)) return false;
+
+  const wantedType = String(missionType || '').trim().toLowerCase();
+  const wantedKey = String(missionKey || '').trim();
+  const wantedTitle = String(missionTitle || '').trim().toLowerCase();
 
   let changed = false;
 
@@ -503,9 +527,23 @@ function updatePhotoMissionsForLevel(level, { countApproved = 1 }) {
     if (!mission || mission.active === false) continue;
     if (mission.status === 'completed') continue;
 
-    const type = String(mission.type || '');
+    const currentType = String(mission.type || '').trim().toLowerCase();
+    const currentKey = String(mission.missionKey || '').trim();
+    const currentTitle = String(mission.title || '').trim().toLowerCase();
 
-    if (type !== 'approved_event_photo') {
+    let matchesMission = false;
+
+    if (wantedKey) {
+      matchesMission = currentKey === wantedKey;
+    } else if (wantedType) {
+      matchesMission = currentType === wantedType;
+    } else if (wantedTitle) {
+      matchesMission = currentTitle === wantedTitle;
+    } else {
+      matchesMission = isPhotoMissionType(currentType);
+    }
+
+    if (!matchesMission) {
       continue;
     }
 
@@ -528,6 +566,10 @@ function updatePhotoMissionsForLevel(level, { countApproved = 1 }) {
       mission.status = 'in_progress';
       mission.updatedAt = now();
       changed = true;
+    }
+
+    if (matchesMission && (wantedKey || wantedType || wantedTitle)) {
+      break;
     }
   }
 
@@ -570,6 +612,10 @@ exports.syncPromotionAfterPhotoApproved = async function syncPromotionAfterPhoto
   userId,
   clubId,
   eventId = null,
+  missionType = null,
+  missionKey = null,
+  missionTitle = null,
+  levelNumber = null,
 }) {
   try {
     if (!isValidObjectId(userId) || !isValidObjectId(clubId)) {
@@ -593,8 +639,15 @@ exports.syncPromotionAfterPhotoApproved = async function syncPromotionAfterPhoto
       if (!level) continue;
       if (level.status === 'locked') continue;
       if (level.status === 'completed') continue;
+      if (levelNumber != null && Number(level.levelNumber) !== Number(levelNumber)) continue;
 
-      const levelChanged = updatePhotoMissionsForLevel(level, { countApproved: 1 });
+      const levelChanged = updatePhotoMissionsForLevel(level, {
+        countApproved: 1,
+        missionType,
+        missionKey,
+        missionTitle,
+      });
+
       if (levelChanged) {
         changed = true;
         finalizeLevelIfCompleted(progress, level);
@@ -602,7 +655,11 @@ exports.syncPromotionAfterPhotoApproved = async function syncPromotionAfterPhoto
     }
 
     if (!changed) {
-      return { ok: true, changed: false };
+      return {
+        ok: true,
+        changed: false,
+        reason: 'No matching photo mission found in promotion progress',
+      };
     }
 
     progress.counters = progress.counters || {};
