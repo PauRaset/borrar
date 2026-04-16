@@ -1275,10 +1275,31 @@ router.post("/:id/photos/:photoId/approve", anyAuth, ensureUserId, async (req, r
     await event.save();
 
     // Promotions: solo cuenta cuando está aprobada
+    const approvedPhoto = event.photos[idx];
     const clubId = event.createdBy ? event.createdBy.toString() : null;
-    const uploaderId = event.photos[idx].by ? event.photos[idx].by.toString() : null;
+    const uploaderId = approvedPhoto.by ? approvedPhoto.by.toString() : null;
     if (clubId && uploaderId) {
-      await syncPromotionAfterPhotoApproved({ userId: uploaderId, clubId, eventId: id });
+      await syncPromotionAfterPhotoApproved({
+        userId: uploaderId,
+        clubId,
+        eventId: id,
+        missionType:
+          approvedPhoto.validatedForMissionType ||
+          approvedPhoto.missionType ||
+          null,
+        missionKey:
+          approvedPhoto.validatedForMissionId ||
+          approvedPhoto.missionId ||
+          null,
+        missionTitle:
+          approvedPhoto.validatedForMissionTitle ||
+          approvedPhoto.missionTitle ||
+          null,
+        levelNumber:
+          approvedPhoto.validatedForLevelNumber ??
+          approvedPhoto.levelNumber ??
+          null,
+      });
     }
 
     return res.json({
