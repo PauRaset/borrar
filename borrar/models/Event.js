@@ -25,6 +25,22 @@ const eventPhotoSchema = new mongoose.Schema(
     reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     reviewedAt: { type: Date, default: null },
     reviewNote: { type: String, default: "" },
+
+    // mission metadata captured at upload time (depends on the uploader's current level/mission)
+    missionType: { type: String, default: null },
+    missionId: { type: String, default: null },
+    missionTitle: { type: String, default: null },
+    missionDescription: { type: String, default: null },
+    missionCurrent: { type: Number, default: null },
+    missionTarget: { type: Number, default: null },
+    levelNumber: { type: Number, default: null },
+
+    // moderation result metadata saved by the club when approving/rejecting the photo
+    validatedForMissionType: { type: String, default: null },
+    validatedForMissionId: { type: String, default: null },
+    validatedForMissionTitle: { type: String, default: null },
+    validatedForLevelNumber: { type: Number, default: null },
+    validationResult: { type: String, default: null },
   },
   { _id: false }
 );
@@ -230,6 +246,20 @@ eventSchema.pre("save", function (next) {
           if (copy.reviewedAt === undefined) copy.reviewedAt = null;
           if (copy.reviewNote === undefined) copy.reviewNote = "";
           if (!copy.uploadedAt) copy.uploadedAt = new Date();
+
+          if (copy.missionType === undefined) copy.missionType = null;
+          if (copy.missionId === undefined) copy.missionId = null;
+          if (copy.missionTitle === undefined) copy.missionTitle = null;
+          if (copy.missionDescription === undefined) copy.missionDescription = null;
+          if (copy.missionCurrent === undefined) copy.missionCurrent = null;
+          if (copy.missionTarget === undefined) copy.missionTarget = null;
+          if (copy.levelNumber === undefined) copy.levelNumber = null;
+
+          if (copy.validatedForMissionType === undefined) copy.validatedForMissionType = null;
+          if (copy.validatedForMissionId === undefined) copy.validatedForMissionId = null;
+          if (copy.validatedForMissionTitle === undefined) copy.validatedForMissionTitle = null;
+          if (copy.validatedForLevelNumber === undefined) copy.validatedForLevelNumber = null;
+          if (copy.validationResult === undefined) copy.validationResult = null;
 
           return copy;
         }
