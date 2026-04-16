@@ -93,6 +93,17 @@ function extractPhotoMissionMeta(body = {}) {
     missionType: (body.missionType || body.photoMissionType || body.targetMissionType || "").toString().trim() || null,
     missionId: (body.missionId || body.photoMissionId || body.targetMissionId || "").toString().trim() || null,
     missionTitle: (body.missionTitle || body.photoMissionTitle || body.targetMissionTitle || "").toString().trim() || null,
+    missionDescription:
+      (body.missionDescription ||
+        body.photoMissionDescription ||
+        body.targetMissionDescription ||
+        "").toString().trim() || null,
+    missionCurrent: parseLevelNumberMaybe(
+      body.missionCurrent || body.photoMissionCurrent || body.targetMissionCurrent
+    ),
+    missionTarget: parseLevelNumberMaybe(
+      body.missionTarget || body.photoMissionTarget || body.targetMissionTarget
+    ),
     levelNumber: parseLevelNumberMaybe(body.levelNumber || body.photoLevelNumber || body.targetLevelNumber),
   };
 }
@@ -1212,6 +1223,9 @@ router.get("/:id/photos/moderation", anyAuth, ensureUserId, async (req, res) => 
       missionType: p.missionType || null,
       missionId: p.missionId || null,
       missionTitle: p.missionTitle || null,
+      missionDescription: p.missionDescription || null,
+      missionCurrent: p.missionCurrent ?? null,
+      missionTarget: p.missionTarget ?? null,
       levelNumber: p.levelNumber ?? null,
       validatedForMissionType: p.validatedForMissionType || null,
       validatedForMissionId: p.validatedForMissionId || null,
@@ -1486,6 +1500,9 @@ async function postPhotosHandler(req, res) {
         missionId: missionMeta.missionId,
         missionTitle: missionMeta.missionTitle,
         levelNumber: missionMeta.levelNumber,
+        missionDescription: missionMeta.missionDescription,
+        missionCurrent: missionMeta.missionCurrent,
+        missionTarget: missionMeta.missionTarget,
         validatedForMissionType: null,
         validatedForMissionId: null,
         validatedForMissionTitle: null,
