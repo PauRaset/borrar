@@ -79,6 +79,10 @@ const LevelProgressSchema = new Schema(
     // Progreso calculado (0..1) cacheado (opcional)
     progress: { type: Number, default: 0 },
     completedAt: { type: Date, default: null },
+
+    // Canje de recompensa del nivel
+    rewardRedeemed: { type: Boolean, default: false },
+    rewardRedeemedAt: { type: Date, default: null },
   },
   { _id: false }
 );
@@ -178,6 +182,8 @@ UserClubPromotionProgressSchema.statics.buildFromTemplates = function ({
         reward: t.reward || { type: 'custom', title: '' },
         progress: 0,
         completedAt: null,
+        rewardRedeemed: false,
+        rewardRedeemedAt: null,
       };
     });
 
