@@ -118,6 +118,66 @@ function computeLevelProgress(level) {
   return Math.max(0, Math.min(1, avg));
 }
 
+function isLevelFullyCompleted(level) {
+  if (!level || !Array.isArray(level.missions) || level.missions.length === 0) {
+    return false;
+  }
+
+  return level.missions.every((mission) => mission.status === 'completed');
+}
+
+function shouldBlockLevelUntilRewardRedeemed(level) {
+  if (!level) return false;
+  return isLevelFullyCompleted(level) && level.rewardRedeemed !== true;
+}
+
+function applyRewardGating(progress) {
+  if (!progress || !Array.isArray(progress.levels)) return false;
+
+  let changed = false;
+  const levels = progress.levels;
+  const firstPendingRewardLevel = levels.find((level) => shouldBlockLevelUntilRewardRedeemed(level));
+
+  if (!firstPendingRewardLevel) {
+    return false;
+  }
+
+  const blockedFromLevelNumber = Number(firstPendingRewardLevel.levelNumber) + 1;
+
+  if (Number(progress.currentLevel || 1) !== Number(firstPendingRewardLevel.levelNumber)) {
+    progress.currentLevel = Number(firstPendingRewardLevel.levelNumber);
+    changed = true;
+  }
+
+  for (const level of levels) {
+    if (!level) continue;
+
+    if (Number(level.levelNumber) >= blockedFromLevelNumber) {
+      if (level.status !== 'locked') {
+        level.status = 'locked';
+        changed = true;
+      }
+
+      for (const mission of level.missions || []) {
+        if (mission.status !== 'completed' && mission.status !== 'pending') {
+          if (mission.status !== 'locked') {
+            mission.status = 'locked';
+            mission.updatedAt = now();
+            changed = true;
+          }
+        }
+      }
+    }
+  }
+
+  return changed;
+}
+
+function getNextLevel(progress, levelNumber) {
+  if (!progress || !Array.isArray(progress.levels)) return null;
+  return progress.levels.find((level) => Number(level.levelNumber) === Number(levelNumber) + 1) || null;
+}
+
 
 function normalizeEvidence(evidence) {
   if (!evidence) return [];
@@ -393,6 +453,8 @@ function syncLevelWithTemplate(existingLevel, templateLevel, levelIndex = 0) {
     description: String(templateLevel.description || ''),
     difficulty: String(templateLevel.difficulty || 'medium'),
     reward: templateLevel.reward || null,
+    rewardRedeemed: existingLevel?.rewardRedeemed === true,
+    rewardRedeemedAt: existingLevel?.rewardRedeemedAt || null,
     status: nextStatus,
     active: templateLevel.active !== false,
     visibleInApp: templateLevel.visibleInApp !== false,
@@ -463,16 +525,24 @@ function syncProgressWithTemplates(progress, templates) {
   } else {
     progress.currentLevel = nextLevels[0]?.levelNumber || 1;
   }
+
+  applyRewardGating(progress);
 }
 
 function unlockNextLevel(progress, completedLevelNumber) {
+  const completedLevel = findLevel(progress, completedLevelNumber);
+  if (completedLevel && completedLevel.rewardRedeemed !== true) {
+    progress.currentLevel = Number(completedLevelNumber);
+    progress.currentRewardTitle = completedLevel.reward?.title || '';
+    return;
+  }
+
   const nextLevelNumber = Number(completedLevelNumber) + 1;
   const next = findLevel(progress, nextLevelNumber);
   if (!next) return;
 
   if (next.status === 'locked') {
     next.status = 'in_progress';
-    // Desbloquea misiones del siguiente nivel
     for (const m of next.missions || []) {
       if (m.status === 'locked') m.status = 'in_progress';
       if (!m.startedAt) m.startedAt = now();
@@ -486,11 +556,14 @@ function unlockNextLevel(progress, completedLevelNumber) {
 
 
 function refreshCurrentSnapshot(progress) {
+  applyRewardGating(progress);
+
   const curLevel = findLevel(progress, progress.currentLevel);
   if (!curLevel) {
     progress.currentProgress = 0;
     return;
   }
+
   curLevel.progress = computeLevelProgress(curLevel);
   progress.currentProgress = curLevel.progress;
   progress.currentRewardTitle = curLevel.reward?.title || '';
@@ -591,6 +664,9 @@ function syncCounterBasedMissions(progress, userDoc = null) {
     ) {
       level.status = 'in_progress';
       level.completedAt = null;
+      changed = true;
+    }
+    if (applyRewardGating(progress)) {
       changed = true;
     }
   }
@@ -767,6 +843,10 @@ exports.syncPromotionAfterPhotoApproved = async function syncPromotionAfterPhoto
       }
     }
 
+    if (applyRewardGating(progress)) {
+      changed = true;
+    }
+
     if (!changed) {
       return {
         ok: true,
@@ -875,6 +955,12 @@ exports.getMyPromotions = async (req, res) => {
               visibleInApp: level.visibleInApp !== false,
               progress: Number(level.progress || 0),
               reward: level.reward || null,
+              rewardRedeemed: level.rewardRedeemed === true,
+              rewardRedeemedAt: level.rewardRedeemedAt || null,
+              canRedeemReward:
+                Number(level.levelNumber || 0) === Number(doc.currentLevel || 0) &&
+                Number(level.progress || 0) >= 1 &&
+                level.rewardRedeemed !== true,
               missions: Array.isArray(level.missions)
                 ? level.missions
                     .map((mission) => ({
@@ -936,12 +1022,12 @@ exports.getClubLevelsForUser = async (req, res) => {
     });
 
     // recalcular snapshot
-    let approvedUserDoc = null;
-    if (UserModel && claim.user) {
-      approvedUserDoc = await UserModel.findById(claim.user).lean();
+    let freshUserDoc = mongoUser;
+    if ((!freshUserDoc || !freshUserDoc._id) && UserModel) {
+      freshUserDoc = await UserModel.findById(progress.user).lean();
     }
-    
-    syncCounterBasedMissions(progress, approvedUserDoc);
+
+    syncCounterBasedMissions(progress, freshUserDoc);
     refreshCurrentSnapshot(progress);
     progress.lastActivityAt = now();
     await progress.save();
@@ -952,7 +1038,17 @@ exports.getClubLevelsForUser = async (req, res) => {
       currentLevel: progress.currentLevel,
       currentProgress: progress.currentProgress,
       pendingClaimsCount: progress.pendingClaimsCount || 0,
-      levels: progress.levels,
+      levels: Array.isArray(progress.levels)
+        ? progress.levels.map((level) => ({
+            ...level.toObject(),
+            rewardRedeemed: level.rewardRedeemed === true,
+            rewardRedeemedAt: level.rewardRedeemedAt || null,
+            canRedeemReward:
+              Number(level.levelNumber || 0) === Number(progress.currentLevel || 0) &&
+              Number(level.progress || 0) >= 1 &&
+              level.rewardRedeemed !== true,
+          }))
+        : [],
     });
   } catch (e) {
     console.error('[promotions] getClubLevelsForUser error:', e);
@@ -1200,6 +1296,7 @@ exports.approveClaim = async (req, res) => {
       }
     }
 
+    applyRewardGating(progress);
     refreshCurrentSnapshot(progress);
     progress.lastActivityAt = now();
     await progress.save();
@@ -1259,6 +1356,7 @@ exports.rejectClaim = async (req, res) => {
       }
       
       syncCounterBasedMissions(progress, rejectedUserDoc);
+      applyRewardGating(progress);
       refreshCurrentSnapshot(progress);
       progress.lastActivityAt = now();
       await progress.save();
@@ -1268,6 +1366,105 @@ exports.rejectClaim = async (req, res) => {
     return res.json({ ok: true, claim });
   } catch (e) {
     console.error('[promotions] rejectClaim error:', e);
+    return res.status(500).json({ ok: false, error: 'Server error' });
+  }
+};
+
+exports.redeemCurrentLevelReward = async (req, res) => {
+  try {
+    const { clubId } = req.params;
+    if (!isValidObjectId(clubId)) {
+      return res.status(400).json({ ok: false, error: 'Invalid clubId' });
+    }
+
+    const { mongoUser } = await getAuthUser(req);
+    if (!mongoUser || !mongoUser._id) {
+      return res.status(401).json({ ok: false, error: 'Unauthorized: missing mongo user' });
+    }
+
+    const templates = await getTemplatesForClub(clubId);
+    if (!templates.length) {
+      return res.status(500).json({ ok: false, error: 'No templates found. Seed PromotionLevelTemplate first.' });
+    }
+
+    let freshUserDoc = mongoUser;
+    if ((!freshUserDoc || !freshUserDoc._id) && UserModel) {
+      freshUserDoc = await UserModel.findById(mongoUser._id).lean();
+    }
+
+    const progress = await ensureProgressDoc({
+      userId: mongoUser._id,
+      clubId,
+      templates,
+      userDoc: freshUserDoc,
+    });
+
+    syncCounterBasedMissions(progress, freshUserDoc);
+    applyRewardGating(progress);
+
+    const level = findLevel(progress, progress.currentLevel);
+    if (!level) {
+      return res.status(404).json({ ok: false, error: 'Current level not found' });
+    }
+
+    if (Number(level.progress || 0) < 1 || !isLevelFullyCompleted(level)) {
+      return res.status(400).json({ ok: false, error: 'Current level is not completed yet' });
+    }
+
+    if (level.rewardRedeemed === true) {
+      return res.status(409).json({ ok: false, error: 'Reward already redeemed for this level' });
+    }
+
+    level.rewardRedeemed = true;
+    level.rewardRedeemedAt = now();
+    level.updatedAt = now();
+
+    const nextLevel = getNextLevel(progress, level.levelNumber);
+    if (nextLevel) {
+      if (nextLevel.status === 'locked') {
+        nextLevel.status = 'in_progress';
+      }
+
+      for (const mission of nextLevel.missions || []) {
+        if (mission.status === 'locked') {
+          mission.status = 'in_progress';
+          mission.updatedAt = now();
+        }
+        if (!mission.startedAt) {
+          mission.startedAt = now();
+        }
+      }
+
+      progress.currentLevel = nextLevel.levelNumber;
+    } else {
+      progress.currentLevel = level.levelNumber;
+    }
+
+    refreshCurrentSnapshot(progress);
+    progress.lastActivityAt = now();
+    await progress.save();
+
+    return res.json({
+      ok: true,
+      clubId,
+      currentLevel: progress.currentLevel,
+      currentProgress: progress.currentProgress,
+      redeemedLevelNumber: level.levelNumber,
+      redeemedAt: level.rewardRedeemedAt,
+      levels: Array.isArray(progress.levels)
+        ? progress.levels.map((entry) => ({
+            ...entry.toObject(),
+            rewardRedeemed: entry.rewardRedeemed === true,
+            rewardRedeemedAt: entry.rewardRedeemedAt || null,
+            canRedeemReward:
+              Number(entry.levelNumber || 0) === Number(progress.currentLevel || 0) &&
+              Number(entry.progress || 0) >= 1 &&
+              entry.rewardRedeemed !== true,
+          }))
+        : [],
+    });
+  } catch (e) {
+    console.error('[promotions] redeemCurrentLevelReward error:', e);
     return res.status(500).json({ ok: false, error: 'Server error' });
   }
 };
