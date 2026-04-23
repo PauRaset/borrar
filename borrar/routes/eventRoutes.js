@@ -371,9 +371,37 @@ function updateAttendMissionsForLevel(level, counters) {
   }
 }
 
-function updatePhotoMissionsForLevel(level, eventId, counters) {
+function updatePhotoMissionsForLevel(level, eventId, counters, missionMatch = null) {
+  let matched = false;
+
   for (const m of level.missions || []) {
-    if (m.type !== "upload_event_photo") continue;
+    if (!isPhotoMissionType(m.type, m)) continue;
+
+    const missionKeyMatches =
+      missionMatch?.missionKey &&
+      String(m.missionKey || "") === String(missionMatch.missionKey);
+
+    const missionTypeMatches =
+      missionMatch?.missionType &&
+      String(m.type || "") === String(missionMatch.missionType);
+
+    const missionTitleMatches =
+      missionMatch?.missionTitle &&
+      String(m.title || "").trim().toLowerCase() ===
+        String(missionMatch.missionTitle || "").trim().toLowerCase();
+
+    const noSpecificMissionRequested =
+      !missionMatch ||
+      (!missionMatch.missionKey && !missionMatch.missionType && !missionMatch.missionTitle);
+
+    const sameMission =
+      noSpecificMissionRequested ||
+      missionKeyMatches ||
+      missionTypeMatches ||
+      missionTitleMatches;
+
+    if (!sameMission) continue;
+    matched = true;
 
     const perEvent = !!(m.params && m.params.perEvent) || !!(m.meta && m.meta.perEvent);
 
@@ -401,6 +429,8 @@ function updatePhotoMissionsForLevel(level, eventId, counters) {
 
     m.updatedAt = new Date();
   }
+
+  return matched;
 }
 
 
@@ -552,7 +582,15 @@ async function syncPromotionAfterAttend({ userId, clubId, eventId, attendedNow }
   }
 }
 
-async function syncPromotionAfterPhotoApproved({ userId, clubId, eventId }) {
+async function syncPromotionAfterPhotoApproved({
+  userId,
+  clubId,
+  eventId,
+  missionType = null,
+  missionKey = null,
+  missionTitle = null,
+  levelNumber = null,
+}) {
   try {
     const progress = await ensurePromotionProgressDoc({ userId, clubId });
     if (!progress) return;
@@ -560,9 +598,69 @@ async function syncPromotionAfterPhotoApproved({ userId, clubId, eventId }) {
     progress.counters = progress.counters || {};
     progress.counters.photosUploadedInClub = clampNonNegative((progress.counters.photosUploadedInClub || 0) + 1);
 
-    for (const lvl of progress.levels || []) {
-      updatePhotoMissionsForLevel(lvl, eventId, progress.counters);
+    const levels = progress.levels || [];
+    const numericLevelNumber = levelNumber == null ? null : Number(levelNumber);
+
+    let matchedMission = false;
+
+    for (const lvl of levels) {
+      const sameLevel = numericLevelNumber == null || Number(lvl.levelNumber) === numericLevelNumber;
+      if (!sameLevel) {
+        lvl.progress = computeLevelProgress(lvl);
+        continue;
+      }
+
+      const matchedInLevel = updatePhotoMissionsForLevel(
+        lvl,
+        eventId,
+        progress.counters,
+        {
+          missionKey: missionKey || null,
+          missionType: missionType || null,
+          missionTitle: missionTitle || null,
+        }
+      );
+
+      if (matchedInLevel) {
+        matchedMission = true;
+      }
+
       lvl.progress = computeLevelProgress(lvl);
+    }
+
+    if (!matchedMission) {
+      const currentLevel = (progress.levels || []).find(
+        (lvl) => numericLevelNumber == null || Number(lvl.levelNumber) === numericLevelNumber
+      );
+
+      if (currentLevel) {
+        const fallbackMission = (currentLevel.missions || []).find((m) =>
+          isPhotoMissionType(m.type, m) &&
+          ["in_progress", "pending", "rejected"].includes(String(m.status || "").toLowerCase())
+        );
+
+        if (fallbackMission) {
+          updatePhotoMissionsForLevel(currentLevel, eventId, progress.counters, {
+            missionKey: fallbackMission.missionKey || null,
+            missionType: fallbackMission.type || null,
+            missionTitle: fallbackMission.title || null,
+          });
+          currentLevel.progress = computeLevelProgress(currentLevel);
+          matchedMission = true;
+        }
+      }
+    }
+
+    if (!matchedMission) {
+      console.warn("[promotions] syncPromotionAfterPhotoApproved: no mission matched", {
+        userId: String(userId || ""),
+        clubId: String(clubId || ""),
+        eventId: String(eventId || ""),
+        missionType,
+        missionKey,
+        missionTitle,
+        levelNumber,
+      });
     }
 
     let guard = 0;
