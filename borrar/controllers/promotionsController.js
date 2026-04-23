@@ -292,7 +292,7 @@ async function getTemplatesForClub(clubId) {
   return (globalTemplates || []).sort((a, b) => a.levelNumber - b.levelNumber);
 }
 
-async function ensureProgressDoc({ userId, clubId, templates }) {
+async function ensureProgressDoc({ userId, clubId, templates, userDoc = null }) {
   let progress = await UserClubPromotionProgress.findOne({ user: userId, club: clubId });
 
   if (!progress) {
@@ -305,6 +305,7 @@ async function ensureProgressDoc({ userId, clubId, templates }) {
   }
 
   syncProgressWithTemplates(progress, templates);
+  syncCounterBasedMissions(progress, userDoc);
   refreshCurrentSnapshot(progress);
   progress.lastActivityAt = now();
   await progress.save();
@@ -495,6 +496,112 @@ function refreshCurrentSnapshot(progress) {
   progress.currentRewardTitle = curLevel.reward?.title || '';
 }
 
+function getUserFollowedUsersCount(userDoc) {
+  if (!userDoc || typeof userDoc !== 'object') return 0;
+
+  if (Array.isArray(userDoc.following)) return userDoc.following.length;
+  if (Array.isArray(userDoc.followingUsers)) return userDoc.followingUsers.length;
+  if (Array.isArray(userDoc.follows)) return userDoc.follows.length;
+
+  const numericCandidates = [
+    userDoc.followingCount,
+    userDoc.followedUsersCount,
+    userDoc.followCount,
+    userDoc.following_count,
+  ];
+
+  for (const value of numericCandidates) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+
+  return 0;
+}
+
+function isFollowUsersMissionType(type) {
+  const normalized = String(type || '').trim().toLowerCase();
+  if (!normalized) return false;
+
+  return [
+    'follow_users',
+    'followed_users',
+    'follow_users_count',
+    'follow_count',
+    'following_count',
+    'seguir_usuarios',
+    'usuarios_seguidos',
+  ].includes(normalized);
+}
+
+function syncCounterBasedMissions(progress, userDoc = null) {
+  if (!progress || !Array.isArray(progress.levels)) return false;
+
+  const followedUsersCount = getUserFollowedUsersCount(userDoc);
+  let changed = false;
+
+  progress.counters = progress.counters || {};
+  if (Number(progress.counters.followedUsers || 0) !== followedUsersCount) {
+    progress.counters.followedUsers = followedUsersCount;
+    changed = true;
+  }
+
+  for (const level of progress.levels) {
+    if (!level || !Array.isArray(level.missions)) continue;
+
+    for (const mission of level.missions) {
+      if (!mission || mission.active === false) continue;
+      if (!isFollowUsersMissionType(mission.type)) continue;
+
+      const target = Number(mission.target || 1);
+      const nextCurrent = Math.max(0, Math.min(target, followedUsersCount));
+      const prevCurrent = Number(mission.current || 0);
+
+      if (prevCurrent !== nextCurrent) {
+        mission.current = nextCurrent;
+        mission.updatedAt = now();
+        changed = true;
+      }
+
+      const shouldBeCompleted = nextCurrent >= target;
+      if (shouldBeCompleted && mission.status !== 'completed') {
+        mission.status = 'completed';
+        mission.completedAt = mission.completedAt || now();
+        mission.updatedAt = now();
+        changed = true;
+      } else if (!shouldBeCompleted) {
+        const desiredStatus = level.status === 'locked' ? 'locked' : 'in_progress';
+        if (mission.status !== desiredStatus && mission.status !== 'pending') {
+          mission.status = desiredStatus;
+          mission.completedAt = null;
+          mission.updatedAt = now();
+          changed = true;
+        }
+      }
+    }
+
+    const levelWasCompleted = level.status === 'completed';
+    level.progress = computeLevelProgress(level);
+
+    if (finalizeLevelIfCompleted(progress, level)) {
+      changed = true;
+    } else if (
+      levelWasCompleted &&
+      Array.isArray(level.missions) &&
+      level.missions.some((m) => m.status !== 'completed')
+    ) {
+      level.status = 'in_progress';
+      level.completedAt = null;
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    refreshCurrentSnapshot(progress);
+  }
+
+  return changed;
+}
+
 function isPhotoMissionType(type) {
   const normalized = String(type || '').trim().toLowerCase();
   if (!normalized) return false;
@@ -627,10 +734,16 @@ exports.syncPromotionAfterPhotoApproved = async function syncPromotionAfterPhoto
       return { ok: false, error: 'No templates found' };
     }
 
+    let userDoc = null;
+    if (UserModel && isValidObjectId(userId)) {
+      userDoc = await UserModel.findById(userId).lean();
+    }
+    
     const progress = await ensureProgressDoc({
       userId,
       clubId,
       templates,
+      userDoc,
     });
 
     let changed = false;
@@ -714,15 +827,21 @@ exports.getMyPromotions = async (req, res) => {
       const clubDoc = clubId ? (clubsById[clubId] || null) : null;
 
       const templates = clubId && isValidObjectId(clubId)
-        ? await getTemplatesForClub(clubId)
-        : [];
-
-      if (templates.length) {
-        syncProgressWithTemplates(doc, templates);
-        refreshCurrentSnapshot(doc);
-        doc.lastActivityAt = now();
-        await doc.save();
+      ? await getTemplatesForClub(clubId)
+      : [];
+    
+    if (templates.length) {
+      let freshUserDoc = mongoUser;
+      if ((!freshUserDoc || !freshUserDoc._id) && UserModel && doc.user) {
+        freshUserDoc = await UserModel.findById(doc.user).lean();
       }
+    
+      syncProgressWithTemplates(doc, templates);
+      syncCounterBasedMissions(doc, freshUserDoc);
+      refreshCurrentSnapshot(doc);
+      doc.lastActivityAt = now();
+      await doc.save();
+    }
 
       promotions.push({
         id: doc._id.toString(),
@@ -813,9 +932,16 @@ exports.getClubLevelsForUser = async (req, res) => {
       userId: mongoUser._id,
       clubId,
       templates,
+      userDoc: mongoUser,
     });
 
     // recalcular snapshot
+    let approvedUserDoc = null;
+    if (UserModel && claim.user) {
+      approvedUserDoc = await UserModel.findById(claim.user).lean();
+    }
+    
+    syncCounterBasedMissions(progress, approvedUserDoc);
     refreshCurrentSnapshot(progress);
     progress.lastActivityAt = now();
     await progress.save();
@@ -871,6 +997,7 @@ exports.createClaim = async (req, res) => {
       userId: mongoUser._id,
       clubId,
       templates,
+      userDoc: mongoUser,
     });
 
     const level = findLevel(progress, levelNumber);
@@ -1125,6 +1252,13 @@ exports.rejectClaim = async (req, res) => {
         mission.updatedAt = now();
       }
       if (level) level.progress = computeLevelProgress(level);
+
+      let rejectedUserDoc = null;
+      if (UserModel && claim.user) {
+        rejectedUserDoc = await UserModel.findById(claim.user).lean();
+      }
+      
+      syncCounterBasedMissions(progress, rejectedUserDoc);
       refreshCurrentSnapshot(progress);
       progress.lastActivityAt = now();
       await progress.save();
