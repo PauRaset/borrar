@@ -16,6 +16,10 @@ router.get('/my', requireFirebase, promotionsController.getMyPromotions);
 
 // Devuelve niveles (10) + progreso del usuario para un club
 // GET /api/promotions/:clubId/levels
+
+// Canjear la recompensa del nivel actual completado
+// POST /api/promotions/:clubId/redeem
+router.post('/:clubId/redeem', requireFirebase, promotionsController.redeemCurrentLevelReward);
 router.get('/:clubId/levels', requireFirebase, promotionsController.getClubLevelsForUser);
 
 // Crear un claim (subir prueba: foto/qr/text) para una misión
