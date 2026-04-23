@@ -1,6 +1,7 @@
-const User = require('../models/User');
 // controllers/socialController.js
 const mongoose = require('mongoose');
+const User = require('../models/User');
+const UserClubPromotionProgress = require('../models/UserClubPromotionProgress');
 
 // Helpers
 const oid = (v) => {
@@ -18,6 +19,30 @@ const isObjectId = (v) => {
   }
 };
 const pickUserId = (req) => req.userId || req.user?.id || req.user?._id;
+
+const syncFollowedUsersPromotionCounter = async (userId) => {
+  try {
+    if (!userId) return;
+
+    const user = await User.findById(userId).select('_id following');
+    if (!user) return;
+
+    const followedUsersCount = Array.isArray(user.following) ? user.following.length : 0;
+
+    await UserClubPromotionProgress.updateMany(
+      { user: oid(user._id) },
+      {
+        $set: {
+          'counters.followedUsers': followedUsersCount,
+        },
+      }
+    );
+
+    console.log('[promotions][followedUsers] synced user=', String(user._id), 'count=', followedUsersCount);
+  } catch (err) {
+    console.error('[promotions][followedUsers] sync error', err);
+  }
+};
 
 // Safe resolve user by key (either ObjectId or firebaseUid)
 const resolveUserByKey = async (key) => {
@@ -78,6 +103,7 @@ exports.toggleFollow = async (req, res) => {
         User.updateOne({ _id: oid(target._id) }, { $addToSet: { followers: oid(me._id) }, $inc: { followersCount: 1 } }),
       ]);
     }
+    await syncFollowedUsersPromotionCounter(me._id);
 
     // Leer contadores consistentes tras la operación
     const t2 = await User.findById(target._id).select('_id followersCount followingCount followers');
@@ -130,6 +156,8 @@ exports.followUser = async (req, res) => {
         User.updateOne({ _id: oid(me._id) }, { $addToSet: { following: oid(target._id) }, $inc: { followingCount: 1 } }),
         User.updateOne({ _id: oid(target._id) }, { $addToSet: { followers: oid(me._id) }, $inc: { followersCount: 1 } }),
       ]);
+
+      await syncFollowedUsersPromotionCounter(me._id);
     }
 
     const t2 = await User.findById(target._id).select('_id followersCount followingCount followers');
@@ -176,6 +204,8 @@ exports.unfollowUser = async (req, res) => {
       User.updateOne({ _id: oid(me._id) }, { $pull: { following: oid(target._id) }, $inc: { followingCount: -1 } }),
       User.updateOne({ _id: oid(target._id) }, { $pull: { followers: oid(me._id) }, $inc: { followersCount: -1 } }),
     ]);
+
+    await syncFollowedUsersPromotionCounter(me._id);
 
     const t2 = await User.findById(target._id).select('_id followersCount followingCount followers');
     return res.json({
