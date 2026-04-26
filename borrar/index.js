@@ -1074,7 +1074,13 @@ if (paymentRoutes) {
 // Shares: generar links con refCode y redirects de tracking
 if (shareRoutes) {
   app.use('/api/share', shareRoutes);
+
+  // Ruta pública corta para compartir: https://dominio/r/:refCode
+  // Reutiliza el mismo router sin exponer /create fuera de /api/share.
+  app.get('/r/:refCode', (req, res, next) => shareRoutes(req, res, next));
+
   console.log('✅ Mounted /api/share');
+  console.log('✅ Mounted public share redirect /r/:refCode');
 } else {
   console.warn('⚠️ /api/share NO montado (shareRoutes=null).');
 }
