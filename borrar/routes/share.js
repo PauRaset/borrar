@@ -61,13 +61,150 @@ function joinUrl(base, path) {
   return `${b}${p}`;
 }
 
-function buildDirectUrl({ apiBase, eventId, refCode, channel }) {
-  const base = apiBase || '';
+function buildAppEventUrl({ eventId, refCode, channel }) {
+  const appScheme = (process.env.APP_SCHEME || 'nightvibe://').trim().replace(/\/$/, '');
   const qs = new URLSearchParams();
   if (refCode) qs.set('ref', refCode);
   if (channel) qs.set('ch', channel);
   const q = qs.toString();
-  return `${base}/api/payments/direct/${eventId}${q ? `?${q}` : ''}`;
+  return `${appScheme}/event/${eventId}${q ? `?${q}` : ''}`;
+}
+
+function pickIosStoreUrl() {
+  return (process.env.IOS_APP_STORE_URL || 'https://apps.apple.com').trim();
+}
+
+function pickAndroidStoreUrl() {
+  return (process.env.ANDROID_PLAY_STORE_URL || 'https://play.google.com/store').trim();
+}
+
+function isIosUserAgent(ua) {
+  const text = String(ua || '').toLowerCase();
+  return /iphone|ipad|ipod/.test(text);
+}
+
+function isAndroidUserAgent(ua) {
+  const text = String(ua || '').toLowerCase();
+  return /android/.test(text);
+}
+
+function buildShareRedirectHtml({ appUrl, iosStoreUrl, androidStoreUrl, fallbackStoreUrl }) {
+  const safeAppUrl = String(appUrl || '').replace(/"/g, '&quot;');
+  const safeIosStoreUrl = String(iosStoreUrl || '').replace(/"/g, '&quot;');
+  const safeAndroidStoreUrl = String(androidStoreUrl || '').replace(/"/g, '&quot;');
+  const safeFallbackStoreUrl = String(fallbackStoreUrl || '').replace(/"/g, '&quot;');
+
+  return `<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NightVibe</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        background: #0d111b;
+        color: #ffffff;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        padding: 24px;
+        text-align: center;
+      }
+      .card {
+        width: 100%;
+        max-width: 420px;
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 18px;
+        padding: 24px;
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: 24px;
+      }
+      p {
+        margin: 0 0 18px;
+        color: rgba(255,255,255,0.78);
+        line-height: 1.45;
+      }
+      .btn {
+        display: inline-block;
+        padding: 14px 18px;
+        border-radius: 14px;
+        background: #00e5ff;
+        color: #0d111b;
+        text-decoration: none;
+        font-weight: 800;
+      }
+      .links {
+        margin-top: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .small {
+        color: rgba(255,255,255,0.54);
+        font-size: 12px;
+      }
+      .hidden {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Abriendo NightVibe…</h1>
+      <p>Si tienes la app instalada, se abrirá automáticamente. Si no, te enviaremos a la tienda para descargarla.</p>
+      <a id="openApp" class="btn" href="${safeAppUrl}">Abrir la app</a>
+      <div class="links">
+        <a id="iosStore" class="small hidden" href="${safeIosStoreUrl}">Descargar en App Store</a>
+        <a id="androidStore" class="small hidden" href="${safeAndroidStoreUrl}">Descargar en Google Play</a>
+        <a id="fallbackStore" class="small hidden" href="${safeFallbackStoreUrl}">Descargar la app</a>
+      </div>
+    </div>
+    <script>
+      (function () {
+        var ua = navigator.userAgent || '';
+        var isIOS = /iPhone|iPad|iPod/i.test(ua);
+        var isAndroid = /Android/i.test(ua);
+        var appUrl = ${JSON.stringify(String(appUrl || ''))};
+        var iosStoreUrl = ${JSON.stringify(String(iosStoreUrl || ''))};
+        var androidStoreUrl = ${JSON.stringify(String(androidStoreUrl || ''))};
+        var fallbackStoreUrl = ${JSON.stringify(String(fallbackStoreUrl || ''))};
+        var targetStoreUrl = isIOS ? iosStoreUrl : (isAndroid ? androidStoreUrl : fallbackStoreUrl);
+
+        var iosLink = document.getElementById('iosStore');
+        var androidLink = document.getElementById('androidStore');
+        var fallbackLink = document.getElementById('fallbackStore');
+
+        if (isIOS && iosLink) iosLink.classList.remove('hidden');
+        if (isAndroid && androidLink) androidLink.classList.remove('hidden');
+        if (!isIOS && !isAndroid && fallbackLink) fallbackLink.classList.remove('hidden');
+
+        var didHide = false;
+        var fallbackTimer = setTimeout(function () {
+          if (!didHide && targetStoreUrl) {
+            window.location.replace(targetStoreUrl);
+          }
+        }, 1400);
+
+        document.addEventListener('visibilitychange', function () {
+          if (document.hidden) {
+            didHide = true;
+            clearTimeout(fallbackTimer);
+          }
+        });
+
+        if (appUrl) {
+          window.location.href = appUrl;
+        }
+      })();
+    </script>
+  </body>
+</html>`;
 }
 
 // GET /api/share/r/:refCode
@@ -106,15 +243,28 @@ router.get('/r/:refCode', async (req, res) => {
 
     await link.save();
 
-    const apiBase = pickApiBase(req);
-    const directUrl = buildDirectUrl({
-      apiBase,
+    const appUrl = buildAppEventUrl({
       eventId: String(link.eventId),
       refCode: link.refCode,
       channel: link.channel ? String(link.channel) : null,
     });
+    const iosStoreUrl = pickIosStoreUrl();
+    const androidStoreUrl = pickAndroidStoreUrl();
+    const fallbackStoreUrl = isIosUserAgent(ua)
+      ? iosStoreUrl
+      : isAndroidUserAgent(ua)
+      ? androidStoreUrl
+      : iosStoreUrl || androidStoreUrl;
 
-    return res.redirect(302, directUrl);
+    const html = buildShareRedirectHtml({
+      appUrl,
+      iosStoreUrl,
+      androidStoreUrl,
+      fallbackStoreUrl,
+    });
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(200).send(html);
   } catch (e) {
     console.error('[share/r]', e);
     return res.status(500).send('server_error');
@@ -155,21 +305,19 @@ router.post('/create', async (req, res) => {
       });
     }
 
-    const apiBase = pickApiBase(req);
     const shareBase = pickShareBase(req);
 
-    // Prefer tracking redirect URL when sharing (use public domain if available)
+    // Public tracking URL to share with others
     const shareUrl = joinUrl(shareBase, `/r/${encodeURIComponent(link.refCode)}`);
 
-    // Keep direct URL for compatibility
-    const directUrl = buildDirectUrl({
-      apiBase,
+    // App deep-link for internal use / debugging
+    const appUrl = buildAppEventUrl({
       eventId: String(eventId),
       refCode: link.refCode,
       channel: link.channel ? String(channel) : null,
     });
 
-    return res.json({ ok: true, refCode: link.refCode, shareUrl, directUrl });
+    return res.json({ ok: true, refCode: link.refCode, shareUrl, appUrl });
   } catch (e) {
     console.error('[share/create]', e);
     return res.status(500).json({ ok: false, error: 'server_error' });
