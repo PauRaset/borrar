@@ -118,12 +118,25 @@ function computeLevelProgress(level) {
   return Math.max(0, Math.min(1, avg));
 }
 
+function isMissionEffectivelyCompleted(mission) {
+  if (!mission || typeof mission !== 'object') return false;
+
+  const status = String(mission.status || '').trim().toLowerCase();
+  const target = Number(mission.target || 1);
+  const current = Number(mission.current || 0);
+
+  if (status === 'completed' || status === 'approved') return true;
+  if (target > 0 && current >= target) return true;
+
+  return false;
+}
+
 function isLevelFullyCompleted(level) {
   if (!level || !Array.isArray(level.missions) || level.missions.length === 0) {
     return false;
   }
 
-  return level.missions.every((mission) => mission.status === 'completed');
+  return level.missions.every((mission) => isMissionEffectivelyCompleted(mission));
 }
 
 function shouldBlockLevelUntilRewardRedeemed(level) {
@@ -442,7 +455,7 @@ function syncLevelWithTemplate(existingLevel, templateLevel, levelIndex = 0) {
     : [];
 
   let nextStatus = existingLevel?.status || (nextLevelNumber === 1 ? 'in_progress' : 'locked');
-  if (nextMissions.length && nextMissions.every((mission) => mission.status === 'completed')) {
+  if (nextMissions.length && nextMissions.every((mission) => isMissionEffectivelyCompleted(mission))) {
     nextStatus = 'completed';
   }
 
@@ -768,7 +781,7 @@ function finalizeLevelIfCompleted(progress, level) {
 
   const allDone =
     level.missions.length > 0 &&
-    level.missions.every((m) => m.status === 'completed');
+    level.missions.every((m) => isMissionEffectivelyCompleted(m));
 
   if (!allDone) return false;
 
@@ -1284,7 +1297,7 @@ exports.approveClaim = async (req, res) => {
     if (level) {
       // Si todas misiones completadas => nivel completado
       const missions = level.missions || [];
-      const allDone = missions.length > 0 && missions.every((m) => m.status === 'completed');
+      const allDone = missions.length > 0 && missions.every((m) => isMissionEffectivelyCompleted(m));
       level.progress = computeLevelProgress(level);
 
       if (allDone && level.status !== 'completed') {
