@@ -23,7 +23,6 @@ function sha256(input) {
   return createHash('sha256').update(String(input || '')).digest('hex');
 }
 
-
 function getClientIp(req) {
   const xff = req.headers['x-forwarded-for'];
   if (typeof xff === 'string' && xff.length) {
@@ -146,8 +145,9 @@ function buildShareRedirectHtml({ appUrl, iosStoreUrl, androidStoreUrl, fallback
         gap: 10px;
       }
       .small {
-        color: rgba(255,255,255,0.54);
-        font-size: 12px;
+        color: rgba(255,255,255,0.64);
+        font-size: 13px;
+        text-decoration: none;
       }
       .hidden {
         display: none;
@@ -157,12 +157,13 @@ function buildShareRedirectHtml({ appUrl, iosStoreUrl, androidStoreUrl, fallback
   <body>
     <div class="card">
       <h1>Abriendo NightVibe…</h1>
-      <p>Si tienes la app instalada, se abrirá automáticamente. Si no, te enviaremos a la tienda para descargarla.</p>
-      <a id="openApp" class="btn" href="${safeAppUrl}">Abrir la app</a>
+      <p>Si no tienes la app instalada, te enviaremos a la tienda para descargarla. Si ya la tienes, también puedes intentar abrirla manualmente.</p>
+      <a id="primaryStore" class="btn" href="${safeFallbackStoreUrl}">Descargar la app</a>
       <div class="links">
-        <a id="iosStore" class="small hidden" href="${safeIosStoreUrl}">Descargar en App Store</a>
-        <a id="androidStore" class="small hidden" href="${safeAndroidStoreUrl}">Descargar en Google Play</a>
-        <a id="fallbackStore" class="small hidden" href="${safeFallbackStoreUrl}">Descargar la app</a>
+        <a id="openApp" class="small" href="${safeAppUrl}">Intentar abrir la app</a>
+        <a id="iosStore" class="small hidden" href="${safeIosStoreUrl}">Abrir App Store</a>
+        <a id="androidStore" class="small hidden" href="${safeAndroidStoreUrl}">Abrir Google Play</a>
+        <a id="fallbackStore" class="small hidden" href="${safeFallbackStoreUrl}">Abrir tienda</a>
       </div>
     </div>
     <script>
@@ -170,37 +171,28 @@ function buildShareRedirectHtml({ appUrl, iosStoreUrl, androidStoreUrl, fallback
         var ua = navigator.userAgent || '';
         var isIOS = /iPhone|iPad|iPod/i.test(ua);
         var isAndroid = /Android/i.test(ua);
-        var appUrl = ${JSON.stringify(String(appUrl || ''))};
         var iosStoreUrl = ${JSON.stringify(String(iosStoreUrl || ''))};
         var androidStoreUrl = ${JSON.stringify(String(androidStoreUrl || ''))};
         var fallbackStoreUrl = ${JSON.stringify(String(fallbackStoreUrl || ''))};
         var targetStoreUrl = isIOS ? iosStoreUrl : (isAndroid ? androidStoreUrl : fallbackStoreUrl);
 
+        var primaryStore = document.getElementById('primaryStore');
         var iosLink = document.getElementById('iosStore');
         var androidLink = document.getElementById('androidStore');
         var fallbackLink = document.getElementById('fallbackStore');
 
+        if (primaryStore && targetStoreUrl) {
+          primaryStore.href = targetStoreUrl;
+          primaryStore.textContent = isIOS
+            ? 'Descargar en App Store'
+            : isAndroid
+            ? 'Descargar en Google Play'
+            : 'Descargar la app';
+        }
+
         if (isIOS && iosLink) iosLink.classList.remove('hidden');
         if (isAndroid && androidLink) androidLink.classList.remove('hidden');
         if (!isIOS && !isAndroid && fallbackLink) fallbackLink.classList.remove('hidden');
-
-        var didHide = false;
-        var fallbackTimer = setTimeout(function () {
-          if (!didHide && targetStoreUrl) {
-            window.location.replace(targetStoreUrl);
-          }
-        }, 1400);
-
-        document.addEventListener('visibilitychange', function () {
-          if (document.hidden) {
-            didHide = true;
-            clearTimeout(fallbackTimer);
-          }
-        });
-
-        if (appUrl) {
-          window.location.href = appUrl;
-        }
       })();
     </script>
   </body>
@@ -208,7 +200,7 @@ function buildShareRedirectHtml({ appUrl, iosStoreUrl, androidStoreUrl, fallback
 }
 
 // GET /api/share/r/:refCode
-// Registra click (+ unique aproximado) y redirige al link de compra
+// Registra click (+ unique aproximado) y muestra landing con intento de abrir app / tienda
 router.get('/r/:refCode', async (req, res) => {
   try {
     const refCode = typeof req.params.refCode === 'string' ? req.params.refCode.trim().slice(0, 64) : '';
