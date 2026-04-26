@@ -4,6 +4,7 @@ const router = express.Router();
 
 const Order = require('../models/Order');
 const Event = require('../models/Event');
+const mongoose = require('mongoose');
 
 // (Opcional) clicks/uniqueClicks desde ShareLink
 let ShareLink;
@@ -12,6 +13,307 @@ try { ShareLink = require('../models/ShareLink'); } catch (_) { ShareLink = null
 // (Opcional) si quieres devolver username
 let User;
 try { User = require('../models/User'); } catch (_) { User = null; }
+
+const isValidObjectId = (v) => mongoose.Types.ObjectId.isValid(String(v || ''));
+
+async function enrichUsers(items, idKey = 'userId') {
+  if (!User || !Array.isArray(items) || items.length === 0) return items || [];
+
+  const ids = items
+    .map((item) => String(item?.[idKey] || ''))
+    .filter((id) => isValidObjectId(id));
+
+  if (!ids.length) return items;
+
+  const users = await User.find({ _id: { $in: ids } })
+    .select('username profilePicture')
+    .lean();
+
+  const byId = new Map(users.map((u) => [String(u._id), u]));
+
+  return items.map((item) => ({
+    ...item,
+    user: byId.get(String(item?.[idKey] || '')) || null,
+  }));
+}
+/**
+ * GET /api/referrals/club/:clubId/summary
+ * Resumen global del club: KPIs, top usuarios, top eventos y canales.
+ */
+router.get('/club/:clubId/summary', async (req, res) => {
+  try {
+    const { clubId } = req.params;
+    if (!clubId) {
+      return res.status(400).json({ ok: false, error: 'clubId required' });
+    }
+
+    const paidOrdersMatch = {
+      clubId: String(clubId),
+      status: 'paid',
+    };
+
+    const [
+      orderTotalsRaw,
+      topUsersSalesRaw,
+      topEventsSalesRaw,
+      linkTotalsRaw,
+      topUsersClicksRaw,
+      topEventsClicksRaw,
+      byChannelRaw,
+    ] = await Promise.all([
+      Order.aggregate([
+        { $match: paidOrdersMatch },
+        {
+          $group: {
+            _id: null,
+            totalOrders: { $sum: 1 },
+            totalTickets: { $sum: { $ifNull: ['$qty', 0] } },
+            totalRevenueEUR: { $sum: { $ifNull: ['$amountEUR', 0] } },
+          },
+        },
+      ]),
+
+      Order.aggregate([
+        { $match: { ...paidOrdersMatch, refUserId: { $ne: null } } },
+        {
+          $group: {
+            _id: '$refUserId',
+            orders: { $sum: 1 },
+            tickets: { $sum: { $ifNull: ['$qty', 0] } },
+            revenueEUR: { $sum: { $ifNull: ['$amountEUR', 0] } },
+          },
+        },
+      ]),
+
+      Order.aggregate([
+        { $match: paidOrdersMatch },
+        {
+          $group: {
+            _id: '$eventId',
+            orders: { $sum: 1 },
+            tickets: { $sum: { $ifNull: ['$qty', 0] } },
+            revenueEUR: { $sum: { $ifNull: ['$amountEUR', 0] } },
+          },
+        },
+      ]),
+
+      ShareLink
+        ? ShareLink.aggregate([
+            { $match: { clubId: String(clubId) } },
+            {
+              $group: {
+                _id: null,
+                totalLinks: { $sum: 1 },
+                totalClicks: { $sum: { $ifNull: ['$clicks', 0] } },
+                totalUniqueClicks: { $sum: { $ifNull: ['$uniqueClicks', 0] } },
+              },
+            },
+          ])
+        : Promise.resolve([]),
+
+      ShareLink
+        ? ShareLink.aggregate([
+            { $match: { clubId: String(clubId), createdByUserId: { $ne: null } } },
+            {
+              $group: {
+                _id: '$createdByUserId',
+                links: { $sum: 1 },
+                clicks: { $sum: { $ifNull: ['$clicks', 0] } },
+                uniqueClicks: { $sum: { $ifNull: ['$uniqueClicks', 0] } },
+                lastClickedAt: { $max: '$lastClickedAt' },
+              },
+            },
+          ])
+        : Promise.resolve([]),
+
+      ShareLink
+        ? ShareLink.aggregate([
+            { $match: { clubId: String(clubId) } },
+            {
+              $group: {
+                _id: '$eventId',
+                links: { $sum: 1 },
+                clicks: { $sum: { $ifNull: ['$clicks', 0] } },
+                uniqueClicks: { $sum: { $ifNull: ['$uniqueClicks', 0] } },
+                lastClickedAt: { $max: '$lastClickedAt' },
+              },
+            },
+          ])
+        : Promise.resolve([]),
+
+      ShareLink
+        ? ShareLink.aggregate([
+            { $match: { clubId: String(clubId) } },
+            {
+              $group: {
+                _id: { $ifNull: ['$channel', 'unknown'] },
+                links: { $sum: 1 },
+                clicks: { $sum: { $ifNull: ['$clicks', 0] } },
+                uniqueClicks: { $sum: { $ifNull: ['$uniqueClicks', 0] } },
+              },
+            },
+          ])
+        : Promise.resolve([]),
+    ]);
+
+    const orderTotals = orderTotalsRaw[0] || {
+      totalOrders: 0,
+      totalTickets: 0,
+      totalRevenueEUR: 0,
+    };
+
+    const linkTotals = linkTotalsRaw[0] || {
+      totalLinks: 0,
+      totalClicks: 0,
+      totalUniqueClicks: 0,
+    };
+
+    const topUsersMap = new Map();
+
+    for (const row of topUsersSalesRaw || []) {
+      const key = String(row._id || '');
+      if (!key) continue;
+      topUsersMap.set(key, {
+        userId: key,
+        links: 0,
+        clicks: 0,
+        uniqueClicks: 0,
+        orders: Number(row.orders || 0),
+        tickets: Number(row.tickets || 0),
+        revenueEUR: Number(row.revenueEUR || 0),
+        lastClickedAt: null,
+      });
+    }
+
+    for (const row of topUsersClicksRaw || []) {
+      const key = String(row._id || '');
+      if (!key) continue;
+      const existing = topUsersMap.get(key) || {
+        userId: key,
+        links: 0,
+        clicks: 0,
+        uniqueClicks: 0,
+        orders: 0,
+        tickets: 0,
+        revenueEUR: 0,
+        lastClickedAt: null,
+      };
+
+      existing.links += Number(row.links || 0);
+      existing.clicks += Number(row.clicks || 0);
+      existing.uniqueClicks += Number(row.uniqueClicks || 0);
+      existing.lastClickedAt = row.lastClickedAt || existing.lastClickedAt;
+      topUsersMap.set(key, existing);
+    }
+
+    let topUsers = Array.from(topUsersMap.values()).sort(
+      (a, b) =>
+        (b.revenueEUR - a.revenueEUR) ||
+        (b.clicks - a.clicks) ||
+        (b.uniqueClicks - a.uniqueClicks) ||
+        (b.orders - a.orders)
+    );
+
+    topUsers = await enrichUsers(topUsers, 'userId');
+
+    const eventIds = Array.from(
+      new Set([
+        ...(topEventsSalesRaw || []).map((row) => String(row._id || '')).filter(Boolean),
+        ...(topEventsClicksRaw || []).map((row) => String(row._id || '')).filter(Boolean),
+      ])
+    );
+
+    const events = eventIds.length
+      ? await Event.find({ _id: { $in: eventIds } })
+          .select('_id title name eventTitle coverImage image heroImage startsAt date')
+          .lean()
+      : [];
+
+    const eventsById = new Map(events.map((ev) => [String(ev._id), ev]));
+    const topEventsMap = new Map();
+
+    for (const row of topEventsSalesRaw || []) {
+      const key = String(row._id || '');
+      if (!key) continue;
+      const ev = eventsById.get(key) || null;
+      topEventsMap.set(key, {
+        eventId: key,
+        eventTitle: ev?.title || ev?.name || ev?.eventTitle || 'Evento',
+        coverImage: ev?.coverImage || ev?.image || ev?.heroImage || '',
+        startsAt: ev?.startsAt || ev?.date || null,
+        links: 0,
+        clicks: 0,
+        uniqueClicks: 0,
+        orders: Number(row.orders || 0),
+        tickets: Number(row.tickets || 0),
+        revenueEUR: Number(row.revenueEUR || 0),
+        lastClickedAt: null,
+      });
+    }
+
+    for (const row of topEventsClicksRaw || []) {
+      const key = String(row._id || '');
+      if (!key) continue;
+      const ev = eventsById.get(key) || null;
+      const existing = topEventsMap.get(key) || {
+        eventId: key,
+        eventTitle: ev?.title || ev?.name || ev?.eventTitle || 'Evento',
+        coverImage: ev?.coverImage || ev?.image || ev?.heroImage || '',
+        startsAt: ev?.startsAt || ev?.date || null,
+        links: 0,
+        clicks: 0,
+        uniqueClicks: 0,
+        orders: 0,
+        tickets: 0,
+        revenueEUR: 0,
+        lastClickedAt: null,
+      };
+
+      existing.links += Number(row.links || 0);
+      existing.clicks += Number(row.clicks || 0);
+      existing.uniqueClicks += Number(row.uniqueClicks || 0);
+      existing.lastClickedAt = row.lastClickedAt || existing.lastClickedAt;
+      topEventsMap.set(key, existing);
+    }
+
+    const topEvents = Array.from(topEventsMap.values()).sort(
+      (a, b) =>
+        (b.clicks - a.clicks) ||
+        (b.uniqueClicks - a.uniqueClicks) ||
+        (b.revenueEUR - a.revenueEUR) ||
+        (b.orders - a.orders)
+    );
+
+    const byChannel = (byChannelRaw || [])
+      .map((row) => ({
+        channel: String(row._id || 'unknown'),
+        links: Number(row.links || 0),
+        clicks: Number(row.clicks || 0),
+        uniqueClicks: Number(row.uniqueClicks || 0),
+        orders: 0,
+        tickets: 0,
+        revenueEUR: 0,
+      }))
+      .sort((a, b) => (b.clicks - a.clicks) || (b.uniqueClicks - a.uniqueClicks) || (b.links - a.links));
+
+    return res.json({
+      ok: true,
+      clubId,
+      totalLinks: Number(linkTotals.totalLinks || 0),
+      totalClicks: Number(linkTotals.totalClicks || 0),
+      totalUniqueClicks: Number(linkTotals.totalUniqueClicks || 0),
+      totalOrders: Number(orderTotals.totalOrders || 0),
+      totalTickets: Number(orderTotals.totalTickets || 0),
+      totalRevenueEUR: Number(orderTotals.totalRevenueEUR || 0),
+      topUsers,
+      topEvents,
+      byChannel,
+    });
+  } catch (e) {
+    console.error('[referrals analytics summary]', e);
+    return res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
 
 /**
  * GET /api/referrals/club/:clubId/event/:eventId
@@ -55,7 +357,7 @@ router.get('/club/:clubId/event/:eventId', async (req, res) => {
       { $sort: { revenueEUR: -1, tickets: -1, orders: -1 } },
     ];
 
-    const rows = await Order.aggregate(pipeline);
+    const salesRows = await Order.aggregate(pipeline);
 
     // === Click analytics (from ShareLink) ===
     let clickRows = [];
@@ -85,7 +387,7 @@ router.get('/club/:clubId/event/:eventId', async (req, res) => {
 
     // bucket por usuario
     const byUser = new Map();
-    for (const r of rows) {
+    for (const r of salesRows) {
       const uid = String(r._id.refUserId);
       const ch = String(r._id.shareChannel || 'unknown');
 
@@ -184,18 +486,24 @@ router.get('/club/:clubId/event/:eventId', async (req, res) => {
         (b.totals.orders - a.totals.orders)
     );
 
-    // opcional: enriquecer con username
-    if (User && referrals.length) {
-      const ids = referrals.map(x => x.refUserId);
-      const users = await User.find({ _id: { $in: ids } })
-        .select('username profilePicture')
-        .lean();
+    referrals = await enrichUsers(referrals, 'refUserId');
 
-      const m = new Map(users.map(u => [String(u._id), u]));
-      referrals = referrals.map(x => ({ ...x, user: m.get(String(x.refUserId)) || null }));
-    }
+    const rows = referrals.map((entry) => ({
+      userId: entry.refUserId,
+      username: entry.user?.username || '',
+      profilePicture: entry.user?.profilePicture || '',
+      channel: entry.channels?.[0]?.channel || 'unknown',
+      links: Number(entry.totals.links || 0),
+      clicks: Number(entry.totals.clicks || 0),
+      uniqueClicks: Number(entry.totals.uniqueClicks || 0),
+      orders: Number(entry.totals.orders || 0),
+      tickets: Number(entry.totals.tickets || 0),
+      revenueEUR: Number(entry.totals.revenueEUR || 0),
+      channels: entry.channels || [],
+      user: entry.user || null,
+    }));
 
-    return res.json({ ok: true, clubId, eventId, referrals });
+    return res.json({ ok: true, clubId, eventId, referrals, rows });
   } catch (e) {
     console.error('[referrals analytics]', e);
     return res.status(500).json({ ok: false, error: 'server_error' });
