@@ -347,10 +347,18 @@ router.get('/club/:clubId/event/:eventId', async (req, res) => {
   try {
     const { clubId, eventId } = req.params;
 
-    // validar evento pertenece al club (según tu Event.js)
-    const ev = await Event.findById(eventId).select('clubId').lean();
+    // Validar que el evento pertenece al club. En algunos documentos antiguos
+    // puede venir asociado por `clubId`, `club`, `owner`, `createdBy` o `userId`.
+    const ev = await Event.findById(eventId)
+      .select('clubId club owner createdBy userId')
+      .lean();
     if (!ev) return res.status(404).json({ ok: false, error: 'Event not found' });
-    if (String(ev.clubId || '') !== String(clubId || '')) {
+
+    const eventClubId = String(
+      ev.clubId || ev.club || ev.owner || ev.createdBy || ev.userId || ''
+    );
+
+    if (eventClubId !== String(clubId || '')) {
       return res.status(403).json({ ok: false, error: 'Event does not belong to club' });
     }
 
