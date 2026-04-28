@@ -6,6 +6,7 @@ const { createHash } = require('crypto');
 
 const ShareLink = require('../models/ShareLink');
 const Event = require('../models/Event');
+const { anyAuth, ensureUserId } = require('../middlewares/authMiddleware');
 
 // Genera refCode corto (compatible con Node antiguos)
 function genRefCode() {
@@ -58,6 +59,18 @@ function joinUrl(base, path) {
   const b = (base || '').replace(/\/$/, '');
   const p = (path || '').startsWith('/') ? path : `/${path}`;
   return `${b}${p}`;
+}
+
+function pickCreatedByUserId(req) {
+  const raw =
+    req.userId ||
+    req.user?.id ||
+    req.user?._id ||
+    req.auth?.userId ||
+    req.body?.createdByUserId ||
+    null;
+
+  return raw ? String(raw) : null;
 }
 
 function buildAppEventUrl({ eventId, refCode, channel }) {
@@ -265,7 +278,7 @@ router.get('/r/:refCode', async (req, res) => {
 
 // POST /api/share/create
 // body: { eventId, channel? }
-router.post('/create', async (req, res) => {
+router.post('/create', anyAuth, ensureUserId, async (req, res) => {
   try {
     const { eventId, channel } = req.body || {};
     if (!eventId) return res.status(400).json({ ok: false, error: 'eventId required' });
@@ -275,8 +288,10 @@ router.post('/create', async (req, res) => {
 
     const clubId = String(event.clubId || event.createdBy || event.userId || '');
 
-    // Si tienes middleware auth, aquí puedes sacar req.user?.id
-    const createdByUserId = req.user?.id ? String(req.user.id) : null;
+    const createdByUserId = pickCreatedByUserId(req);
+    if (!createdByUserId) {
+      return res.status(401).json({ ok: false, error: 'Unauthorized' });
+    }
 
     let link = await ShareLink.findOne({
       eventId: String(eventId),
