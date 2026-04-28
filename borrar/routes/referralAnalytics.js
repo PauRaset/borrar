@@ -19,22 +19,46 @@ const isValidObjectId = (v) => mongoose.Types.ObjectId.isValid(String(v || ''));
 async function enrichUsers(items, idKey = 'userId') {
   if (!User || !Array.isArray(items) || items.length === 0) return items || [];
 
-  const ids = items
-    .map((item) => String(item?.[idKey] || ''))
-    .filter((id) => isValidObjectId(id));
+  const rawIds = items
+    .map((item) => String(item?.[idKey] || '').trim())
+    .filter(Boolean);
 
-  if (!ids.length) return items;
+  if (!rawIds.length) return items;
 
-  const users = await User.find({ _id: { $in: ids } })
-    .select('username profilePicture')
+  const mongoIds = rawIds.filter((id) => isValidObjectId(id));
+  const firebaseUids = rawIds.filter((id) => !isValidObjectId(id));
+
+  const or = [];
+  if (mongoIds.length) {
+    or.push({ _id: { $in: mongoIds } });
+  }
+  if (firebaseUids.length) {
+    or.push({ firebaseUid: { $in: firebaseUids } });
+  }
+
+  if (!or.length) return items;
+
+  const users = await User.find({ $or: or })
+    .select('_id firebaseUid username profilePicture')
     .lean();
 
-  const byId = new Map(users.map((u) => [String(u._id), u]));
+  const byMongoId = new Map();
+  const byFirebaseUid = new Map();
 
-  return items.map((item) => ({
-    ...item,
-    user: byId.get(String(item?.[idKey] || '')) || null,
-  }));
+  for (const u of users) {
+    byMongoId.set(String(u._id), u);
+    if (u.firebaseUid) {
+      byFirebaseUid.set(String(u.firebaseUid), u);
+    }
+  }
+
+  return items.map((item) => {
+    const key = String(item?.[idKey] || '').trim();
+    return {
+      ...item,
+      user: byMongoId.get(key) || byFirebaseUid.get(key) || null,
+    };
+  });
 }
 /**
  * GET /api/referrals/club/:clubId/summary
