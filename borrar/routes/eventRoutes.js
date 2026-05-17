@@ -306,6 +306,35 @@ async function ensureUserId(req, res, next) {
   return res.status(401).json({ message: "Usuario no autenticado" });
 }
 
+async function optionalUserId(req, res, next) {
+  try {
+    if (req.user && req.user.id) return next();
+
+    const token = extractIdToken(req);
+    if (!token) return next();
+
+    try {
+      const decoded = await admin.auth().verifyIdToken(token);
+      const user = await User.findOrCreateFromFirebase({
+        uid: decoded.uid,
+        phoneNumber: decoded.phone_number || decoded.phoneNumber || null,
+      });
+
+      req.firebaseUser = {
+        uid: decoded.uid,
+        phone: decoded.phone_number || decoded.phoneNumber || null,
+      };
+
+      req.user = { id: user._id.toString() };
+    } catch (_) {}
+
+    return next();
+  } catch (e) {
+    console.warn("[optionalUserId] error:", e?.message || e);
+    return next();
+  }
+}
+
 /* ------------------------------------------------------------------
    PROMOTIONS BRIDGE (auto-progress levels)
 ------------------------------------------------------------------- */
@@ -755,7 +784,7 @@ function usernameFromUserDoc(u) {
   );
 }
 
-function toPhotoTileAbs(req, entry) {
+function toPhotoTileAbs(req, entry, viewerUserId = null) {
   // Acepta string o objeto y devuelve objeto { url, byUsername?, uploadedAt? } con URL absoluta
   if (!entry) return null;
 
@@ -782,7 +811,9 @@ function toPhotoTileAbs(req, entry) {
       ...(entry.uploadedAt ? { uploadedAt: entry.uploadedAt } : {}),
       reactions: reactionSummary.counts,
       reactionsTotal: reactionSummary.total,
-      myReaction: null,
+      myReaction: (entry.reactions || []).find(
+        (r) => String(r?.userId || "") === String(viewerUserId)
+      )?.type || null,
     };
   }
   return null;
@@ -948,7 +979,7 @@ router.get("/mine", anyAuth, ensureUserId, async (req, res) => {
 
     const formattedEvents = events.map((event) => {
       const photos = approvedOnly(event.photos)
-        .map((p) => toPhotoTileAbs(req, p))
+        .map((p) => toPhotoTileAbs(req, p, req.user?.id || null))
         .filter(Boolean);
 
       return {
@@ -980,14 +1011,14 @@ router.get("/mine", anyAuth, ensureUserId, async (req, res) => {
 /* ------------------------------------------------------------------
    LISTAR EVENTOS (público)
 ------------------------------------------------------------------- */
-router.get("/", async (req, res) => {
+router.get("/", optionalUserId, async (req, res) => {
   try {
     const events = await Event.find().populate("createdBy", "username email profilePicture displayName").lean();
 
     const formattedEvents = events.map((event) => {
       // normaliza fotos a objetos con url absoluta (manteniendo compatibilidad)
       const photos = approvedOnly(event.photos)
-        .map((p) => toPhotoTileAbs(req, p))
+        .map((p) => toPhotoTileAbs(req, p, req.user?.id || null))
         .filter(Boolean);
 
       return {
@@ -1018,7 +1049,7 @@ router.get("/", async (req, res) => {
    GET /api/events/search?q=...
    ⚠️ IMPORTANTE: esta ruta debe ir ANTES que cualquier /:id
 ------------------------------------------------------------------- */
-router.get("/search", async (req, res) => {
+router.get("/search", optionalUserId, async (req, res) => {
   try {
     const qRaw = (req.query.q || req.query.query || req.query.search || "").toString();
     const q = qRaw.trim();
@@ -1052,7 +1083,7 @@ router.get("/search", async (req, res) => {
 
     const formattedEvents = events.map((event) => {
       const photos = approvedOnly(event.photos)
-        .map((p) => toPhotoTileAbs(req, p))
+        .map((p) => toPhotoTileAbs(req, p, req.user?.id || null))
         .filter(Boolean);
 
       return {
@@ -1216,7 +1247,7 @@ router.get("/:id/attendees/populated", (req, res) => attendeesHandler(req, res, 
 /* ------------------------------------------------------------------
    DETALLE DE EVENTO (público; calcula isOwner si hay usuario)
 ------------------------------------------------------------------- */
-router.get("/:id", async (req, res) => {
+router.get("/:id", optionalUserId, async (req, res) => {
   try {
     const event = await Event.findById(req.params.id).populate(
       "createdBy",
@@ -1235,7 +1266,7 @@ router.get("/:id", async (req, res) => {
     const formattedEvent = {
       ...obj,
       imageUrl: absUrlFromUpload(req, obj.image),
-      photos: approvedOnly(obj.photos).map((p) => toPhotoTileAbs(req, p)).filter(Boolean),
+      photos: approvedOnly(obj.photos).map((p) => toPhotoTileAbs(req, p, req.user?.id || null)).filter(Boolean),
       createdBy: obj.createdBy
         ? {
             ...obj.createdBy,
@@ -1291,7 +1322,7 @@ async function getPhotosHandler(req, res) {
     if (!event) return res.status(404).json({ message: "Evento no encontrado" });
 
     const photos = approvedOnly(event.photos)
-      .map((p) => toPhotoTileAbs(req, p))
+      .map((p) => toPhotoTileAbs(req, p, req.user?.id || null))
       .filter(Boolean);
 
     return res.json({ photos });
@@ -1301,10 +1332,10 @@ async function getPhotosHandler(req, res) {
   }
 }
 
-router.get("/:id/photos", getPhotosHandler);
-router.get("/:id/gallery", getPhotosHandler);
-router.get("/:id/images", getPhotosHandler);
-router.get("/:id/media", getPhotosHandler);
+router.get("/:id/photos", optionalUserId, getPhotosHandler);
+router.get("/:id/gallery", optionalUserId, getPhotosHandler);
+router.get("/:id/images", optionalUserId, getPhotosHandler);
+router.get("/:id/media", optionalUserId, getPhotosHandler);
 
 router.post(
   "/:id/photos/:photoId/react",
@@ -1771,7 +1802,7 @@ async function postPhotosHandler(req, res) {
     }));
 
     const allPhotos = approvedOnly(event.photos)
-      .map((p) => toPhotoTileAbs(req, p))
+      .map((p) => toPhotoTileAbs(req, p, req.user?.id || null))
       .filter(Boolean);
 
     return res.status(201).json({
@@ -1877,7 +1908,7 @@ router.delete("/:id/photos/:pid?", anyAuth, ensureUserId, async (req, res) => {
 
     // Devolver listado normalizado
     const outPhotos = (event.photos || [])
-      .map((p) => toPhotoTileAbs(req, p))
+      .map((p) => toPhotoTileAbs(req, p, req.user?.id || null))
       .filter(Boolean);
 
     return res.json({
@@ -2069,7 +2100,7 @@ async function updateEventHandler(req, res) {
     const formatted = {
       ...updated,
       imageUrl: absUrlFromUpload(req, updated.image),
-      photos: approvedOnly(updated.photos).map((p) => toPhotoTileAbs(req, p)).filter(Boolean),
+      photos: approvedOnly(updated.photos).map((p) => toPhotoTileAbs(req, p, req.user?.id || null)).filter(Boolean),
       createdBy: updated.createdBy
         ? {
             ...updated.createdBy,
