@@ -76,6 +76,27 @@ function buildEventPhotoAccessUrl(req, eventId, photoId) {
   return joinUrl(backendBase(req), `/api/events/${eventId}/photos/${photoId}/file`);
 }
 
+function summarizePhotoReactions(reactions = []) {
+  const summary = {
+    hype: 0,
+    love: 0,
+    party: 0,
+    energy: 0,
+  };
+
+  for (const r of reactions || []) {
+    const key = (r?.type || "").toString();
+    if (summary[key] !== undefined) {
+      summary[key] += 1;
+    }
+  }
+
+  return {
+    counts: summary,
+    total: Object.values(summary).reduce((a, b) => a + b, 0),
+  };
+}
+
 function rawPhotoValue(entry) {
   if (!entry) return "";
   if (typeof entry === "string") return entry;
@@ -751,10 +772,17 @@ function toPhotoTileAbs(req, entry) {
       entry.username ||
       null;
 
+    const reactionSummary = summarizePhotoReactions(entry.reactions || []);
+
     return {
       url,
+      ...(entry.photoId ? { photoId: entry.photoId } : {}),
+      ...(entry.by ? { by: entry.by } : {}),
       ...(byUsername ? { byUsername } : {}),
       ...(entry.uploadedAt ? { uploadedAt: entry.uploadedAt } : {}),
+      reactions: reactionSummary.counts,
+      reactionsTotal: reactionSummary.total,
+      myReaction: null,
     };
   }
   return null;
@@ -1278,6 +1306,92 @@ router.get("/:id/gallery", getPhotosHandler);
 router.get("/:id/images", getPhotosHandler);
 router.get("/:id/media", getPhotosHandler);
 
+router.post(
+  "/:id/photos/:photoId/react",
+  anyAuth,
+  ensureUserId,
+  async (req, res) => {
+    try {
+      const { id, photoId } = req.params;
+      const reactionType = (req.body?.type || "").toString().trim();
+
+      if (!mongoose.isValidObjectId(id)) {
+        return res.status(400).json({ message: "ID de evento inválido" });
+      }
+
+      const allowed = ["hype", "love", "party", "energy"];
+
+      if (!allowed.includes(reactionType)) {
+        return res.status(400).json({ message: "Reacción inválida" });
+      }
+
+      const event = await Event.findById(id);
+      if (!event) {
+        return res.status(404).json({ message: "Evento no encontrado" });
+      }
+
+      const idx = (event.photos || []).findIndex(
+        (p) =>
+          p &&
+          typeof p === "object" &&
+          String(p.photoId || "") === String(photoId)
+      );
+
+      if (idx === -1) {
+        return res.status(404).json({ message: "Foto no encontrada" });
+      }
+
+      const photo = event.photos[idx];
+
+      photo.reactions = Array.isArray(photo.reactions)
+        ? photo.reactions
+        : [];
+
+      const existingIndex = photo.reactions.findIndex(
+        (r) => String(r.userId || "") === String(req.user.id)
+      );
+
+      let userReaction = reactionType;
+
+      // toggle same reaction
+      if (
+        existingIndex !== -1 &&
+        String(photo.reactions[existingIndex].type) === reactionType
+      ) {
+        photo.reactions.splice(existingIndex, 1);
+        userReaction = null;
+      } else {
+        if (existingIndex !== -1) {
+          photo.reactions.splice(existingIndex, 1);
+        }
+
+        photo.reactions.push({
+          userId: req.user.id,
+          type: reactionType,
+          createdAt: new Date(),
+        });
+      }
+
+      await event.save();
+
+      const summary = summarizePhotoReactions(photo.reactions || []);
+
+      return res.json({
+        ok: true,
+        photoId,
+        reactions: summary.counts,
+        reactionsTotal: summary.total,
+        myReaction: userReaction,
+      });
+    } catch (e) {
+      console.error("[POST /events/:id/photos/:photoId/react] error:", e);
+      return res.status(500).json({
+        message: "Error reaccionando a la foto",
+      });
+    }
+  }
+);
+
 /* ------------------------------------------------------------------
    MODERACIÓN DE FOTOS (solo propietario/club)
 ------------------------------------------------------------------- */
@@ -1627,6 +1741,7 @@ async function postPhotosHandler(req, res) {
         validatedForMissionTitle: null,
         validatedForLevelNumber: null,
         validationResult: null,
+        reactions: [],
       };
 
       event.photos = Array.isArray(event.photos) ? event.photos : [];
