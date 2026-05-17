@@ -41,6 +41,31 @@ const eventPhotoSchema = new mongoose.Schema(
     validatedForMissionTitle: { type: String, default: null },
     validatedForLevelNumber: { type: Number, default: null },
     validationResult: { type: String, default: null },
+
+    // reactions (NightVibe vibes)
+    reactions: {
+      type: [
+        {
+          userId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "User",
+            required: true,
+          },
+
+          type: {
+            type: String,
+            enum: ["hype", "love", "party", "energy"],
+            required: true,
+          },
+
+          createdAt: {
+            type: Date,
+            default: Date.now,
+          },
+        },
+      ],
+      default: [],
+    },
   },
   { _id: false }
 );
@@ -260,6 +285,7 @@ eventSchema.pre("save", function (next) {
           if (copy.validatedForMissionTitle === undefined) copy.validatedForMissionTitle = null;
           if (copy.validatedForLevelNumber === undefined) copy.validatedForLevelNumber = null;
           if (copy.validationResult === undefined) copy.validationResult = null;
+          if (!Array.isArray(copy.reactions)) copy.reactions = [];
 
           return copy;
         }
