@@ -6,6 +6,8 @@ const {
   toggleFollow,
   followUser,
   unfollowUser,
+  acceptFollowRequest,
+  rejectFollowRequest,
   getFollowers,
   getFollowing,
   getUserStats,
@@ -45,6 +47,10 @@ router.post('/follow/toggle/:id', anyAuthWithId, (req, res, next) => {
 router.post('/users/:id/follow', anyAuthWithId, followUser);
 router.delete('/users/:id/follow', anyAuthWithId, unfollowUser);
 
+// ---- Follow Requests (private profiles) ----
+router.post('/follow/requests/:id/accept', anyAuthWithId, acceptFollowRequest);
+router.post('/follow/requests/:id/reject', anyAuthWithId, rejectFollowRequest);
+
 // ---- Lists ----
 router.get('/users/:id/followers', getFollowers);
 router.get('/users/:id/following', getFollowing);
@@ -56,5 +62,8 @@ router.get('/users/:id/stats', anyAuth, getUserStats);
 router.options('/follow/toggle', (_req, res) => res.sendStatus(200));
 router.options('/follow/toggle/:id', (_req, res) => res.sendStatus(200));
 router.options('/users/:id/follow', (_req, res) => res.sendStatus(200));
+
+router.options('/follow/requests/:id/accept', (_req, res) => res.sendStatus(200));
+router.options('/follow/requests/:id/reject', (_req, res) => res.sendStatus(200));
 
 module.exports = router;
