@@ -178,6 +178,70 @@ async function createPhotoReactionNotification({ req, event, photo, reactionType
   }
 }
 
+// --- Notification helpers for new approved event photo ---
+async function createNewEventPhotoNotifications({ req, event, photo }) {
+  try {
+    if (!event || !photo) return;
+
+    const eventId = event._id;
+    const eventTitle = event.title || "un evento";
+    const photoId = photo?.photoId || rawPhotoValue(photo) || "";
+    const previewImage = absUrlFromUpload(req, rawPhotoValue(photo));
+    const uploaderId = photo?.by ? String(photo.by) : null;
+    const ownerId = event.createdBy ? String(event.createdBy) : null;
+
+    const attendeeIds = Array.isArray(event.attendees)
+      ? event.attendees.map((id) => String(id)).filter(Boolean)
+      : [];
+
+    const recipients = Array.from(new Set(attendeeIds)).filter((userId) => {
+      if (!userId) return false;
+      if (uploaderId && String(userId) === String(uploaderId)) return false;
+      if (ownerId && String(userId) === String(ownerId)) return false;
+      return true;
+    });
+
+    if (!recipients.length) return;
+
+    await Notification.bulkWrite(
+      recipients.map((userId) => ({
+        updateOne: {
+          filter: {
+            user: userId,
+            event: eventId,
+            photoId,
+            type: "new_event_photo",
+          },
+          update: {
+            $set: {
+              title: "Nuevas fotos disponibles",
+              body: `Se añadieron nuevas fotos a ${eventTitle}.`,
+              routeTarget: `event:${eventId}/photos`,
+              previewImage,
+              read: false,
+              readAt: null,
+              pushSent: false,
+              meta: {
+                eventTitle,
+                photoId,
+              },
+            },
+            $setOnInsert: {
+              user: userId,
+              event: eventId,
+              photoId,
+              type: "new_event_photo",
+            },
+          },
+          upsert: true,
+        },
+      }))
+    );
+  } catch (e) {
+    console.warn("[notifications] createNewEventPhotoNotifications failed:", e?.message || e);
+  }
+}
+
 function rawPhotoValue(entry) {
   if (!entry) return "";
   if (typeof entry === "string") return entry;
@@ -1607,8 +1671,16 @@ router.post("/:id/photos/:photoId/approve", anyAuth, ensureUserId, async (req, r
 
     await event.save();
 
-    // Promotions: solo cuenta cuando está aprobada
     const approvedPhoto = event.photos[idx];
+
+    // Notifications: avisar a asistentes cuando una foto pasa a estar visible.
+    await createNewEventPhotoNotifications({
+      req,
+      event,
+      photo: approvedPhoto,
+    });
+
+    // Promotions: solo cuenta cuando está aprobada
     const clubId = event.createdBy ? event.createdBy.toString() : null;
     const uploaderId = approvedPhoto.by ? approvedPhoto.by.toString() : null;
     if (clubId && uploaderId) {
