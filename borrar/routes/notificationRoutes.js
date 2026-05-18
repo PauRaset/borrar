@@ -2,7 +2,7 @@
 
 const express = require('express');
 const mongoose = require('mongoose');
-const admin = require('../firebaseAdmin');
+const admin = require('../middlewares/firebaseAdmin');
 
 const Notification = require('../models/Notification');
 const User = require('../models/User');
