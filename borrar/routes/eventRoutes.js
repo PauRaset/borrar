@@ -10,6 +10,7 @@ const router = express.Router();
 
 const Event = require("../models/Event");
 const User = require("../models/User");
+const Notification = require("../models/Notification");
 const PromotionLevelTemplate = require("../models/PromotionLevelTemplate");
 const UserClubPromotionProgress = require("../models/UserClubPromotionProgress");
 
@@ -95,6 +96,86 @@ function summarizePhotoReactions(reactions = []) {
     counts: summary,
     total: Object.values(summary).reduce((a, b) => a + b, 0),
   };
+}
+
+// --- Notification helpers for photo reactions ---
+function reactionLabel(type) {
+  switch (type) {
+    case "hype":
+      return "hype";
+    case "love":
+      return "corazón";
+    case "party":
+      return "fiesta";
+    case "energy":
+      return "energía";
+    default:
+      return "reacción";
+  }
+}
+
+async function createPhotoReactionNotification({ req, event, photo, reactionType, userReaction }) {
+  try {
+    if (!userReaction) return;
+
+    const actorId = req.user?.id;
+    const ownerId = photo?.by ? String(photo.by) : "";
+
+    if (!actorId || !ownerId) return;
+
+    // No notificar si reaccionas a tu propia foto.
+    if (String(actorId) === String(ownerId)) return;
+
+    const actor = await User.findById(actorId).select("username displayName profilePicture").lean();
+    const actorName =
+      actor?.username ||
+      actor?.displayName ||
+      "Alguien";
+
+    const eventTitle = event?.title || "un evento";
+    const photoId = photo?.photoId || rawPhotoValue(photo) || "";
+    const previewImage = absUrlFromUpload(req, rawPhotoValue(photo));
+
+    await Notification.findOneAndUpdate(
+      {
+        user: ownerId,
+        actor: actorId,
+        event: event._id,
+        photoId,
+        type: "photo_reaction",
+      },
+      {
+        $set: {
+          reactionType,
+          title: "Nueva reacción en tu foto",
+          body: `${actorName} reaccionó a tu foto en ${eventTitle}.`,
+          routeTarget: `event:${event._id}/photos`,
+          previewImage,
+          read: false,
+          readAt: null,
+          pushSent: false,
+          meta: {
+            reactionLabel: reactionLabel(reactionType),
+            eventTitle,
+          },
+        },
+        $setOnInsert: {
+          user: ownerId,
+          actor: actorId,
+          event: event._id,
+          photoId,
+          type: "photo_reaction",
+        },
+      },
+      {
+        upsert: true,
+        new: true,
+        setDefaultsOnInsert: true,
+      }
+    );
+  } catch (e) {
+    console.warn("[notifications] createPhotoReactionNotification failed:", e?.message || e);
+  }
 }
 
 function rawPhotoValue(entry) {
@@ -1404,6 +1485,15 @@ router.post(
       }
 
       await event.save();
+
+      // --- Notification for reaction on photo ---
+      await createPhotoReactionNotification({
+        req,
+        event,
+        photo,
+        reactionType,
+        userReaction,
+      });
 
       const summary = summarizePhotoReactions(photo.reactions || []);
 
