@@ -11,6 +11,7 @@ const router = express.Router();
 const Event = require("../models/Event");
 const User = require("../models/User");
 const Notification = require("../models/Notification");
+const { sendPushNotificationToUser } = require("../utils/sendPushNotification");
 const PromotionLevelTemplate = require("../models/PromotionLevelTemplate");
 const UserClubPromotionProgress = require("../models/UserClubPromotionProgress");
 
@@ -136,7 +137,7 @@ async function createPhotoReactionNotification({ req, event, photo, reactionType
     const photoId = photo?.photoId || rawPhotoValue(photo) || "";
     const previewImage = absUrlFromUpload(req, rawPhotoValue(photo));
 
-    await Notification.findOneAndUpdate(
+    const notification = await Notification.findOneAndUpdate(
       {
         user: ownerId,
         actor: actorId,
@@ -173,6 +174,10 @@ async function createPhotoReactionNotification({ req, event, photo, reactionType
         setDefaultsOnInsert: true,
       }
     );
+
+    if (notification?._id) {
+      await sendPushNotificationToUser(ownerId, notification);
+    }
   } catch (e) {
     console.warn("[notifications] createPhotoReactionNotification failed:", e?.message || e);
   }
@@ -203,40 +208,46 @@ async function createNewEventPhotoNotifications({ req, event, photo }) {
 
     if (!recipients.length) return;
 
-    await Notification.bulkWrite(
-      recipients.map((userId) => ({
-        updateOne: {
-          filter: {
+    for (const userId of recipients) {
+      const notification = await Notification.findOneAndUpdate(
+        {
+          user: userId,
+          event: eventId,
+          photoId,
+          type: "new_event_photo",
+        },
+        {
+          $set: {
+            title: "Nuevas fotos disponibles",
+            body: `Se añadieron nuevas fotos a ${eventTitle}.`,
+            routeTarget: `event:${eventId}/photos`,
+            previewImage,
+            read: false,
+            readAt: null,
+            pushSent: false,
+            meta: {
+              eventTitle,
+              photoId,
+            },
+          },
+          $setOnInsert: {
             user: userId,
             event: eventId,
             photoId,
             type: "new_event_photo",
           },
-          update: {
-            $set: {
-              title: "Nuevas fotos disponibles",
-              body: `Se añadieron nuevas fotos a ${eventTitle}.`,
-              routeTarget: `event:${eventId}/photos`,
-              previewImage,
-              read: false,
-              readAt: null,
-              pushSent: false,
-              meta: {
-                eventTitle,
-                photoId,
-              },
-            },
-            $setOnInsert: {
-              user: userId,
-              event: eventId,
-              photoId,
-              type: "new_event_photo",
-            },
-          },
-          upsert: true,
         },
-      }))
-    );
+        {
+          upsert: true,
+          new: true,
+          setDefaultsOnInsert: true,
+        }
+      );
+
+      if (notification?._id) {
+        await sendPushNotificationToUser(userId, notification);
+      }
+    }
   } catch (e) {
     console.warn("[notifications] createNewEventPhotoNotifications failed:", e?.message || e);
   }
