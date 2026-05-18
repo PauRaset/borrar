@@ -4,6 +4,7 @@ const mongoose = require('mongoose');
 const PromotionLevelTemplate = require('../models/PromotionLevelTemplate');
 const UserClubPromotionProgress = require('../models/UserClubPromotionProgress');
 const PromotionClaim = require('../models/PromotionClaim');
+const Notification = require('../models/Notification');
 
 // Opcionales (si existen en tu backend)
 let UserModel = null;
@@ -17,6 +18,40 @@ function isValidObjectId(id) {
 
 function now() {
   return new Date();
+}
+
+async function createPromotionNotification({
+  userId,
+  type,
+  title,
+  body,
+  clubId = null,
+  clubName = '',
+  previewImage = null,
+  meta = {},
+}) {
+  try {
+    if (!userId || !type || !title) return;
+
+    await Notification.create({
+      user: userId,
+      type,
+      title,
+      body,
+      routeTarget: 'promotion:level_reward',
+      previewImage,
+      pushSent: false,
+      read: false,
+      readAt: null,
+      meta: {
+        clubId,
+        clubName,
+        ...meta,
+      },
+    });
+  } catch (e) {
+    console.warn('[notifications][promotion] create failed:', e?.message || e);
+  }
 }
 
 /**
@@ -1294,6 +1329,30 @@ exports.approveClaim = async (req, res) => {
       mission.updatedAt = now();
     }
 
+    const clubDoc = ClubModel && claim.club
+      ? await ClubModel.findById(claim.club).lean()
+      : null;
+
+    const clubName = pickClubName(clubDoc);
+    const clubAvatar = pickClubAvatar(clubDoc);
+
+    if (mission) {
+      await createPromotionNotification({
+        userId: claim.user,
+        type: 'promotion_completed',
+        title: 'Misión completada',
+        body: `${mission.title || 'Has completado una misión'} en ${clubName}.`,
+        clubId: claim.club,
+        clubName,
+        previewImage: clubAvatar,
+        meta: {
+          missionKey: mission.missionKey || null,
+          missionTitle: mission.title || '',
+          levelNumber: claim.levelNumber,
+        },
+      });
+    }
+
     if (level) {
       // Si todas misiones completadas => nivel completado
       const missions = level.missions || [];
@@ -1303,6 +1362,19 @@ exports.approveClaim = async (req, res) => {
       if (allDone && level.status !== 'completed') {
         level.status = 'completed';
         level.completedAt = now();
+
+        await createPromotionNotification({
+          userId: claim.user,
+          type: 'promotion_level_up',
+          title: `Nivel ${level.levelNumber} completado`,
+          body: `Has desbloqueado nuevas recompensas en ${clubName}.`,
+          clubId: claim.club,
+          clubName,
+          previewImage: clubAvatar,
+          meta: {
+            levelNumber: level.levelNumber,
+          },
+        });
 
         // desbloquear siguiente
         unlockNextLevel(progress, level.levelNumber);
@@ -1456,6 +1528,27 @@ exports.redeemCurrentLevelReward = async (req, res) => {
     refreshCurrentSnapshot(progress);
     progress.lastActivityAt = now();
     await progress.save();
+
+    const clubDoc = ClubModel && clubId
+      ? await ClubModel.findById(clubId).lean()
+      : null;
+
+    const clubName = pickClubName(clubDoc);
+    const clubAvatar = pickClubAvatar(clubDoc);
+
+    await createPromotionNotification({
+      userId: mongoUser._id,
+      type: 'promotion_reward_claimed',
+      title: 'Premio canjeado',
+      body: `Has canjeado una recompensa de ${clubName}.`,
+      clubId,
+      clubName,
+      previewImage: clubAvatar,
+      meta: {
+        levelNumber: level.levelNumber,
+        rewardTitle: level.reward?.title || '',
+      },
+    });
 
     return res.json({
       ok: true,
