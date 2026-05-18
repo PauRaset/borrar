@@ -1035,6 +1035,7 @@ const userRoutes = require("./routes/userRoutes");
 const registrationRoutes = require("./routes/registrationRoutes"); // <-- MOVIDO AQUÍ
 const promotionsRoutes = require("./routes/promotionsRoutes");
 const notificationRoutes = require("./routes/notificationRoutes");
+const pushRoutes = require("./routes/pushRoutes");
 
 // Compat: clientes antiguos pueden llamar /start|/request|/requests
 // Normalizamos name -> clubName y reenviamos al router en /apply sin perder body
@@ -1060,6 +1061,7 @@ app.use("/api/users", userRoutes);
 app.use("/api/events", eventRoutes);
 app.use("/api/promotions", promotionsRoutes);
 app.use("/api/notifications", notificationRoutes);
+app.use("/api/push", pushRoutes);
 app.use("/search", searchRoutes);
 app.use("/api/registration", registrationRoutes); // <-- Y montado AQUÍ
 app.use("/api/clubs", clubRoutes);
