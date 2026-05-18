@@ -69,6 +69,33 @@ const userSchema = new mongoose.Schema(
       sparse: true,
     },
 
+    // ---- Push notifications / Firebase Cloud Messaging ----
+    fcmTokens: {
+      type: [
+        {
+          token: {
+            type: String,
+            required: true,
+            trim: true,
+          },
+          platform: {
+            type: String,
+            enum: ['ios', 'android', 'web', 'unknown'],
+            default: 'unknown',
+          },
+          deviceName: {
+            type: String,
+            default: '',
+          },
+          lastSeenAt: {
+            type: Date,
+            default: Date.now,
+          },
+        },
+      ],
+      default: [],
+    },
+
     // ---- Reset / creación de contraseña (nuevo) ----
     resetPasswordToken: { type: String, index: true },
     resetPasswordExpires: { type: Date },
@@ -187,6 +214,18 @@ userSchema.pre("save", function (next) {
   }
   if (Array.isArray(this.followRequestsSent)) {
     this.followRequestsSent = uniqObjectIds(this.followRequestsSent);
+  }
+
+  // Deduplicar FCM tokens
+  if (Array.isArray(this.fcmTokens)) {
+    const seen = new Set();
+    this.fcmTokens = this.fcmTokens.filter((entry) => {
+      const token = (entry?.token || '').trim();
+      if (!token) return false;
+      if (seen.has(token)) return false;
+      seen.add(token);
+      return true;
+    });
   }
 
   next();
@@ -434,6 +473,49 @@ userSchema.methods.rejectFollowRequest = async function (requesterId) {
     accepted: false,
     isFollowing: false,
   };
+};
+
+// ------------------------- FCM tokens -------------------------
+userSchema.methods.addFcmToken = async function ({
+  token,
+  platform = 'unknown',
+  deviceName = '',
+}) {
+  const clean = (token || '').trim();
+  if (!clean) return false;
+
+  const existing = this.fcmTokens.find((t) => t.token === clean);
+
+  if (existing) {
+    existing.platform = platform || existing.platform || 'unknown';
+    existing.deviceName = deviceName || existing.deviceName || '';
+    existing.lastSeenAt = new Date();
+  } else {
+    this.fcmTokens.push({
+      token: clean,
+      platform,
+      deviceName,
+      lastSeenAt: new Date(),
+    });
+  }
+
+  await this.save();
+  return true;
+};
+
+userSchema.methods.removeFcmToken = async function (token) {
+  const clean = (token || '').trim();
+  if (!clean) return false;
+
+  const before = this.fcmTokens.length;
+  this.fcmTokens = this.fcmTokens.filter((t) => t.token !== clean);
+
+  const changed = this.fcmTokens.length !== before;
+  if (changed) {
+    await this.save();
+  }
+
+  return changed;
 };
 
 // Helper: crear/actualizar desde datos verificados de Firebase
