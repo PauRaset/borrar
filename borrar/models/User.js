@@ -23,7 +23,7 @@ const userSchema = new mongoose.Schema(
     bio: { type: String, default: "" },
     isPrivate: { type: Boolean, default: false },
 
-    role: { type: String, enum: ["club", "spectator"], default: "club" },
+    role: { type: String, enum: ["club", "spectator"], default: "spectator" },
 
     // --- Social (seguidores / seguidos) ---
     followers: {
@@ -32,6 +32,18 @@ const userSchema = new mongoose.Schema(
       index: true,
     },
     following: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+      default: [],
+      index: true,
+    },
+
+    // --- Solicitudes de seguimiento para perfiles privados ---
+    followRequestsReceived: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+      default: [],
+      index: true,
+    },
+    followRequestsSent: {
       type: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
       default: [],
       index: true,
@@ -100,6 +112,8 @@ userSchema.index({ firebaseUid: 1 });
 userSchema.index({ instagram: 1 });
 userSchema.index({ followersCount: 1 });
 userSchema.index({ followingCount: 1 });
+userSchema.index({ followRequestsReceived: 1 });
+userSchema.index({ followRequestsSent: 1 });
 
 /* ----------------------------- Hooks & helpers ---------------------------- */
 
@@ -168,6 +182,12 @@ userSchema.pre("save", function (next) {
     this.following = uniqObjectIds(this.following);
     this.followingCount = this.following.length;
   }
+  if (Array.isArray(this.followRequestsReceived)) {
+    this.followRequestsReceived = uniqObjectIds(this.followRequestsReceived);
+  }
+  if (Array.isArray(this.followRequestsSent)) {
+    this.followRequestsSent = uniqObjectIds(this.followRequestsSent);
+  }
 
   next();
 });
@@ -185,23 +205,35 @@ userSchema.methods.setPassword = async function (plain) {
   return this.password;
 };
 
+// Helper to safely convert to ObjectId
+const toObjectId = (v) => {
+  try {
+    if (!v) return null;
+    if (v instanceof mongoose.Types.ObjectId) return v;
+    return new mongoose.Types.ObjectId(String(v));
+  } catch {
+    return null;
+  }
+};
+
 // ---------------------------- Follow / Unfollow ----------------------------
 userSchema.methods.follow = async function (targetId) {
   const me = this;
-  if (!targetId) throw new Error('TARGET_REQUIRED');
-  if (me._id.equals(targetId)) throw new Error('NO_SELF_FOLLOW');
+  const tid = toObjectId(targetId);
+  if (!tid) throw new Error('TARGET_REQUIRED');
+  if (me._id.equals(tid)) throw new Error('NO_SELF_FOLLOW');
 
   const User = mongoose.model('User');
-  const target = await User.findById(targetId);
+  const target = await User.findById(tid);
   if (!target) throw new Error('TARGET_NOT_FOUND');
 
   // ¿ya le sigo?
-  const already = me.following.some((id) => id.equals(target._id));
+  const already = me.following.some((id) => id.equals(tid));
   if (already) {
     return { changed: false, isFollowing: true };
   }
 
-  me.following.push(target._id);
+  me.following.push(tid);
   target.followers.push(me._id);
 
   me.followingCount = me.following.length;
@@ -213,17 +245,18 @@ userSchema.methods.follow = async function (targetId) {
 
 userSchema.methods.unfollow = async function (targetId) {
   const me = this;
-  if (!targetId) throw new Error('TARGET_REQUIRED');
-  if (me._id.equals(targetId)) throw new Error('NO_SELF_UNFOLLOW');
+  const tid = toObjectId(targetId);
+  if (!tid) throw new Error('TARGET_REQUIRED');
+  if (me._id.equals(tid)) throw new Error('NO_SELF_UNFOLLOW');
 
   const User = mongoose.model('User');
-  const target = await User.findById(targetId);
+  const target = await User.findById(tid);
   if (!target) throw new Error('TARGET_NOT_FOUND');
 
   const beforeMe = me.following.length;
   const beforeTarget = target.followers.length;
 
-  me.following = me.following.filter((id) => !id.equals(target._id));
+  me.following = me.following.filter((id) => !id.equals(tid));
   target.followers = target.followers.filter((id) => !id.equals(me._id));
 
   const changed = me.following.length !== beforeMe || target.followers.length !== beforeTarget;
@@ -233,6 +266,174 @@ userSchema.methods.unfollow = async function (targetId) {
 
   await Promise.all([me.save(), target.save()]);
   return { changed, isFollowing: false };
+};
+
+userSchema.methods.toggleFollow = async function (targetId) {
+  const me = this;
+  const tid = toObjectId(targetId);
+  if (!tid) throw new Error('TARGET_REQUIRED');
+  if (me._id.equals(tid)) throw new Error('NO_SELF_TOGGLE');
+
+  const isFollowing = me.following.some((id) => id.equals(tid));
+  if (isFollowing) {
+    return this.unfollow(tid);
+  } else {
+    return this.follow(tid);
+  }
+};
+
+// ------------------------- Follow Requests privados -------------------------
+userSchema.methods.requestFollow = async function (targetId) {
+  const me = this;
+  const tid = toObjectId(targetId);
+  if (!tid) throw new Error('TARGET_REQUIRED');
+  if (me._id.equals(tid)) throw new Error('NO_SELF_FOLLOW_REQUEST');
+
+  const User = mongoose.model('User');
+  const target = await User.findById(tid);
+  if (!target) throw new Error('TARGET_NOT_FOUND');
+
+  const alreadyFollowing = me.following.some((id) => id.equals(tid));
+  if (alreadyFollowing) {
+    return {
+      changed: false,
+      isFollowing: true,
+      requestPending: false,
+      isPrivate: !!target.isPrivate,
+    };
+  }
+
+  // Si el perfil no es privado, el request se convierte en follow normal.
+  if (!target.isPrivate) {
+    return this.follow(tid);
+  }
+
+  const alreadyPending =
+    me.followRequestsSent.some((id) => id.equals(tid)) ||
+    target.followRequestsReceived.some((id) => id.equals(me._id));
+
+  if (alreadyPending) {
+    return {
+      changed: false,
+      isFollowing: false,
+      requestPending: true,
+      isPrivate: true,
+    };
+  }
+
+  me.followRequestsSent.push(tid);
+  target.followRequestsReceived.push(me._id);
+
+  await Promise.all([me.save(), target.save()]);
+
+  return {
+    changed: true,
+    isFollowing: false,
+    requestPending: true,
+    isPrivate: true,
+  };
+};
+
+userSchema.methods.cancelFollowRequest = async function (targetId) {
+  const me = this;
+  const tid = toObjectId(targetId);
+  if (!tid) throw new Error('TARGET_REQUIRED');
+  if (me._id.equals(tid)) throw new Error('NO_SELF_CANCEL_REQUEST');
+
+  const User = mongoose.model('User');
+  const target = await User.findById(tid);
+  if (!target) throw new Error('TARGET_NOT_FOUND');
+
+  const beforeMe = me.followRequestsSent.length;
+  const beforeTarget = target.followRequestsReceived.length;
+
+  me.followRequestsSent = me.followRequestsSent.filter((id) => !id.equals(tid));
+  target.followRequestsReceived = target.followRequestsReceived.filter((id) => !id.equals(me._id));
+
+  const changed =
+    me.followRequestsSent.length !== beforeMe ||
+    target.followRequestsReceived.length !== beforeTarget;
+
+  await Promise.all([me.save(), target.save()]);
+
+  return {
+    changed,
+    isFollowing: false,
+    requestPending: false,
+    isPrivate: !!target.isPrivate,
+  };
+};
+
+userSchema.methods.acceptFollowRequest = async function (requesterId) {
+  const target = this;
+  const rid = toObjectId(requesterId);
+  if (!rid) throw new Error('REQUESTER_REQUIRED');
+  if (target._id.equals(rid)) throw new Error('NO_SELF_ACCEPT_REQUEST');
+
+  const User = mongoose.model('User');
+  const requester = await User.findById(rid);
+  if (!requester) throw new Error('REQUESTER_NOT_FOUND');
+
+  const wasPending =
+    target.followRequestsReceived.some((id) => id.equals(rid)) ||
+    requester.followRequestsSent.some((id) => id.equals(target._id));
+
+  if (!wasPending) {
+    return {
+      changed: false,
+      accepted: false,
+      isFollowing: requester.following.some((id) => id.equals(target._id)),
+    };
+  }
+
+  target.followRequestsReceived = target.followRequestsReceived.filter((id) => !id.equals(rid));
+  requester.followRequestsSent = requester.followRequestsSent.filter((id) => !id.equals(target._id));
+
+  const alreadyFollowing = requester.following.some((id) => id.equals(target._id));
+  if (!alreadyFollowing) {
+    requester.following.push(target._id);
+    target.followers.push(requester._id);
+  }
+
+  requester.followingCount = requester.following.length;
+  target.followersCount = target.followers.length;
+
+  await Promise.all([requester.save(), target.save()]);
+
+  return {
+    changed: true,
+    accepted: true,
+    isFollowing: true,
+  };
+};
+
+userSchema.methods.rejectFollowRequest = async function (requesterId) {
+  const target = this;
+  const rid = toObjectId(requesterId);
+  if (!rid) throw new Error('REQUESTER_REQUIRED');
+  if (target._id.equals(rid)) throw new Error('NO_SELF_REJECT_REQUEST');
+
+  const User = mongoose.model('User');
+  const requester = await User.findById(rid);
+  if (!requester) throw new Error('REQUESTER_NOT_FOUND');
+
+  const beforeTarget = target.followRequestsReceived.length;
+  const beforeRequester = requester.followRequestsSent.length;
+
+  target.followRequestsReceived = target.followRequestsReceived.filter((id) => !id.equals(rid));
+  requester.followRequestsSent = requester.followRequestsSent.filter((id) => !id.equals(target._id));
+
+  const changed =
+    target.followRequestsReceived.length !== beforeTarget ||
+    requester.followRequestsSent.length !== beforeRequester;
+
+  await Promise.all([requester.save(), target.save()]);
+
+  return {
+    changed,
+    accepted: false,
+    isFollowing: false,
+  };
 };
 
 // Helper: crear/actualizar desde datos verificados de Firebase
