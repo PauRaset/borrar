@@ -139,22 +139,11 @@ const clearFollowRequestNotification = async ({ actorId, targetId }) => {
   try {
     if (!actorId || !targetId) return;
 
-    await Notification.updateMany(
-      {
-        user: targetId,
-        actor: actorId,
-        type: 'follow_request',
-      },
-      {
-        $set: {
-          read: true,
-          readAt: new Date(),
-          meta: {
-            requestResolved: true,
-          },
-        },
-      }
-    );
+    await Notification.deleteMany({
+      user: targetId,
+      actor: actorId,
+      type: 'follow_request',
+    });
   } catch (err) {
     console.warn('[notifications][follow_request] clear failed:', err?.message || err);
   }
