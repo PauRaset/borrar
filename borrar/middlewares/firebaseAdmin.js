@@ -65,7 +65,10 @@ function loadFromJsonString(env) {
 }
 
 function loadFromJsonPath(env) {
-  const p = env.FIREBASE_SERVICE_ACCOUNT_PATH || env.GOOGLE_APPLICATION_CREDENTIALS;
+  const p =
+    env.FIREBASE_SERVICE_ACCOUNT_PATH ||
+    env.FIREBASE_SERVICE_ACCOUNTS_PATH ||
+    env.GOOGLE_APPLICATION_CREDENTIALS;
   if (!p) return null;
   const abs = path.resolve(p);
   if (!fs.existsSync(abs)) {
@@ -80,13 +83,13 @@ function loadFromJsonPath(env) {
 function loadCredentialAndProject() {
   const env = process.env;
 
-  // 1) JSON string / base64
-  const fromJson = loadFromJsonString(env);
-  if (fromJson) return fromJson;
-
-  // 2) Ruta a JSON
+  // 1) Ruta a JSON
   const fromPath = loadFromJsonPath(env);
   if (fromPath) return fromPath;
+
+  // 2) JSON string / base64
+  const fromJson = loadFromJsonString(env);
+  if (fromJson) return fromJson;
 
   // 3) Trío de variables sueltas
   const fromTrio = loadFromEnvTrio(env);
