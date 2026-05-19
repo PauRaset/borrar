@@ -5,6 +5,7 @@ const PromotionLevelTemplate = require('../models/PromotionLevelTemplate');
 const UserClubPromotionProgress = require('../models/UserClubPromotionProgress');
 const PromotionClaim = require('../models/PromotionClaim');
 const Notification = require('../models/Notification');
+const { sendPushNotificationToUser } = require('../utils/sendPushNotification');
 
 // Opcionales (si existen en tu backend)
 let UserModel = null;
@@ -33,7 +34,7 @@ async function createPromotionNotification({
   try {
     if (!userId || !type || !title) return;
 
-    await Notification.create({
+    const notification = await Notification.create({
       user: userId,
       type,
       title,
@@ -49,6 +50,10 @@ async function createPromotionNotification({
         ...meta,
       },
     });
+
+    if (notification?._id) {
+      await sendPushNotificationToUser(userId, notification);
+    }
   } catch (e) {
     console.warn('[notifications][promotion] create failed:', e?.message || e);
   }
