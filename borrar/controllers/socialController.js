@@ -2,6 +2,7 @@
 const mongoose = require('mongoose');
 const User = require('../models/User');
 const Notification = require('../models/Notification');
+const { sendPushNotificationToUser } = require('../utils/sendPushNotification');
 const UserClubPromotionProgress = require('../models/UserClubPromotionProgress');
 
 // Helpers
@@ -89,7 +90,7 @@ const createFollowNotification = async ({ actor, target, isRequest = false }) =>
 
     const actorName = displayNameForUser(actor);
 
-    await Notification.findOneAndUpdate(
+    const notification = await Notification.findOneAndUpdate(
       {
         user: target._id,
         actor: actor._id,
@@ -125,6 +126,10 @@ const createFollowNotification = async ({ actor, target, isRequest = false }) =>
         setDefaultsOnInsert: true,
       }
     );
+
+    if (notification?._id) {
+      await sendPushNotificationToUser(target._id, notification);
+    }
   } catch (err) {
     console.warn('[notifications][follow] create failed:', err?.message || err);
   }
