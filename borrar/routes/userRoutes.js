@@ -451,6 +451,111 @@ router.get('/:id/moments', optionalAnyAuth, async (req, res) => {
 });
 
 
+/* -------------------------------------------------------------
+   GET /api/users/:id/club-moments
+   Fotos aprobadas subidas por asistentes en eventos creados por un club.
+------------------------------------------------------------- */
+router.get('/:id/club-moments', optionalAnyAuth, async (req, res) => {
+  try {
+    const clubUser = await resolveUserByAnyId(req.params.id);
+    if (!clubUser) return res.status(404).json({ message: 'Club no encontrado' });
+
+    const clubId = String(clubUser._id);
+
+    const events = await Event.find({
+      createdBy: clubUser._id,
+      photos: { $exists: true, $ne: [] },
+    })
+      .select('title date image createdBy photos')
+      .populate('createdBy', 'username displayName entName profilePicture')
+      .populate('photos.by', 'username displayName profilePicture')
+      .sort({ date: -1, updatedAt: -1 })
+      .lean();
+
+    const moments = [];
+
+    for (const event of events) {
+      const eventId = String(event._id);
+      const eventTitle = event.title || 'Evento NightVibe';
+      const club = event.createdBy || clubUser;
+      const photos = Array.isArray(event.photos) ? event.photos : [];
+
+      for (const photo of photos) {
+        const status = (photo.status || '').toString().toLowerCase();
+        const validationResult = (photo.validationResult || '').toString().toLowerCase();
+        const isApproved =
+          status === 'approved' ||
+          validationResult === 'approved' ||
+          validationResult === 'valid';
+
+        // En perfiles de club solo mostramos contenido ya aprobado/validado.
+        if (!isApproved) continue;
+
+        const photoUrl = absUrlFromUpload(req, rawPhotoValue(photo));
+        if (!photoUrl) continue;
+
+        const uploader = photo.by && typeof photo.by === 'object' ? photo.by : null;
+        const reactions = photoReactionsSummary(photo);
+
+        moments.push({
+          id: photo.photoId || `${eventId}:${rawPhotoValue(photo)}`,
+          photoId: photo.photoId || '',
+          photoUrl,
+          uploadedAt: photo.uploadedAt || photo.createdAt || event.date || null,
+          status: photo.status || null,
+          validationResult: photo.validationResult || null,
+          isApproved,
+          reactionsTotal: reactions.total,
+          reactionsByType: reactions.byType,
+          event: {
+            id: eventId,
+            title: eventTitle,
+            imageUrl: absUrlFromUpload(req, event.image),
+            date: event.date || null,
+          },
+          club: {
+            id: String(club._id || clubId),
+            username: club.username || club.displayName || club.entName || '',
+            displayName: club.displayName || club.username || club.entName || '',
+            profilePictureUrl: absUrlFromUpload(req, club.profilePicture),
+          },
+          uploader: uploader
+            ? {
+                id: String(uploader._id || ''),
+                username: uploader.username || uploader.displayName || photo.byUsername || '',
+                displayName: uploader.displayName || uploader.username || photo.byUsername || '',
+                profilePictureUrl: absUrlFromUpload(req, uploader.profilePicture),
+              }
+            : {
+                id: photo.by ? String(photo.by) : '',
+                username: photo.byUsername || '',
+                displayName: photo.byUsername || '',
+                profilePictureUrl: null,
+              },
+        });
+      }
+    }
+
+    moments.sort((a, b) => {
+      const ad = a.uploadedAt ? new Date(a.uploadedAt).getTime() : 0;
+      const bd = b.uploadedAt ? new Date(b.uploadedAt).getTime() : 0;
+      return bd - ad;
+    });
+
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '80', 10) || 80, 1), 160);
+
+    return res.json({
+      ok: true,
+      clubId,
+      count: moments.length,
+      moments: moments.slice(0, limit),
+    });
+  } catch (err) {
+    console.error('[GET /users/:id/club-moments]', err);
+    return res.status(500).json({ message: 'Error obteniendo momentos del club' });
+  }
+});
+
 /* =============================================================
    NUEVOS ENDPOINTS PARA HIDRATAR ASISTENTES (no tocan nada más)
    - GET /api/users/:id
