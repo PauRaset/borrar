@@ -257,6 +257,7 @@ router.put("/me", anyAuth, ensureUserId, async (req, res) => {
 /* -------------------------------------------------------------
    POST /api/users/me/avatar  (subir/cambiar avatar)
 ------------------------------------------------------------- */
+
 router.post("/me/avatar", anyAuth, ensureUserId, upload.single("avatar"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'Falta el archivo "avatar"' });
@@ -287,6 +288,165 @@ router.post("/me/avatar", anyAuth, ensureUserId, upload.single("avatar"), async 
   } catch (err) {
     console.error("[POST /api/users/me/avatar] error:", err);
     res.status(500).json({ message: "No se pudo subir el avatar", error: err.message });
+  }
+});
+
+/* -------------------------------------------------------------
+   GET /api/users/:id/moments
+   Fotos aprobadas subidas por un usuario en eventos/clubs.
+------------------------------------------------------------- */
+async function resolveUserByAnyId(id) {
+  const or = [];
+  if (/^[a-fA-F0-9]{24}$/.test(id)) or.push({ _id: id });
+  or.push({ firebaseUid: id }, { username: id }, { phoneNumber: id });
+  return User.findOne({ $or: or }).lean();
+}
+
+async function resolveViewerMongoId(req) {
+  if (req.user && req.user.id) return String(req.user.id);
+
+  const firebaseUid = req.firebaseUser && req.firebaseUser.uid
+    ? String(req.firebaseUser.uid)
+    : '';
+
+  if (!firebaseUid) return '';
+
+  const viewer = await User.findOne({ firebaseUid }).select('_id').lean();
+  return viewer?._id ? String(viewer._id) : '';
+}
+
+function userFollowsTarget(viewerId, targetUser) {
+  if (!viewerId || !targetUser) return false;
+
+  const followers = Array.isArray(targetUser.followers) ? targetUser.followers : [];
+  return followers.some((id) => String(id) === String(viewerId));
+}
+
+function rawPhotoValue(photo) {
+  if (!photo) return '';
+  return (
+    photo.url ||
+    photo.imageUrl ||
+    photo.path ||
+    photo.src ||
+    photo.file ||
+    photo.filename ||
+    ''
+  ).toString();
+}
+
+function photoReactionsSummary(photo) {
+  const reactions = Array.isArray(photo?.reactions) ? photo.reactions : [];
+  const byType = {};
+
+  for (const reaction of reactions) {
+    const type = (reaction?.type || '').toString().trim();
+    if (!type) continue;
+    byType[type] = (byType[type] || 0) + 1;
+  }
+
+  return {
+    total: reactions.length,
+    byType,
+  };
+}
+
+router.get('/:id/moments', optionalAnyAuth, async (req, res) => {
+  try {
+    const target = await resolveUserByAnyId(req.params.id);
+    if (!target) return res.status(404).json({ message: 'Usuario no encontrado' });
+
+    const viewerId = await resolveViewerMongoId(req);
+    const targetId = String(target._id);
+    const targetUid = target.firebaseUid ? String(target.firebaseUid) : '';
+    const viewerUid = req.firebaseUser && req.firebaseUser.uid ? String(req.firebaseUser.uid) : '';
+    const isOwner =
+      (viewerId && viewerId === targetId) ||
+      (viewerUid && targetUid && viewerUid === targetUid);
+
+    const canSeePrivate = !target.isPrivate || isOwner || userFollowsTarget(viewerId, target);
+    if (!canSeePrivate) {
+      return res.status(403).json({ message: 'Perfil privado' });
+    }
+
+    const events = await Event.find({
+      'photos.by': target._id,
+    })
+      .select('title date image createdBy photos')
+      .populate('createdBy', 'username displayName entName profilePicture')
+      .sort({ date: -1, updatedAt: -1 })
+      .lean();
+
+    const moments = [];
+
+    for (const event of events) {
+      const eventId = String(event._id);
+      const eventTitle = event.title || 'Evento NightVibe';
+      const club = event.createdBy || null;
+
+      const photos = Array.isArray(event.photos) ? event.photos : [];
+      for (const photo of photos) {
+        if (!photo?.by || String(photo.by) !== targetId) continue;
+
+        const status = (photo.status || '').toString().toLowerCase();
+        const validationResult = (photo.validationResult || '').toString().toLowerCase();
+        const isApproved =
+          status === 'approved' ||
+          validationResult === 'approved' ||
+          validationResult === 'valid';
+
+        // Para terceros solo mostramos momentos aprobados. El dueño puede ver también pendientes/rechazados.
+        if (!isOwner && !isApproved) continue;
+
+        const reactions = photoReactionsSummary(photo);
+        const photoUrl = absUrlFromUpload(req, rawPhotoValue(photo));
+        if (!photoUrl) continue;
+
+        moments.push({
+          id: photo.photoId || `${eventId}:${rawPhotoValue(photo)}`,
+          photoId: photo.photoId || '',
+          photoUrl,
+          uploadedAt: photo.uploadedAt || photo.createdAt || event.date || null,
+          status: photo.status || null,
+          validationResult: photo.validationResult || null,
+          isApproved,
+          reactionsTotal: reactions.total,
+          reactionsByType: reactions.byType,
+          event: {
+            id: eventId,
+            title: eventTitle,
+            imageUrl: absUrlFromUpload(req, event.image),
+            date: event.date || null,
+          },
+          club: club
+            ? {
+                id: String(club._id || ''),
+                username: club.username || club.displayName || club.entName || '',
+                displayName: club.displayName || club.username || club.entName || '',
+                profilePictureUrl: absUrlFromUpload(req, club.profilePicture),
+              }
+            : null,
+        });
+      }
+    }
+
+    moments.sort((a, b) => {
+      const ad = a.uploadedAt ? new Date(a.uploadedAt).getTime() : 0;
+      const bd = b.uploadedAt ? new Date(b.uploadedAt).getTime() : 0;
+      return bd - ad;
+    });
+
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '60', 10) || 60, 1), 120);
+
+    return res.json({
+      ok: true,
+      userId: targetId,
+      count: moments.length,
+      moments: moments.slice(0, limit),
+    });
+  } catch (err) {
+    console.error('[GET /users/:id/moments]', err);
+    return res.status(500).json({ message: 'Error obteniendo momentos del usuario' });
   }
 });
 
@@ -496,424 +656,3 @@ router.get("/:id/avatar", async (req, res) => {
 });
 
 module.exports = router;
-
-
-
-/*// routes/userRoutes.js
-const express = require("express");
-const router = express.Router();
-const path = require("path");
-const fs = require("fs");
-const multer = require("multer");
-const sharp = require("sharp");
-
-const User = require("../models/User");
-const Event = require("../models/Event");
-const authenticateToken = require("../middlewares/authMiddleware");
-
-// Inicializa firebase-admin (igual que en eventRoutes)
-require("../middlewares/firebaseAdmin");
-const admin = require("firebase-admin");
-
-function backendBase(req) {
-  return process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
-}
-
-function absUrlFromUpload(req, p) {
-  if (!p) return null;
-  const base = backendBase(req);
-
-  if (typeof p !== "string") p = String(p);
-
-  if (p.startsWith("http")) {
-    const idx = p.indexOf("/uploads/");
-    if (idx !== -1) return `${base}${p.substring(idx)}`;
-    return p; // URL externa no /uploads
-  }
-  const clean = p.startsWith("/") ? p : `/${p}`;
-  return `${base}${clean}`;
-}
-
-// Saca idToken de headers, si viene
-function extractIdToken(req) {
-  const h = req.headers || {};
-  const auth = h.authorization || h.Authorization || "";
-  if (auth.startsWith("Bearer ")) return auth.slice(7).trim();
-  if (auth.startsWith("Firebase ")) return auth.slice(8).trim();
-  return (
-    h["x-firebase-id-token"] ||
-    h["firebase-id-token"] ||
-    h["firebase_token"] ||
-    h["idtoken"] ||
-    (req.body && (req.body.firebaseIdToken || req.body.idToken)) ||
-    null
-  );
-}
-
-async function anyAuth(req, res, next) {
-  const token = extractIdToken(req);
-  if (!token) {
-    // sin token Firebase -> intenta tu JWT
-    return authenticateToken(req, res, next);
-  }
-  try {
-    const decoded = await admin.auth().verifyIdToken(token);
-    req.firebaseUser = {
-      uid: decoded.uid,
-      phone: decoded.phone_number || decoded.phoneNumber || null,
-      displayName: decoded.name || null,
-      photoURL: decoded.picture || null,
-    };
-    return next();
-  } catch (_) {
-    // no era Firebase válido -> usa tu JWT
-    return authenticateToken(req, res, next);
-  }
-}
-
-// Garantiza req.user.id (ObjectId string de Mongo)
-// - si viene de tu JWT: ya lo pone el middleware
-// - si viene de Firebase: crea/encuentra el User y lo setea
-async function ensureUserId(req, res, next) {
-  if (req.user && req.user.id) return next();
-  if (req.firebaseUser && req.firebaseUser.uid) {
-    try {
-      const user = await User.findOrCreateFromFirebase({
-        uid: req.firebaseUser.uid,
-        phoneNumber: req.firebaseUser.phone,
-        displayName: req.firebaseUser.displayName,
-        photoURL: req.firebaseUser.photoURL,
-      });
-      req.user = { id: user._id.toString() };
-      return next();
-    } catch (err) {
-      console.error("[ensureUserId] error:", err);
-      return res.status(401).json({ message: "No autorizado" });
-    }
-  }
-  return res.status(401).json({ message: "Usuario no autenticado" });
-}
-
-const ROOT_UPLOADS_DIR = path.join(__dirname, "..", "uploads");
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    ensureDir(ROOT_UPLOADS_DIR);
-    cb(null, ROOT_UPLOADS_DIR);
-  },
-  filename: (req, file, cb) => cb(null, Date.now() + "_" + file.originalname),
-});
-const upload = multer({ storage });
-
-async function processImageToJpg(srcPath, outDir, baseName) {
-  ensureDir(outDir);
-  const outPath = path.join(outDir, `${baseName}.jpg`);
-  try {
-    await sharp(srcPath)
-      .rotate()
-      .resize(800, 800, { fit: "inside", withoutEnlargement: true })
-      .jpeg({ quality: 82 })
-      .toFile(outPath);
-    return outPath;
-  } catch (e) {
-    const fallback = path.join(outDir, `${baseName}${path.extname(srcPath) || ""}`);
-    fs.copyFileSync(srcPath, fallback);
-    return fallback;
-  } finally {
-    try { fs.unlinkSync(srcPath); } catch {}
-  }
-}
-
-
-router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const events = await Event.find({ attendees: userId })
-      .select("title date image createdBy")
-      .sort({ date: -1 })
-      .lean();
-
-    const out = events.map((e) => ({
-      id: e._id.toString(),
-      title: e.title,
-      date: e.date,
-      imageUrl: absUrlFromUpload(req, e.image),
-    }));
-
-    res.json(out);
-  } catch (err) {
-    console.error("[/me/attending] error:", err);
-    res.status(500).json({ message: "Error obteniendo tus eventos" });
-  }
-});
-
-router.get("/me", anyAuth, ensureUserId, async (req, res) => {
-  try {
-    const u = await User.findById(req.user.id).lean();
-    if (!u) return res.status(404).json({ message: "Usuario no encontrado" });
-
-    const avatarRaw = u.profilePicture || u.avatar || null;
-
-    return res.json({
-      _id: u._id,
-      id: u._id,
-      username: u.username,
-      email: u.email || null,
-      phoneNumber: u.phoneNumber || null,
-      role: u.role || null,
-      entName: u.entName || "",
-      wUser: u.wUser || "",
-      profilePicture: u.profilePicture || "",
-      profilePictureUrl: absUrlFromUpload(req, avatarRaw),
-      createdAt: u.createdAt,
-      updatedAt: u.updatedAt,
-    });
-  } catch (err) {
-    console.error("[GET /api/users/me] error:", err);
-    return res.status(500).json({ message: "No se pudo obtener el usuario actual" });
-  }
-});
-
-function sanitizeProfileUpdate(body) {
-  const allowed = ["username", "entName", "wUser", "role"];
-  const out = {};
-  for (const k of allowed) {
-    if (typeof body[k] !== "undefined") out[k] = body[k];
-  }
-  return out;
-}
-
-router.patch("/me", anyAuth, ensureUserId, async (req, res) => {
-  try {
-    const update = sanitizeProfileUpdate(req.body);
-    const user = await User.findByIdAndUpdate(req.user.id, update, { new: true }).lean();
-    if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
-
-    return res.json({
-      _id: user._id,
-      id: user._id,
-      username: user.username,
-      entName: user.entName || "",
-      wUser: user.wUser || "",
-      role: user.role || null,
-      profilePictureUrl: absUrlFromUpload(req, user.profilePicture || user.avatar || null),
-    });
-  } catch (err) {
-    console.error("[PATCH /api/users/me] error:", err);
-    res.status(500).json({ message: "No se pudo actualizar el perfil" });
-  }
-});
-
-router.put("/me", anyAuth, ensureUserId, async (req, res) => {
-  // mismo handler que PATCH
-  return router.handle({ ...req, method: "PATCH" }, res);
-});
-
-router.post("/me/avatar", anyAuth, ensureUserId, upload.single("avatar"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ message: 'Falta el archivo "avatar"' });
-
-    const processedDir = ROOT_UPLOADS_DIR;
-    const processedImagePath = await processImageToJpg(
-      req.file.path,
-      processedDir,
-      `avatar-${Date.now()}-${path.parse(req.file.originalname).name}`
-    );
-
-    const rel = path
-      .relative(path.join(__dirname, ".."), processedImagePath)
-      .replace(/\\/g, "/");
-
-    const user = await User.findByIdAndUpdate(
-      req.user.id,
-      { profilePicture: rel },
-      { new: true }
-    ).lean();
-
-    return res.json({
-      _id: user._id,
-      id: user._id,
-      profilePicture: rel,
-      profilePictureUrl: absUrlFromUpload(req, rel),
-    });
-  } catch (err) {
-    console.error("[POST /api/users/me/avatar] error:", err);
-    res.status(500).json({ message: "No se pudo subir el avatar", error: err.message });
-  }
-});
-
-
-// GET /api/users/:id/attending  -> lista de eventos donde el usuario asiste
-router.get("/:id/attending", async (req, res) => {
-  try {
-    const id = req.params.id;
-    const or = [];
-    if (/^[a-fA-F0-9]{24}$/.test(id)) or.push({ _id: id });
-    or.push({ firebaseUid: id }, { username: id }, { phoneNumber: id });
-
-    const user = await User.findOne({ $or: or }).select("_id").lean();
-    if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
-
-    const events = await Event.find({ attendees: user._id })
-      .select("title date image createdBy")
-      .sort({ date: -1 })
-      .lean();
-
-    const out = events.map((e) => ({
-      id: e._id.toString(),
-      title: e.title,
-      date: e.date,
-      imageUrl: absUrlFromUpload(req, e.image),
-    }));
-
-    return res.json(out);
-  } catch (err) {
-    console.error("[GET /users/:id/attending]", err);
-    return res.status(500).json({ message: "Error obteniendo eventos asistidos" });
-  }
-});
-
-// GET /api/users/:id  -> admite _id Mongo, firebaseUid, username o phoneNumber
-router.get("/:id", async (req, res) => {
-  try {
-    const id = req.params.id;
-    const or = [];
-    if (/^[a-fA-F0-9]{24}$/.test(id)) or.push({ _id: id });
-    or.push({ firebaseUid: id }, { username: id }, { phoneNumber: id });
-
-    const user = await User.findOne({ $or: or })
-      // Incluimos posibles campos sociales si existen (arrays o counters)
-      .select(
-        "username displayName profilePicture followers following followersCount followingCount firebaseUid phoneNumber"
-      )
-      .lean();
-
-    // Followers/Following: soporta dos esquemas comunes
-    // - arrays: user.followers / user.following
-    // - counters: user.followersCount / user.followingCount
-    const followersCount = Array.isArray(user.followers)
-      ? user.followers.length
-      : Number(user.followersCount || 0);
-
-    const followingCount = Array.isArray(user.following)
-      ? user.following.length
-      : Number(user.followingCount || 0);
-
-    // Attendances: contamos eventos donde el usuario aparece en `attendees`
-    let attendancesCount = 0;
-    try {
-      attendancesCount = await Event.countDocuments({ attendees: user._id });
-    } catch (_) {
-      attendancesCount = 0;
-    }
-
-    return res.json({
-      id: String(user._id || id),
-      username: user.username || "",
-      displayName: user.displayName || "",
-      profilePicture: user.profilePicture || null,
-      avatarUrl: absUrlFromUpload(req, user.profilePicture),
-      followersCount,
-      followingCount,
-      attendancesCount,
-    });
-  } catch (err) {
-    console.error("[GET /users/:id]", err);
-    return res.status(500).json({ message: "Error interno" });
-  }
-});
-
-// GET /api/users?ids=a,b,c  -> batch por querystring
-router.get("/", async (req, res) => {
-  try {
-    const idsRaw = (req.query.ids || "").toString();
-    if (!idsRaw) return res.json([]);
-
-    const ids = idsRaw.split(",").map((s) => s.trim()).filter(Boolean);
-    const byObjectId = ids.filter((s) => /^[a-fA-F0-9]{24}$/.test(s));
-
-    const users = await User.find({
-      $or: [
-        { _id: { $in: byObjectId } },
-        { firebaseUid: { $in: ids } },
-        { username: { $in: ids } },
-        { phoneNumber: { $in: ids } },
-      ],
-    })
-      .select("username displayName profilePicture")
-      .lean();
-
-    const out = users.map((u) => ({
-      id: String(u._id),
-      username: u.username || "",
-      displayName: u.displayName || "",
-      profilePicture: u.profilePicture || null,
-      avatarUrl: absUrlFromUpload(req, u.profilePicture),
-    }));
-    res.json(out);
-  } catch (err) {
-    console.error("[GET /users?ids]", err);
-    res.status(500).json({ message: "Error interno" });
-  }
-});
-
-// POST /api/users/batch  -> { ids: [...] }
-router.post("/batch", async (req, res) => {
-  try {
-    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [];
-    if (!ids.length) return res.json([]);
-
-    const byObjectId = ids.filter((s) => /^[a-fA-F0-9]{24}$/.test(s));
-
-    const users = await User.find({
-      $or: [
-        { _id: { $in: byObjectId } },
-        { firebaseUid: { $in: ids } },
-        { username: { $in: ids } },
-        { phoneNumber: { $in: ids } },
-      ],
-    })
-      .select("username displayName profilePicture")
-      .lean();
-
-    const out = users.map((u) => ({
-      id: String(u._id),
-      username: u.username || "",
-      displayName: u.displayName || "",
-      profilePicture: u.profilePicture || null,
-      avatarUrl: absUrlFromUpload(req, u.profilePicture),
-    }));
-    res.json(out);
-  } catch (err) {
-    console.error("[POST /users/batch]", err);
-    res.status(500).json({ message: "Error interno" });
-  }
-});
-
-// GET /api/users/:id/avatar  -> redirige a la imagen real
-router.get("/:id/avatar", async (req, res) => {
-  try {
-    const id = req.params.id;
-    const or = [];
-    if (/^[a-fA-F0-9]{24}$/.test(id)) or.push({ _id: id });
-    or.push({ firebaseUid: id }, { username: id }, { phoneNumber: id });
-
-    const user = await User.findOne({ $or: or })
-      .select("profilePicture")
-      .lean();
-
-    if (!user || !user.profilePicture) return res.status(404).end();
-
-    const url = absUrlFromUpload(req, user.profilePicture);
-    if (!url) return res.status(404).end();
-    return res.redirect(url);
-  } catch (err) {
-    console.error("[GET /users/:id/avatar]", err);
-    res.status(500).end();
-  }
-});
-
-module.exports = router;*/
