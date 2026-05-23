@@ -205,6 +205,10 @@ router.get("/me", anyAuth, ensureUserId, async (req, res) => {
       profilePicture: u.profilePicture || "",
       profilePictureUrl: absUrlFromUpload(req, avatarRaw),
       isPrivate: !!u.isPrivate,
+      privacySettings: u.privacySettings || {},
+      attendancesVisibility: u.attendancesVisibility || u.privacySettings?.attendancesVisibility || "followers",
+      momentsVisibility: u.momentsVisibility || u.privacySettings?.momentsVisibility || "followers",
+      locationVisibility: u.locationVisibility || u.privacySettings?.locationVisibility || "private",
       createdAt: u.createdAt,
       updatedAt: u.updatedAt,
     });
@@ -218,12 +222,53 @@ router.get("/me", anyAuth, ensureUserId, async (req, res) => {
    PATCH/PUT /api/users/me  (actualiza perfil)
    Campos permitidos: username, entName, wUser, role (opcional)
 ------------------------------------------------------------- */
+function normalizeVisibility(value, fallback = "followers") {
+  const raw = (value || fallback).toString().toLowerCase().trim();
+  if (["public", "followers", "private"].includes(raw)) return raw;
+  return fallback;
+}
+
 function sanitizeProfileUpdate(body) {
-  const allowed = ["username", "entName", "wUser", "role", "isPrivate"]; // + privacidad
+  const allowed = ["username", "entName", "wUser", "role", "isPrivate"];
   const out = {};
+
   for (const k of allowed) {
     if (typeof body[k] !== "undefined") out[k] = body[k];
   }
+
+  const incomingPrivacy = body.privacySettings && typeof body.privacySettings === "object"
+    ? body.privacySettings
+    : {};
+
+  const attendancesVisibility = normalizeVisibility(
+    body.attendancesVisibility || incomingPrivacy.attendancesVisibility,
+    "followers"
+  );
+  const momentsVisibility = normalizeVisibility(
+    body.momentsVisibility || incomingPrivacy.momentsVisibility,
+    "followers"
+  );
+  const locationVisibility = normalizeVisibility(
+    body.locationVisibility || incomingPrivacy.locationVisibility,
+    "private"
+  );
+
+  if (
+    typeof body.attendancesVisibility !== "undefined" ||
+    typeof body.momentsVisibility !== "undefined" ||
+    typeof body.locationVisibility !== "undefined" ||
+    body.privacySettings
+  ) {
+    out.attendancesVisibility = attendancesVisibility;
+    out.momentsVisibility = momentsVisibility;
+    out.locationVisibility = locationVisibility;
+    out.privacySettings = {
+      attendancesVisibility,
+      momentsVisibility,
+      locationVisibility,
+    };
+  }
+
   return out;
 }
 
@@ -241,6 +286,10 @@ router.patch("/me", anyAuth, ensureUserId, async (req, res) => {
       wUser: user.wUser || "",
       role: user.role || null,
       isPrivate: !!user.isPrivate,
+      privacySettings: user.privacySettings || {},
+      attendancesVisibility: user.attendancesVisibility || user.privacySettings?.attendancesVisibility || "followers",
+      momentsVisibility: user.momentsVisibility || user.privacySettings?.momentsVisibility || "followers",
+      locationVisibility: user.locationVisibility || user.privacySettings?.locationVisibility || "private",
       profilePictureUrl: absUrlFromUpload(req, user.profilePicture || user.avatar || null),
     });
   } catch (err) {
@@ -322,6 +371,20 @@ function userFollowsTarget(viewerId, targetUser) {
   return followers.some((id) => String(id) === String(viewerId));
 }
 
+function visibilityFor(targetUser, key, fallback) {
+  const nested = targetUser?.privacySettings && typeof targetUser.privacySettings === "object"
+    ? targetUser.privacySettings[key]
+    : null;
+  return normalizeVisibility(targetUser?.[key] || nested, fallback);
+}
+
+function canViewByVisibility({ visibility, isOwner, viewerId, targetUser }) {
+  if (isOwner) return true;
+  if (visibility === "public") return true;
+  if (visibility === "followers") return userFollowsTarget(viewerId, targetUser);
+  return false;
+}
+
 function rawPhotoValue(photo) {
   if (!photo) return '';
   return (
@@ -364,9 +427,16 @@ router.get('/:id/moments', optionalAnyAuth, async (req, res) => {
       (viewerId && viewerId === targetId) ||
       (viewerUid && targetUid && viewerUid === targetUid);
 
-    const canSeePrivate = !target.isPrivate || isOwner || userFollowsTarget(viewerId, target);
-    if (!canSeePrivate) {
-      return res.status(403).json({ message: 'Perfil privado' });
+    const momentsVisibility = visibilityFor(target, "momentsVisibility", target.isPrivate ? "followers" : "public");
+    const canSeeMoments = canViewByVisibility({
+      visibility: momentsVisibility,
+      isOwner,
+      viewerId,
+      targetUser: target,
+    });
+
+    if (!canSeeMoments) {
+      return res.status(403).json({ message: 'Momentos privados' });
     }
 
     const events = await Event.find({
@@ -573,7 +643,9 @@ router.get("/:id/attending", optionalAnyAuth, async (req, res) => {
     if (/^[a-fA-F0-9]{24}$/.test(id)) or.push({ _id: id });
     or.push({ firebaseUid: id }, { username: id }, { phoneNumber: id });
 
-    const user = await User.findOne({ $or: or }).select("_id firebaseUid isPrivate").lean();
+    const user = await User.findOne({ $or: or })
+      .select("_id firebaseUid isPrivate followers privacySettings attendancesVisibility")
+      .lean();
     if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
 
     // Privacy gate: si el perfil es privado, solo el dueño puede ver asistencias.
@@ -583,8 +655,16 @@ router.get("/:id/attending", optionalAnyAuth, async (req, res) => {
     const targetUid = user.firebaseUid ? String(user.firebaseUid) : "";
     const isOwner = (viewerMongoId && viewerMongoId === targetMongoId) || (viewerUid && targetUid && viewerUid === targetUid);
 
-    if (user.isPrivate && !isOwner) {
-      return res.status(403).json({ message: "Perfil privado" });
+    const attendancesVisibility = visibilityFor(user, "attendancesVisibility", user.isPrivate ? "followers" : "public");
+    const canSeeAttendances = canViewByVisibility({
+      visibility: attendancesVisibility,
+      isOwner,
+      viewerId: viewerMongoId,
+      targetUser: user,
+    });
+
+    if (!canSeeAttendances) {
+      return res.status(403).json({ message: "Asistencias privadas" });
     }
 
     const events = await Event.find({ attendees: user._id })
@@ -617,7 +697,7 @@ router.get("/:id", optionalAnyAuth, async (req, res) => {
     const user = await User.findOne({ $or: or })
       // Incluimos posibles campos sociales si existen (arrays o counters)
       .select(
-        "username displayName profilePicture followers following followersCount followingCount firebaseUid phoneNumber isPrivate"
+        "username displayName profilePicture followers following followersCount followingCount firebaseUid phoneNumber isPrivate privacySettings attendancesVisibility momentsVisibility locationVisibility"
       )
       .lean();
 
@@ -640,11 +720,21 @@ router.get("/:id", optionalAnyAuth, async (req, res) => {
       ? user.following.length
       : Number(user.followingCount || 0);
 
+    const attendancesVisibility = visibilityFor(user, "attendancesVisibility", user.isPrivate ? "followers" : "public");
+    const momentsVisibility = visibilityFor(user, "momentsVisibility", user.isPrivate ? "followers" : "public");
+    const locationVisibility = visibilityFor(user, "locationVisibility", "private");
+    const canSeeAttendances = canViewByVisibility({
+      visibility: attendancesVisibility,
+      isOwner,
+      viewerId: viewerMongoId,
+      targetUser: user,
+    });
+
     // Attendances: contamos eventos donde el usuario aparece en `attendees`
     let attendancesCount = 0;
     try {
       // Si el perfil es privado, ocultamos el contador a terceros (solo dueño).
-      if (!user.isPrivate || isOwner) {
+      if (canSeeAttendances) {
         attendancesCount = await Event.countDocuments({ attendees: user._id });
       } else {
         attendancesCount = 0;
@@ -663,6 +753,24 @@ router.get("/:id", optionalAnyAuth, async (req, res) => {
       followingCount,
       attendancesCount,
       isPrivate: !!user.isPrivate,
+      privacySettings: {
+        attendancesVisibility,
+        momentsVisibility,
+        locationVisibility,
+      },
+      canSeeAttendances,
+      canSeeMoments: canViewByVisibility({
+        visibility: momentsVisibility,
+        isOwner,
+        viewerId: viewerMongoId,
+        targetUser: user,
+      }),
+      canSeeLocation: canViewByVisibility({
+        visibility: locationVisibility,
+        isOwner,
+        viewerId: viewerMongoId,
+        targetUser: user,
+      }),
     });
   } catch (err) {
     console.error("[GET /users/:id]", err);
