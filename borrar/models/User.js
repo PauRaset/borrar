@@ -23,6 +23,46 @@ const userSchema = new mongoose.Schema(
     bio: { type: String, default: "" },
     isPrivate: { type: Boolean, default: false },
 
+    // ---- Privacidad social granular ----
+    privacySettings: {
+      attendancesVisibility: {
+        type: String,
+        enum: ["public", "followers", "private"],
+        default: "followers",
+      },
+      momentsVisibility: {
+        type: String,
+        enum: ["public", "followers", "private"],
+        default: "followers",
+      },
+      locationVisibility: {
+        type: String,
+        enum: ["public", "followers", "private"],
+        default: "private",
+      },
+    },
+
+    attendancesVisibility: {
+      type: String,
+      enum: ["public", "followers", "private"],
+      default: "followers",
+      index: true,
+    },
+
+    momentsVisibility: {
+      type: String,
+      enum: ["public", "followers", "private"],
+      default: "followers",
+      index: true,
+    },
+
+    locationVisibility: {
+      type: String,
+      enum: ["public", "followers", "private"],
+      default: "private",
+      index: true,
+    },
+
     role: { type: String, enum: ["club", "spectator"], default: "spectator" },
 
     // --- Social (seguidores / seguidos) ---
@@ -162,6 +202,38 @@ userSchema.pre("save", function (next) {
   if (this.profilePicture) {
     this.profilePicture = onlyUploadPath(this.profilePicture.trim());
   }
+
+  // Sincronizar privacySettings con campos legacy/directos
+  const normalizeVisibility = (value, fallback) => {
+    const raw = (value || fallback).toString().toLowerCase().trim();
+    if (["public", "followers", "private"].includes(raw)) return raw;
+    return fallback;
+  };
+
+  const attendancesVisibility = normalizeVisibility(
+    this.attendancesVisibility || this.privacySettings?.attendancesVisibility,
+    "followers"
+  );
+
+  const momentsVisibility = normalizeVisibility(
+    this.momentsVisibility || this.privacySettings?.momentsVisibility,
+    "followers"
+  );
+
+  const locationVisibility = normalizeVisibility(
+    this.locationVisibility || this.privacySettings?.locationVisibility,
+    "private"
+  );
+
+  this.attendancesVisibility = attendancesVisibility;
+  this.momentsVisibility = momentsVisibility;
+  this.locationVisibility = locationVisibility;
+
+  this.privacySettings = {
+    attendancesVisibility,
+    momentsVisibility,
+    locationVisibility,
+  };
 
   next();
 });
