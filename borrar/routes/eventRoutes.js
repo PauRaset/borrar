@@ -99,6 +99,25 @@ function summarizePhotoReactions(reactions = []) {
   };
 }
 
+function shapePhotoSignatures(req, signatures = [], viewerUserId = null, cap = 60) {
+  const list = Array.isArray(signatures) ? signatures : [];
+  const shaped = list.slice(0, cap).map((s) => ({
+    userId: String(s?.userId || ""),
+    username: s?.username || null,
+    avatarUrl: absUrlFromUpload(req, s?.profilePicture || null),
+    x: typeof s?.x === "number" ? s.x : 0,
+    y: typeof s?.y === "number" ? s.y : 0,
+  }));
+  const mine = list.find(
+    (s) => String(s?.userId || "") === String(viewerUserId)
+  );
+  return {
+    signatures: shaped,
+    signatureCount: list.length,
+    mySignature: mine ? { x: mine.x, y: mine.y } : null,
+  };
+}
+
 // --- Notification helpers for photo reactions ---
 function reactionLabel(type) {
   switch (type) {
@@ -958,6 +977,7 @@ function toPhotoTileAbs(req, entry, viewerUserId = null) {
       null;
 
     const reactionSummary = summarizePhotoReactions(entry.reactions || []);
+    const sig = shapePhotoSignatures(req, entry.signatures, viewerUserId);
 
     return {
       url,
@@ -970,6 +990,7 @@ function toPhotoTileAbs(req, entry, viewerUserId = null) {
       myReaction: (entry.reactions || []).find(
         (r) => String(r?.userId || "") === String(viewerUserId)
       )?.type || null,
+      ...sig,
     };
   }
   return null;
@@ -1584,6 +1605,152 @@ router.post(
       return res.status(500).json({
         message: "Error reaccionando a la foto",
       });
+    }
+  }
+);
+
+/* ------------------------------------------------------------------
+   FIRMAS DE FOTOS (firmar / quitar firma)
+------------------------------------------------------------------- */
+
+// Firmar una foto: deja tu firma en un punto (x,y relativos 0..1)
+router.post(
+  "/:id/photos/:photoId/sign",
+  anyAuth,
+  ensureUserId,
+  async (req, res) => {
+    try {
+      const { id, photoId } = req.params;
+
+      if (!mongoose.isValidObjectId(id)) {
+        return res.status(400).json({ message: "ID de evento inválido" });
+      }
+
+      let x = Number(req.body?.x);
+      let y = Number(req.body?.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        return res.status(400).json({ message: "Coordenadas inválidas" });
+      }
+      x = Math.min(1, Math.max(0, x));
+      y = Math.min(1, Math.max(0, y));
+
+      const event = await Event.findById(id);
+      if (!event) {
+        return res.status(404).json({ message: "Evento no encontrado" });
+      }
+
+      const idx = (event.photos || []).findIndex(
+        (p) =>
+          p &&
+          typeof p === "object" &&
+          String(p.photoId || "") === String(photoId)
+      );
+      if (idx === -1) {
+        return res.status(404).json({ message: "Foto no encontrada" });
+      }
+
+      const photo = event.photos[idx];
+      photo.signatures = Array.isArray(photo.signatures)
+        ? photo.signatures
+        : [];
+
+      // snapshot del usuario para pintar la firma sin populate
+      const user = await User.findById(req.user.id).select(
+        "username phoneNumber profilePicture"
+      );
+      const username = usernameFromUserDoc(user) || "";
+      const profilePicture = user?.profilePicture || "";
+
+      const existingIndex = photo.signatures.findIndex(
+        (s) => String(s.userId || "") === String(req.user.id)
+      );
+
+      if (existingIndex !== -1) {
+        // ya firmó: actualiza posición y refresca snapshot
+        photo.signatures[existingIndex].x = x;
+        photo.signatures[existingIndex].y = y;
+        photo.signatures[existingIndex].username = username;
+        photo.signatures[existingIndex].profilePicture = profilePicture;
+      } else {
+        photo.signatures.push({
+          userId: req.user.id,
+          username,
+          profilePicture,
+          x,
+          y,
+          createdAt: new Date(),
+        });
+      }
+
+      await event.save();
+
+      const shaped = shapePhotoSignatures(req, photo.signatures, req.user.id);
+      return res.json({
+        ok: true,
+        photoId,
+        signatures: shaped.signatures,
+        signatureCount: shaped.signatureCount,
+        mySignature: shaped.mySignature,
+      });
+    } catch (e) {
+      console.error("[POST /events/:id/photos/:photoId/sign] error:", e);
+      return res.status(500).json({ message: "Error firmando la foto" });
+    }
+  }
+);
+
+// Quitar tu firma de una foto
+router.delete(
+  "/:id/photos/:photoId/sign",
+  anyAuth,
+  ensureUserId,
+  async (req, res) => {
+    try {
+      const { id, photoId } = req.params;
+
+      if (!mongoose.isValidObjectId(id)) {
+        return res.status(400).json({ message: "ID de evento inválido" });
+      }
+
+      const event = await Event.findById(id);
+      if (!event) {
+        return res.status(404).json({ message: "Evento no encontrado" });
+      }
+
+      const idx = (event.photos || []).findIndex(
+        (p) =>
+          p &&
+          typeof p === "object" &&
+          String(p.photoId || "") === String(photoId)
+      );
+      if (idx === -1) {
+        return res.status(404).json({ message: "Foto no encontrada" });
+      }
+
+      const photo = event.photos[idx];
+      photo.signatures = Array.isArray(photo.signatures)
+        ? photo.signatures
+        : [];
+
+      const existingIndex = photo.signatures.findIndex(
+        (s) => String(s.userId || "") === String(req.user.id)
+      );
+      if (existingIndex !== -1) {
+        photo.signatures.splice(existingIndex, 1);
+        await event.save();
+      }
+
+      const shaped = shapePhotoSignatures(req, photo.signatures, req.user.id);
+      return res.json({
+        ok: true,
+        photoId,
+        signatures: shaped.signatures,
+        signatureCount: shaped.signatureCount,
+        mySignature: null,
+      });
+    } catch (e) {
+      console.error("[DELETE /events/:id/photos/:photoId/sign] error:", e);
+      return res.status(500).json({ message: "Error quitando la firma" });
     }
   }
 );
