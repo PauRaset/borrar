@@ -66,6 +66,25 @@ const eventPhotoSchema = new mongoose.Schema(
       ],
       default: [],
     },
+
+    // signatures (NightVibe — firmas sobre la foto)
+    signatures: {
+      type: [
+        {
+          userId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "User",
+            required: true,
+          },
+          username: { type: String, default: "" },
+          profilePicture: { type: String, default: "" }, // ruta relativa (= User.profilePicture)
+          x: { type: Number, required: true, min: 0, max: 1 }, // 0..1 relativo
+          y: { type: Number, required: true, min: 0, max: 1 },
+          createdAt: { type: Date, default: Date.now },
+        },
+      ],
+      default: [],
+    },
   },
   { _id: false }
 );
@@ -286,6 +305,7 @@ eventSchema.pre("save", function (next) {
           if (copy.validatedForLevelNumber === undefined) copy.validatedForLevelNumber = null;
           if (copy.validationResult === undefined) copy.validationResult = null;
           if (!Array.isArray(copy.reactions)) copy.reactions = [];
+          if (!Array.isArray(copy.signatures)) copy.signatures = [];
 
           return copy;
         }
