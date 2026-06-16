@@ -9,6 +9,7 @@ const mongoose = require("mongoose");
 const router = express.Router();
 
 const Event = require("../models/Event");
+const Order = require("../models/Order"); // entradas: compra pagada = Order.status 'paid'
 const User = require("../models/User");
 const Notification = require("../models/Notification");
 const { sendPushNotificationToUser } = require("../utils/sendPushNotification");
@@ -1415,6 +1416,65 @@ router.post("/scan/:token/photo", anyAuth, ensureUserId, uploadAny.any(), async 
   } catch (e) {
     console.error("[POST /events/scan/:token/photo] error:", e);
     return res.status(500).json({ message: "Error subiendo foto desde QR" });
+  }
+});
+
+/* =======================================================================
+   ENTRADAS COMPRADAS (has-ticket)
+   Compras guardadas en Order.userId = UID de Firebase. Casamos contra el uid
+   de Firebase (y req.user.id por robustez). Compra válida = status 'paid'.
+   ======================================================================= */
+
+// GET /api/events/my-tickets -> { eventIds: [...] }
+// El Home lo pide UNA vez y construye un Set (evita N peticiones, una por tarjeta).
+// IMPORTANTE: debe quedar ANTES de `router.get("/:id", ...)`, si no Express
+// interpretaría "my-tickets" como un :id.
+router.get("/my-tickets", optionalUserId, async (req, res) => {
+  try {
+    const buyerIds = [req.firebaseUser?.uid, req.user?.id].filter(Boolean);
+    if (buyerIds.length === 0) return res.json({ eventIds: [] });
+
+    const ids = await Order.distinct("eventId", {
+      userId: { $in: buyerIds },
+      status: "paid",
+    });
+
+    const eventIds = (ids || []).map((x) => String(x)).filter(Boolean);
+    return res.json({ eventIds });
+  } catch (err) {
+    console.error("[GET /events/my-tickets] error:", err);
+    return res.status(500).json({ eventIds: [] });
+  }
+});
+
+// GET /api/events/:id/has-ticket -> { hasTicket: bool }
+// Lo usa el Detalle al cargar y al volver de Stripe.
+router.get("/:id/has-ticket", optionalUserId, async (req, res) => {
+  try {
+    const eventId = String(req.params.id || "").trim();
+    const buyerIds = [req.firebaseUser?.uid, req.user?.id].filter(Boolean);
+    console.log("🎟️ [has-ticket] eventId=", eventId,
+      "| firebaseUid=", req.firebaseUser?.uid,
+      "| mongoId=", req.user?.id,
+      "| buyerIds=", buyerIds);
+
+    if (!eventId) return res.status(400).json({ hasTicket: false });
+    if (buyerIds.length === 0) {
+      console.log("🎟️ [has-ticket] sin buyerIds (sin token) -> false");
+      return res.json({ hasTicket: false });
+    }
+
+    const order = await Order.findOne({
+      eventId,
+      userId: { $in: buyerIds },
+      status: "paid",
+    }).select("_id userId status").lean();
+
+    console.log("🎟️ [has-ticket] order encontrada=", order);
+    return res.json({ hasTicket: !!order });
+  } catch (err) {
+    console.error("[GET /events/:id/has-ticket] error:", err);
+    return res.status(500).json({ hasTicket: false });
   }
 });
 
