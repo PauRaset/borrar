@@ -1452,25 +1452,17 @@ router.get("/my-tickets", optionalUserId, async (req, res) => {
 router.get("/:id/has-ticket", optionalUserId, async (req, res) => {
   try {
     const eventId = String(req.params.id || "").trim();
-    const buyerIds = [req.firebaseUser?.uid, req.user?.id].filter(Boolean);
-    console.log("🎟️ [has-ticket] eventId=", eventId,
-      "| firebaseUid=", req.firebaseUser?.uid,
-      "| mongoId=", req.user?.id,
-      "| buyerIds=", buyerIds);
-
     if (!eventId) return res.status(400).json({ hasTicket: false });
-    if (buyerIds.length === 0) {
-      console.log("🎟️ [has-ticket] sin buyerIds (sin token) -> false");
-      return res.json({ hasTicket: false });
-    }
+
+    const buyerIds = [req.firebaseUser?.uid, req.user?.id].filter(Boolean);
+    if (buyerIds.length === 0) return res.json({ hasTicket: false });
 
     const order = await Order.findOne({
       eventId,
       userId: { $in: buyerIds },
       status: "paid",
-    }).select("_id userId status").lean();
+    }).select("_id").lean();
 
-    console.log("🎟️ [has-ticket] order encontrada=", order);
     return res.json({ hasTicket: !!order });
   } catch (err) {
     console.error("[GET /events/:id/has-ticket] error:", err);
