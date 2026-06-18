@@ -5,6 +5,7 @@ const path = require("path");
 const sharp = require("sharp");
 const fs = require("fs");
 const mongoose = require("mongoose");
+const crypto = require("crypto");
 
 const router = express.Router();
 
@@ -1016,6 +1017,24 @@ function approvedOnly(list) {
 ------------------------------------------------------------- */
 function shapePublicUser(req, u) {
   if (!u) return null;
+
+  // Cuenta privada: NO exponemos identidad (ni nombre, ni foto, ni id real).
+  // Enviamos un id OPACO (hash estable, no reversible al perfil) para que el
+  // cliente la coloque como "presencia" sin poder abrir su perfil.
+  if (u.isPrivate) {
+    const anonId =
+      "priv_" +
+      crypto.createHash("sha1").update(String(u._id)).digest("hex").slice(0, 12);
+    return {
+      id: anonId,
+      private: true,
+      username: "",
+      displayName: "",
+      profilePicture: null,
+      avatarUrl: null,
+    };
+  }
+
   const username =
     u.username ||
     (u.phoneNumber ? String(u.phoneNumber).replace("+", "") : "") ||
@@ -1025,6 +1044,7 @@ function shapePublicUser(req, u) {
   return {
     _id: u._id,
     id: String(u._id || ""),
+    private: false,
     username,
     displayName,
     profilePicture,                             // 👈 clave que busca el front
@@ -1306,7 +1326,7 @@ async function attendeesHandler(req, res, forceFull = false) {
     }
 
     const event = await Event.findById(id)
-      .populate("attendees", "username displayName profilePicture phoneNumber")
+      .populate("attendees", "username displayName profilePicture phoneNumber isPrivate")
       .lean();
 
     if (!event) return res.status(404).json({ message: "Evento no encontrado" });
