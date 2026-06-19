@@ -935,7 +935,7 @@ async function processImageToJpg(srcPath, outDir, baseName) {
   try {
     await sharp(srcPath)
       .rotate()
-      .resize(1600, 1600, { fit: "inside", withoutEnlargement: true })
+      .resize(1080, 1920, { fit: "cover" }) // 9:16 vertical (formato del feed)
       .jpeg({ quality: 82 })
       .toFile(outPath);
     return outPath;
