@@ -198,7 +198,7 @@ const createLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
-app.use(["/api/orders", "/api/webhooks/stripe"], createLimiter);
+app.use(["/api/orders"], createLimiter);
 
 // ===== Webhook Stripe (RAW body) — debe ir ANTES de express.json() =====
 // Soporte para ambos secretos de Stripe (plataforma y cuentas conectadas)
