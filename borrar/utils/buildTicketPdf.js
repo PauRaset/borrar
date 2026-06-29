@@ -143,7 +143,7 @@ function buildTicketPdf({
         // Encabezado
         const headerY = cardY + 18;
         const headerLabel = (themeName === 'clubX' || themeName === 'primeraEvents')
-          ? 'LA PRIMERA — ENTRADA'
+          ? 'ENTRADA'
           : 'NIGHTVIBE — DIGITAL TICKET';
 
         const pageSuffix = totalTickets > 1 ? ` • ENTRADA ${index + 1}/${totalTickets}` : '';
