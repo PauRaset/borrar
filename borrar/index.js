@@ -1125,6 +1125,85 @@ app.post('/api/debug/send-test-email', express.json(), async (req, res) => {
   }
 });
 
+// Helper local: genera un token con el MISMO formato que el webhook (estructura idéntica del QR)
+function makeTicketToken(serial) {
+  const raw = `${serial}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+  const sig = crypto
+    .createHmac('sha256', process.env.QR_HMAC_KEY || 'nv_dev')
+    .update(raw)
+    .digest('hex')
+    .slice(0, 16);
+  return `${raw}.${sig}`;
+}
+
+app.post('/api/debug/resend-ticket', express.json(), async (req, res) => {
+  try {
+    const token = req.headers['x-debug-token'];
+    if (!process.env.DEBUG_ADMIN_TOKEN || token !== process.env.DEBUG_ADMIN_TOKEN) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    const { orderId, to } = req.body || {};
+    if (!orderId) return res.status(400).json({ error: 'missing_orderId' });
+
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ error: 'order_not_found' });
+    if (order.status !== 'paid') {
+      return res.status(409).json({ error: 'order_not_paid', status: order.status });
+    }
+
+    const toEmail = (to && String(to).trim()) || order.email;
+    if (!toEmail) return res.status(400).json({ error: 'no_email' });
+
+    const ticketsDocs = await Ticket.find({
+      orderId: order._id,
+      status: { $in: ['issued', 'checked_in'] },
+    });
+    if (!ticketsDocs.length) return res.status(404).json({ error: 'no_tickets' });
+
+    // Regenerar QR por serial (el check-in valida por serial => seguro)
+    const tickets = [];
+    for (const t of ticketsDocs) {
+      const qrPayload = JSON.stringify({ serial: t.serial, token: makeTicketToken(t.serial) });
+      const qrPngBuffer = await QRCode.toBuffer(qrPayload, { type: 'png', scale: 6, margin: 1 });
+      tickets.push({ serial: t.serial, qrPngBuffer });
+    }
+
+    // Datos del evento (mismos fallbacks que el webhook)
+    let evt = null;
+    try { evt = EventModel ? await EventModel.findById(order.eventId).lean() : null; } catch (_) {}
+    const clubName = evt?.clubName || evt?.club?.entityName || '';
+    const venue = evt?.locationName || evt?.venue || '';
+    const eventDate = evt?.startAt
+      ? new Date(evt.startAt).toLocaleString('es-ES', { dateStyle: 'medium', timeStyle: 'short' })
+      : '';
+    const ticketTheme = (typeof evt?.ticketTheme === 'string' ? evt.ticketTheme.trim() : '') || 'default';
+
+    await sendTicketEmail({
+      to: toEmail,
+      eventTitle: evt?.title || 'Entrada NightVibe',
+      clubName,
+      eventDate,
+      venue,
+      tickets,
+      serial: tickets[0]?.serial,
+      qrPngBuffer: tickets[0]?.qrPngBuffer,
+      ticketTheme,
+      buyerName: order.buyerName || '',
+    });
+
+    order.emailSentAt = new Date();
+    order.emailLastTo = toEmail;
+    order.emailError = null;
+    order.emailAttempts = (order.emailAttempts || 0) + 1;
+    await order.save();
+
+    return res.json({ ok: true, resentTo: toEmail, tickets: tickets.length });
+  } catch (e) {
+    console.error('[resend-ticket] error:', e?.response?.body || e?.message || e);
+    return res.status(500).json({ error: 'resend_failed', message: e?.message || 'unknown' });
+  }
+});
+
 // ===== 404 =====
 app.use((_req, res) => res.status(404).send("Ruta no encontrada"));
 
