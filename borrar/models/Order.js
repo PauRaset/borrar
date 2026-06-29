@@ -47,6 +47,10 @@ const OrderSchema = new mongoose.Schema(
     },
 
     /* -------- Metadatos auxiliares -------- */
+    emailSentAt:   { type: Date,   default: null },
+    emailAttempts: { type: Number, default: 0 },
+    emailError:    { type: String, default: null },
+    emailLastTo:   { type: String, default: null },
 
     /* -------- Atribución (shares) -------- */
     refCode:      { type: String, default: null, index: true },
