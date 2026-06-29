@@ -294,9 +294,26 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
             ticketTheme: ticketThemeResolved,
             buyerName: '',
           });
+
+          try {
+            order.emailSentAt = new Date();
+            order.emailLastTo = toEmail;
+            order.emailError = null;
+            order.emailAttempts = (order.emailAttempts || 0) + 1;
+            await order.save();
+          } catch (persistErr) {
+            console.error('[stripe webhook] no se pudo guardar emailSentAt:', persistErr?.message || persistErr);
+          }
         }
       } catch (e) {
         console.error('Email ticket error:', e);
+        try {
+          order.emailError = String(e?.message || e).slice(0, 500);
+          order.emailAttempts = (order.emailAttempts || 0) + 1;
+          await order.save();
+        } catch (persistErr) {
+          console.error('[stripe webhook] no se pudo guardar emailError:', persistErr?.message || persistErr);
+        }
       }
     }
 
