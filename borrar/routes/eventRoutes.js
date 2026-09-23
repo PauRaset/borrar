@@ -14,6 +14,7 @@ const Order = require("../models/Order"); // entradas: compra pagada = Order.sta
 const User = require("../models/User");
 const Notification = require("../models/Notification");
 const { sendPushNotificationToUser } = require("../utils/sendPushNotification");
+const { geocodeAddress, applyGeo, buildAddress } = require("../utils/geocode");
 const PromotionLevelTemplate = require("../models/PromotionLevelTemplate");
 const UserClubPromotionProgress = require("../models/UserClubPromotionProgress");
 
@@ -1135,6 +1136,12 @@ router.post("/", anyAuth, ensureUserId, upload.single("image"), async (req, res)
       // QR subir foto a evento
       qrToken: new mongoose.Types.ObjectId().toString(),
     });
+
+    // Geocodificamos una sola vez, aquí, para que el mapa no tenga que
+    // hacerlo en el móvil. Si falla, el evento se guarda igualmente con
+    // geoStatus 'failed' y se puede reintentar luego.
+    const geo = await geocodeAddress({ street, postalCode, city });
+    applyGeo(newEvent, geo, buildAddress({ street, postalCode, city }));
 
     const savedEvent = await newEvent.save();
     res.status(201).json({
@@ -2502,6 +2509,18 @@ async function updateEventHandler(req, res) {
       update.image = path
         .relative(path.join(__dirname, ".."), processedImagePath)
         .replace(/\\/g, "/");
+    }
+
+    // Regeocodificar SOLO si la dirección ha cambiado, para no gastar
+    // llamadas de más en cada edición.
+    const newStreet = update.street !== undefined ? update.street : event.street;
+    const newCity   = update.city   !== undefined ? update.city   : event.city;
+    const newPostal = update.postalCode !== undefined ? update.postalCode : event.postalCode;
+    const newAddress = buildAddress({ street: newStreet, postalCode: newPostal, city: newCity });
+
+    if (newAddress && newAddress !== event.geoSourceAddress) {
+      const geo2 = await geocodeAddress({ street: newStreet, postalCode: newPostal, city: newCity });
+      applyGeo(update, geo2, newAddress);
     }
 
     // 4) Actualizar y devolver formateado
