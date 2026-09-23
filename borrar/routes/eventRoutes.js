@@ -1318,6 +1318,86 @@ router.get("/search", optionalUserId, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
+   MAPA — proyección mínima para pintar pines
+   ⚠️  Debe quedar ANTES de /:id para que Express no lo interprete como id
+------------------------------------------------------------------- */
+router.get("/map", optionalUserId, async (req, res) => {
+  try {
+    const now = new Date();
+
+    const geoFilter = { "location.coordinates": { $exists: true } };
+
+    // Solo eventos publicados y no terminados
+    const dateFilter = {
+      isPublished: { $ne: false },
+      $or: [
+        { endAt: { $gte: now } },
+        { startAt: { $gte: now } },
+        { endAt: null, startAt: null },
+      ],
+    };
+
+    let filter = { ...geoFilter, ...dateFilter };
+
+    // Bounding box opcional: ?swLat=&swLng=&neLat=&neLng=
+    const { swLat, swLng, neLat, neLng } = req.query;
+    if (swLat != null && swLng != null && neLat != null && neLng != null) {
+      const sw = [parseFloat(swLng), parseFloat(swLat)];
+      const ne = [parseFloat(neLng), parseFloat(neLat)];
+      if (!sw.some(Number.isNaN) && !ne.some(Number.isNaN)) {
+        filter.location = {
+          $geoWithin: { $box: [sw, ne] },
+        };
+      }
+    }
+
+    const projection = {
+      _id: 1,
+      title: 1,
+      image: 1,
+      startAt: 1,
+      date: 1,
+      city: 1,
+      street: 1,
+      price: 1,
+      currency: 1,
+      location: 1,
+      categories: 1,
+      clubId: 1,
+      attendees: 1, // solo para contar, no se devuelve
+    };
+
+    const events = await Event.find(filter, projection).lean();
+
+    const result = events.map((e) => ({
+      _id: e._id,
+      title: e.title,
+      image: e.image,
+      imageUrl: absUrlFromUpload(req, e.image),
+      startAt: e.startAt,
+      date: e.date,
+      city: e.city,
+      street: e.street,
+      price: e.price,
+      currency: e.currency,
+      location: e.location,
+      categories: Array.isArray(e.categories)
+        ? e.categories
+        : parseCategoriesMaybe(e.categories),
+      clubId: e.clubId,
+      attendeesCount: Array.isArray(e.attendees) ? e.attendees.length : 0,
+    }));
+
+    return res.json(result);
+  } catch (err) {
+    console.error("[GET /events/map] error:", err);
+    return res
+      .status(500)
+      .json({ message: "Error obteniendo eventos del mapa", error: err.message });
+  }
+});
+
+/* ------------------------------------------------------------------
    Devuelve asistentes
    - ?full=1 -> lista plana de usuarios (frontend la admite)
    - sin ?full -> { attendees: [...] } (compat)
