@@ -8,6 +8,8 @@
     "seed:promos": "node scripts/seedPromotionTemplates.js",
     "seed:promos:dry": "node scripts/seedPromotionTemplates.js --dry-run",
     "seed:promos:force": "node scripts/seedPromotionTemplates.js --force",
+    "geocode:events": "node scripts/geocodeExistingEvents.js",
+    "geocode:events:dry": "node scripts/geocodeExistingEvents.js --dry-run",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
