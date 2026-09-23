@@ -162,6 +162,9 @@ const eventSchema = new mongoose.Schema(
     currency: { type: String, default: "eur" },
     capacity: { type: Number, default: 0 },       // 0 = sin límite
     ticketsSold: { type: Number, default: 0 },     // contador rápido
+    // Entradas reservadas por sesiones de Checkout abiertas todavía sin pagar.
+    // ticketsSold + ticketsReserved es el stock comprometido real.
+    ticketsReserved: { type: Number, default: 0 },
     salesStart: { type: Date, default: null },
     salesEnd:   { type: Date, default: null },
     isPublished: { type: Boolean, default: true },
@@ -261,6 +264,11 @@ eventSchema.pre("save", function (next) {
   }
   if (this.capacity < 0) this.capacity = 0;
   if (this.ticketsSold < 0) this.ticketsSold = 0;
+  if (typeof this.ticketsReserved === "string") {
+    const n = Number(this.ticketsReserved);
+    if (!Number.isNaN(n)) this.ticketsReserved = n;
+  }
+  if (this.ticketsReserved < 0) this.ticketsReserved = 0;
 
   // Normalizar salesStart / salesEnd
   if (this.salesStart && !(this.salesStart instanceof Date)) this.salesStart = new Date(this.salesStart);
