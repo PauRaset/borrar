@@ -116,6 +116,31 @@ const eventSchema = new mongoose.Schema(
     street:     { type: String, default: "" },
     postalCode: { type: String, default: "" },
 
+    // Coordenadas geocodificadas a partir de la dirección (GeoJSON Point).
+    // IMPORTANTE: el orden es [longitud, latitud], no al revés.
+    location: {
+      type: {
+        type: String,
+        enum: ["Point"],
+        default: undefined,
+      },
+      coordinates: {
+        type: [Number],
+        default: undefined,
+      },
+    },
+
+    // Metadatos de la geocodificación
+    geoStatus: {
+      type: String,
+      enum: ["pending", "ok", "failed", "manual"],
+      default: "pending",
+    },
+    geoProvider:      { type: String, default: "" },
+    geoFormatted:     { type: String, default: "" },
+    geoUpdatedAt:     { type: Date, default: null },
+    geoSourceAddress: { type: String, default: "" },
+
     // Imagen principal (ruta relativa tipo "uploads/...")
     image: { type: String, default: "" },
 
@@ -345,6 +370,7 @@ eventSchema.index({ attendees: 1, startAt: -1 });
 eventSchema.index({ isPublished: 1, startAt: -1 });
 // Búsquedas por rango de venta
 eventSchema.index({ salesStart: 1, salesEnd: 1 });
+eventSchema.index({ location: "2dsphere" });
 
 // Virtual: evento a la venta ahora
 eventSchema.virtual('isOnSale').get(function () {
