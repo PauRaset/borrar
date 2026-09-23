@@ -41,7 +41,7 @@ const OrderSchema = new mongoose.Schema(
     /* -------- Estados -------- */
     status: {
       type: String,
-      enum: ['created', 'pending', 'paid', 'refunded', 'failed'], // 👈 añadimos pending
+      enum: ['created', 'pending', 'paid', 'refunded', 'failed', 'expired'],
       default: 'pending',
       index: true,
     },
@@ -51,6 +51,13 @@ const OrderSchema = new mongoose.Schema(
     emailAttempts: { type: Number, default: 0 },
     emailError:    { type: String, default: null },
     emailLastTo:   { type: String, default: null },
+
+    /* -------- Reserva de stock -------- */
+    reservedQty:       { type: Number,  default: 0 },
+    reservationActive: { type: Boolean, default: false },
+    expiresAt:         { type: Date,    default: null, index: true },
+    // Marca de emisión de tickets, para idempotencia del webhook
+    ticketsIssuedAt:   { type: Date,    default: null },
 
     /* -------- Atribución (shares) -------- */
     refCode:      { type: String, default: null, index: true },
