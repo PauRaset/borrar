@@ -157,9 +157,13 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
         });
       } else {
         // Order existente: idempotencia
-        if (order.status === 'paid') {
-          console.log('[stripe webhook] order already paid:', order._id);
+        if (order.status === 'paid' && order.ticketsIssuedAt) {
+          console.log('[stripe webhook] order already paid and issued:', order._id);
           return res.json({ ok: true });
+        }
+        if (order.status === 'paid' && !order.ticketsIssuedAt) {
+          console.warn('[stripe webhook] orden pagada SIN tickets emitidos, reintentando emisión:', String(order._id));
+          // seguimos adelante: la idempotencia de tickets nos protege
         }
         order.status = 'paid';
         order.paymentIntentId = session.payment_intent || order.paymentIntentId;
@@ -195,27 +199,23 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
         final: ticketThemeResolved,
       });
 
-      if (evt && evt.capacity && evt.capacity > 0) {
-        await Event2.updateOne(
-          {
-            _id: eventId,
-            $expr: {
-              $lte: [
-                '$ticketsSold',
-                { $subtract: ['$capacity', usedQty] },
-              ],
-            },
-          },
-          { $inc: { ticketsSold: usedQty } }
-        );
-      } else {
-        await Event2.updateOne(
-          { _id: eventId },
-          { $inc: { ticketsSold: usedQty } }
-        );
+      // --- Idempotencia: salir antes de emitir si ya están todos los tickets ---
+      const yaEmitidos = await Ticket.countDocuments({ orderId: order._id });
+      if (yaEmitidos >= usedQty) {
+        console.log('[stripe webhook] tickets ya emitidos para la orden', String(order._id));
+        return res.json({ ok: true, alreadyIssued: true });
       }
 
-      // --- Generar tickets ---
+      // --- Actualizar contador ticketsSold ---
+      const { commitStock } = require('../utils/stock');
+      if (order.reservationActive) {
+        await commitStock(eventId, usedQty);   // suma venta y libera reserva
+        order.reservationActive = false;
+      } else {
+        // Orden sin reserva (compras antiguas o creadas al vuelo)
+        await Event2.updateOne({ _id: eventId }, { $inc: { ticketsSold: usedQty } });
+      }
+
       const created = [];
       for (let i = 0; i < usedQty; i++) {
         const serial = genSerial();
@@ -243,6 +243,9 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
 
         created.push({ doc: t, qrPngBuffer });
       }
+
+      order.ticketsIssuedAt = new Date();
+      await order.save();
 
       // --- Enviar email (1 SOLO correo con N entradas) ---
       try {
@@ -314,6 +317,19 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
         } catch (persistErr) {
           console.error('[stripe webhook] no se pudo guardar emailError:', persistErr?.message || persistErr);
         }
+      }
+    }
+
+    if (event.type === 'checkout.session.expired') {
+      const session = event.data.object;
+      const order = await Order2.findOne({ stripeSessionId: session.id });
+      if (order && order.reservationActive) {
+        const { releaseStock } = require('../utils/stock');
+        await releaseStock(order.eventId, order.reservedQty || 0);
+        order.reservationActive = false;
+        order.status = 'expired';
+        await order.save();
+        console.log('[stripe webhook] reserva liberada por expiración:', String(order._id));
       }
     }
 
