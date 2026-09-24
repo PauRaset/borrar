@@ -89,6 +89,29 @@ const eventPhotoSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const ticketTierSchema = new mongoose.Schema(
+  {
+    tierId: { type: String, required: true },   // estable, generado en el servidor
+    name:   { type: String, required: true },   // "Entrada general", "Con consumición"
+    description: { type: String, default: "" }, // qué incluye (opcional)
+
+    priceEUR: { type: Number, required: true, min: 0 },
+    quantity: { type: Number, required: true, min: 0 },  // 0 = ilimitado en este tier
+
+    // Contadores que lleva el sistema, NUNCA el club
+    sold:     { type: Number, default: 0, min: 0 },
+    reserved: { type: Number, default: 0, min: 0 },
+
+    order:  { type: Number, default: 0 },        // secuencia de tandas
+    active: { type: Boolean, default: true },
+
+    // Ventana de venta opcional (early bird, etc.)
+    salesStart: { type: Date, default: null },
+    salesEnd:   { type: Date, default: null },
+  },
+  { _id: false }
+);
+
 /**
  * Schema de eventos con compatibilidad hacia atrás:
  * - startAt / endAt (fechas normalizadas) y "date" legacy.
@@ -168,6 +191,10 @@ const eventSchema = new mongoose.Schema(
     salesStart: { type: Date, default: null },
     salesEnd:   { type: Date, default: null },
     isPublished: { type: Boolean, default: true },
+
+    // Tipos de entrada y tandas. Si está vacío, el evento usa price/capacity
+    // como siempre (comportamiento legacy).
+    ticketTiers: { type: [ticketTierSchema], default: [] },
 
     attendees: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
 
@@ -367,6 +394,38 @@ eventSchema.pre("save", function (next) {
     this.qrToken = new mongoose.Types.ObjectId().toString();
   }
 
+  // Normalizar ticketTiers
+  if (Array.isArray(this.ticketTiers) && this.ticketTiers.length > 0) {
+    const orders = this.ticketTiers.map((t) => t.order ?? 0);
+    const hasOrderCollision = new Set(orders).size !== orders.length;
+
+    this.ticketTiers = this.ticketTiers.map((tier, idx) => {
+      if (!tier.tierId) {
+        tier.tierId = `tier_${new mongoose.Types.ObjectId().toString()}`;
+      }
+      if (typeof tier.priceEUR === "string") {
+        const n = Number(tier.priceEUR);
+        if (!Number.isNaN(n)) tier.priceEUR = n;
+      }
+      if (typeof tier.quantity === "string") {
+        const n = Number(tier.quantity);
+        if (!Number.isNaN(n)) tier.quantity = n;
+      }
+      if (typeof tier.sold === "string") {
+        const n = Number(tier.sold);
+        tier.sold = Number.isNaN(n) ? 0 : n;
+      }
+      if (tier.sold < 0) tier.sold = 0;
+      if (typeof tier.reserved === "string") {
+        const n = Number(tier.reserved);
+        tier.reserved = Number.isNaN(n) ? 0 : n;
+      }
+      if (tier.reserved < 0) tier.reserved = 0;
+      if (hasOrderCollision) tier.order = idx;
+      return tier;
+    });
+  }
+
   next();
 });
 
@@ -379,6 +438,11 @@ eventSchema.index({ isPublished: 1, startAt: -1 });
 // Búsquedas por rango de venta
 eventSchema.index({ salesStart: 1, salesEnd: 1 });
 eventSchema.index({ location: "2dsphere" });
+
+// Virtual: el evento tiene al menos un tier activo
+eventSchema.virtual('hasTiers').get(function () {
+  return Array.isArray(this.ticketTiers) && this.ticketTiers.some((t) => t.active !== false);
+});
 
 // Virtual: evento a la venta ahora
 eventSchema.virtual('isOnSale').get(function () {
