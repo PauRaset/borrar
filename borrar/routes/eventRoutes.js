@@ -1577,6 +1577,108 @@ router.get("/:id/has-ticket", optionalUserId, async (req, res) => {
   }
 });
 
+/* ------------------------------------------------------------------
+   TIERS — pop-up de selección de entrada
+   Siempre devuelve la misma forma de datos, aunque el evento sea legacy.
+------------------------------------------------------------------- */
+router.get("/:id/tiers", optionalUserId, async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    const event = await Event.findById(id)
+      .select(
+        "_id price capacity ticketsSold ticketsReserved ticketTiers currency platformFeeEUR"
+      )
+      .lean();
+
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    // El mismo cálculo de comisión que payments.js
+    const platformFeeEUR =
+      event.platformFeeEUR != null && event.platformFeeEUR !== ""
+        ? Number(event.platformFeeEUR)
+        : 1.5;
+
+    const activeTiers = (event.ticketTiers || []).filter((t) => t.active !== false);
+    const hasTiers = activeTiers.length > 0;
+
+    let tiers;
+
+    if (hasTiers) {
+      const sorted = [...event.ticketTiers].sort(
+        (a, b) => (a.order ?? 0) - (b.order ?? 0)
+      );
+      const seenNames = new Set();
+
+      tiers = sorted.map((tier) => {
+        const rem =
+          !tier.quantity || tier.quantity <= 0
+            ? Infinity
+            : Math.max(0, tier.quantity - (tier.sold || 0) - (tier.reserved || 0));
+
+        const remaining = rem === Infinity ? null : rem;
+        const soldOut = remaining !== null && remaining <= 0;
+
+        // isNext: primer tier comprable de cada nombre distinto
+        let isNext = false;
+        if (!soldOut && !seenNames.has(tier.name)) {
+          isNext = true;
+          seenNames.add(tier.name);
+        }
+
+        return {
+          tierId:      tier.tierId,
+          name:        tier.name,
+          description: tier.description || "",
+          priceEUR:    tier.priceEUR,
+          remaining,
+          soldOut,
+          isNext,
+          order: tier.order ?? 0,
+        };
+      });
+    } else {
+      // Tier sintético a partir de price/capacity legacy
+      const committed = (event.ticketsSold || 0) + (event.ticketsReserved || 0);
+      const rem =
+        event.capacity > 0
+          ? Math.max(0, event.capacity - committed)
+          : Infinity;
+      const remaining = rem === Infinity ? null : rem;
+      const soldOut = remaining !== null && remaining <= 0;
+
+      tiers = [
+        {
+          tierId:      "legacy",
+          name:        "Entrada",
+          description: "",
+          priceEUR:    event.price || 0,
+          remaining,
+          soldOut,
+          isNext:      !soldOut,
+          order:       0,
+        },
+      ];
+    }
+
+    return res.json({
+      eventId:       String(event._id),
+      hasTiers,
+      tiers,
+      currency:      event.currency || "eur",
+      platformFeeEUR,
+    });
+  } catch (err) {
+    console.error("[GET /events/:id/tiers] error:", err);
+    return res
+      .status(500)
+      .json({ message: "Error obteniendo tiers del evento", error: err.message });
+  }
+});
+
 router.get("/:id/attendees", (req, res) => attendeesHandler(req, res, false));
 router.get("/:id/attendees/populated", (req, res) => attendeesHandler(req, res, true));
 
