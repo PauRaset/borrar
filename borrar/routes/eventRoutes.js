@@ -15,6 +15,24 @@ const User = require("../models/User");
 const Notification = require("../models/Notification");
 const { sendPushNotificationToUser } = require("../utils/sendPushNotification");
 const { geocodeAddress, applyGeo, buildAddress } = require("../utils/geocode");
+const { sanitizeTiers, validateTierChanges, syncEventPrice } = require("../utils/tiers");
+
+/** ticketTiers puede llegar como array (JSON) o como string (FormData). */
+function parseTiersInput(raw) {
+  if (raw === undefined || raw === null || raw === "") return { value: undefined };
+  if (Array.isArray(raw)) return { value: raw };
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed)
+        ? { value: parsed }
+        : { error: "ticketTiers debe ser una lista" };
+    } catch (_) {
+      return { error: "ticketTiers no es un JSON válido" };
+    }
+  }
+  return { error: "ticketTiers debe ser una lista" };
+}
 const PromotionLevelTemplate = require("../models/PromotionLevelTemplate");
 const UserClubPromotionProgress = require("../models/UserClubPromotionProgress");
 
@@ -1143,6 +1161,18 @@ router.post("/", anyAuth, ensureUserId, upload.single("image"), async (req, res)
     const geo = await geocodeAddress({ street, postalCode, city });
     applyGeo(newEvent, geo, buildAddress({ street, postalCode, city }));
 
+    // Tandas (opcional). Sin ticketTiers, el evento es legacy (price/capacity).
+    const tiersInput = parseTiersInput(req.body.ticketTiers);
+    if (tiersInput.error) {
+      return res.status(400).json({ message: tiersInput.error });
+    }
+    if (Array.isArray(tiersInput.value) && tiersInput.value.length > 0) {
+      const { tiers, error } = sanitizeTiers(tiersInput.value);
+      if (error) return res.status(400).json({ message: error });
+      newEvent.ticketTiers = tiers;
+      syncEventPrice(newEvent);
+    }
+
     const savedEvent = await newEvent.save();
     res.status(201).json({
       ...savedEvent.toObject(),
@@ -1673,6 +1703,70 @@ router.get("/:id/tiers", optionalUserId, async (req, res) => {
     });
   } catch (err) {
     console.error("[GET /events/:id/tiers] error:", err);
+    return res
+      .status(500)
+      .json({ message: "Error obteniendo tiers del evento", error: err.message });
+  }
+});
+
+/* ------------------------------------------------------------------
+   TIERS (portal del club) — incluye sold y reserved.
+   Solo el propietario del evento (mismo criterio que updateEventHandler).
+------------------------------------------------------------------- */
+router.get("/:id/tiers/admin", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    const event = await Event.findById(id)
+      .select("_id createdBy price capacity ticketsSold ticketsReserved ticketTiers currency platformFeeEUR")
+      .lean();
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    if (!event.createdBy || event.createdBy.toString() !== req.user.id) {
+      return res.status(403).json({ message: "No tienes permiso para ver este evento" });
+    }
+
+    const tiers = [...(event.ticketTiers || [])]
+      .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+      .map((t) => {
+        const unlimited = !t.quantity || t.quantity <= 0;
+        const sold = t.sold || 0;
+        const reserved = t.reserved || 0;
+        return {
+          tierId:      t.tierId,
+          name:        t.name,
+          description: t.description || "",
+          priceEUR:    t.priceEUR,
+          quantity:    t.quantity,
+          sold,
+          reserved,
+          remaining:   unlimited ? null : Math.max(0, t.quantity - sold - reserved),
+          order:       t.order ?? 0,
+          active:      t.active !== false,
+          salesStart:  t.salesStart || null,
+          salesEnd:    t.salesEnd || null,
+        };
+      });
+
+    return res.json({
+      eventId:         String(event._id),
+      hasTiers:        tiers.some((t) => t.active),
+      tiers,
+      price:           event.price,
+      capacity:        event.capacity || 0,
+      ticketsSold:     event.ticketsSold || 0,
+      ticketsReserved: event.ticketsReserved || 0,
+      currency:        event.currency || "eur",
+      platformFeeEUR:
+        event.platformFeeEUR != null && event.platformFeeEUR !== ""
+          ? Number(event.platformFeeEUR)
+          : 1.5,
+    });
+  } catch (err) {
+    console.error("[GET /events/:id/tiers/admin] error:", err);
     return res
       .status(500)
       .json({ message: "Error obteniendo tiers del evento", error: err.message });
@@ -2629,6 +2723,18 @@ function sanitizeUpdate(payload) {
     "createdBy",
     "attendees",
     "photos",
+    // Contadores de venta: solo los mueve el sistema (stock.js / webhook)
+    "ticketsSold",
+    "ticketsReserved",
+    // Identidad del QR del evento
+    "qrToken",
+    // Resultado de la geocodificación: se recalcula más abajo con applyGeo
+    "location",
+    "geoStatus",
+    "geoProvider",
+    "geoFormatted",
+    "geoUpdatedAt",
+    "geoSourceAddress",
   ].forEach((k) => delete clean[k]);
   return clean;
 }
@@ -2705,10 +2811,50 @@ async function updateEventHandler(req, res) {
       applyGeo(update, geo2, newAddress);
     }
 
+    // Tandas: nunca se escribe lo que manda el cliente tal cual (podría
+    // traer sold/reserved). Solo la versión saneada y validada.
+    const updateFilter = { _id: id };
+    const tiersInput = parseTiersInput(req.body.ticketTiers);
+    delete update.ticketTiers;
+    if (tiersInput.error) {
+      return res.status(400).json({ message: tiersInput.error });
+    }
+    if (tiersInput.value !== undefined) {
+      const existingTiers = (event.ticketTiers || []).map((t) =>
+        typeof t.toObject === "function" ? t.toObject() : t
+      );
+
+      const { tiers, error } = sanitizeTiers(tiersInput.value, existingTiers);
+      if (error) return res.status(400).json({ message: error });
+
+      const check = validateTierChanges(tiers, existingTiers);
+      if (!check.ok) return res.status(400).json({ message: check.error });
+
+      update.ticketTiers = tiers;
+      syncEventPrice(update);
+
+      // Bloqueo optimista: los tiers se reescriben enteros con los sold/reserved
+      // leídos arriba. Si una compra los ha movido desde entonces, no escribimos
+      // (si no, perderíamos esa venta o reserva en los contadores).
+      if (existingTiers.length > 0) {
+        updateFilter.$and = existingTiers.map((t) => ({
+          ticketTiers: {
+            $elemMatch: { tierId: t.tierId, sold: t.sold || 0, reserved: t.reserved || 0 },
+          },
+        }));
+      }
+    }
+
     // 4) Actualizar y devolver formateado
-    const updated = await Event.findByIdAndUpdate(id, update, { new: true })
+    const updated = await Event.findOneAndUpdate(updateFilter, update, { new: true })
       .populate("createdBy", "username email profilePicture displayName")
       .lean();
+
+    if (!updated) {
+      return res.status(409).json({
+        message: "Las ventas de este evento han cambiado mientras editabas. Recarga y vuelve a guardar.",
+      });
+    }
 
     const formatted = {
       ...updated,
