@@ -18,6 +18,9 @@ const OrderSchema = new mongoose.Schema(
     /* -------- Negocio / evento -------- */
     clubId:   { type: String, default: null, index: true },
     eventId:  { type: String, required: true, index: true },
+    // Redundante a propósito: facilita consultas sin depender del array items[]
+    tierId:   { type: String, default: null, index: true },
+    tierName: { type: String, default: '' },
 
     /* -------- Ítems comprados -------- */
     qty:        { type: Number, default: 1 },        // 👈 nº de entradas
