@@ -70,4 +70,191 @@ async function sweepExpiredReservations() {
   if (stale.length) console.log(`[stock] liberadas ${stale.length} reservas caducadas`);
 }
 
-module.exports = { reserveStock, releaseStock, commitStock, sweepExpiredReservations };
+// ─── Funciones para eventos con ticketTiers ───────────────────────────────────
+
+/**
+ * Devuelve los tiers comprables AHORA, ordenados por `order`.
+ * Un tier es comprable si: active, dentro de su ventana de venta,
+ * y con unidades libres (quantity 0 = ilimitado).
+ */
+function availableTiers(event) {
+  const now = new Date();
+  return (event.ticketTiers || [])
+    .filter((tier) => {
+      if (!tier.active) return false;
+      if (tier.salesStart && now < new Date(tier.salesStart)) return false;
+      if (tier.salesEnd   && now > new Date(tier.salesEnd))   return false;
+      return tierRemaining(tier) !== 0;
+    })
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+}
+
+/**
+ * Unidades libres de un tier: quantity - sold - reserved.
+ * Devuelve Infinity si quantity es 0 (ilimitado).
+ */
+function tierRemaining(tier) {
+  if (!tier.quantity || tier.quantity <= 0) return Infinity;
+  return Math.max(0, tier.quantity - (tier.sold || 0) - (tier.reserved || 0));
+}
+
+/**
+ * Reserva qty unidades de un tier concreto de forma ATÓMICA.
+ *
+ * Atomicidad: un único findOneAndUpdate cuyo filtro verifica
+ * simultáneamente aforo global (capacity) y capacidad del tier
+ * mediante $expr con $filter. Si el documento no matchea el filtro
+ * (capacidad insuficiente en cualquier nivel), la operación no ocurre
+ * y ambos contadores quedan intactos.
+ *
+ * Devuelve { ok: true } o { ok: false, reason, remaining }.
+ */
+async function reserveTierStock(eventId, tierId, qty) {
+  if (!qty || qty <= 0) return { ok: false, reason: 'tier_not_found', remaining: 0 };
+
+  const updated = await Event.findOneAndUpdate(
+    {
+      _id: eventId,
+      $expr: {
+        $and: [
+          // Aforo global: sin límite (capacity <= 0) o hay hueco
+          {
+            $or: [
+              { $lte: ['$capacity', 0] },
+              {
+                $lte: [
+                  { $add: ['$ticketsSold', { $ifNull: ['$ticketsReserved', 0] }, qty] },
+                  '$capacity',
+                ],
+              },
+            ],
+          },
+          // Tier: existe, está activo y tiene capacidad
+          {
+            $gte: [
+              {
+                $size: {
+                  $filter: {
+                    input: { $ifNull: ['$ticketTiers', []] },
+                    as: 't',
+                    cond: {
+                      $and: [
+                        { $eq: ['$$t.tierId', tierId] },
+                        { $eq: ['$$t.active', true] },
+                        {
+                          $or: [
+                            { $lte: ['$$t.quantity', 0] },
+                            {
+                              $lte: [
+                                { $add: ['$$t.sold', { $ifNull: ['$$t.reserved', 0] }, qty] },
+                                '$$t.quantity',
+                              ],
+                            },
+                          ],
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+              1,
+            ],
+          },
+        ],
+      },
+    },
+    {
+      $inc: {
+        'ticketTiers.$[tier].reserved': qty,
+        ticketsReserved: qty,
+      },
+    },
+    {
+      arrayFilters: [{ 'tier.tierId': tierId, 'tier.active': true }],
+      new: true,
+    }
+  );
+
+  if (updated) return { ok: true };
+
+  // Lectura de diagnóstico para determinar el motivo
+  const evt = await Event.findById(eventId)
+    .select('capacity ticketsSold ticketsReserved ticketTiers')
+    .lean();
+
+  if (!evt) return { ok: false, reason: 'tier_not_found', remaining: 0 };
+
+  const tier = (evt.ticketTiers || []).find((t) => t.tierId === tierId && t.active !== false);
+  if (!tier) return { ok: false, reason: 'tier_not_found', remaining: 0 };
+
+  const tierRem = tierRemaining(tier);
+  if (tierRem !== Infinity && tierRem <= 0) {
+    return { ok: false, reason: 'tier_sold_out', remaining: 0 };
+  }
+
+  if (evt.capacity > 0) {
+    const globalRem = evt.capacity - (evt.ticketsSold || 0) - (evt.ticketsReserved || 0);
+    if (globalRem <= 0) {
+      return { ok: false, reason: 'event_sold_out', remaining: Math.max(0, globalRem) };
+    }
+  }
+
+  return {
+    ok: false,
+    reason: 'tier_sold_out',
+    remaining: tierRem === Infinity ? null : tierRem,
+  };
+}
+
+/**
+ * Libera una reserva de tier. Decrementa tanto tier.reserved
+ * como el contador global ticketsReserved de forma atómica.
+ * El $elemMatch en el filtro evita decrementar ticketsReserved
+ * si el tier ya no tiene esa reserva.
+ */
+async function releaseTierStock(eventId, tierId, qty) {
+  if (!qty || qty <= 0) return;
+  await Event.updateOne(
+    {
+      _id: eventId,
+      ticketTiers: { $elemMatch: { tierId, reserved: { $gte: qty } } },
+    },
+    {
+      $inc: {
+        'ticketTiers.$[tier].reserved': -qty,
+        ticketsReserved: -qty,
+      },
+    },
+    { arrayFilters: [{ 'tier.tierId': tierId }] }
+  );
+}
+
+/**
+ * Convierte una reserva de tier en venta confirmada.
+ * Atómicamente: sube tier.sold, baja tier.reserved,
+ * sube ticketsSold y baja ticketsReserved.
+ */
+async function commitTierStock(eventId, tierId, qty) {
+  if (!qty || qty <= 0) return;
+  await Event.updateOne(
+    {
+      _id: eventId,
+      ticketTiers: { $elemMatch: { tierId, reserved: { $gte: qty } } },
+    },
+    {
+      $inc: {
+        'ticketTiers.$[tier].sold':     qty,
+        'ticketTiers.$[tier].reserved': -qty,
+        ticketsSold:     qty,
+        ticketsReserved: -qty,
+      },
+    },
+    { arrayFilters: [{ 'tier.tierId': tierId }] }
+  );
+}
+
+module.exports = {
+  reserveStock, releaseStock, commitStock, sweepExpiredReservations,
+  availableTiers, tierRemaining,
+  reserveTierStock, releaseTierStock, commitTierStock,
+};
