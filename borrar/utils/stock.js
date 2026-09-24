@@ -2,6 +2,7 @@
 // Reserva y liberación atómica de stock de entradas.
 const Event = require('../models/Event');
 const Order = require('../models/Order');
+const { syncEventPrice } = require('./tiers');
 
 /**
  * Reserva qty entradas de forma atómica.
@@ -227,6 +228,29 @@ async function releaseTierStock(eventId, tierId, qty) {
     },
     { arrayFilters: [{ 'tier.tierId': tierId }] }
   );
+  // Si se libera la última reserva de una tanda barata, vuelve a estar a la venta.
+  await syncPriceFromTiers(eventId);
+}
+
+/**
+ * Recalcula event.price a partir de las tandas y guarda SOLO ese campo.
+ * Nunca lanza: un fallo aquí no debe romper la emisión de entradas.
+ * El filtro por el price leído evita que un cálculo más antiguo pise a
+ * uno más reciente cuando dos compras se confirman a la vez.
+ */
+async function syncPriceFromTiers(eventId) {
+  try {
+    const evt = await Event.findById(eventId).select('price ticketTiers').lean();
+    if (!evt || !Array.isArray(evt.ticketTiers) || !evt.ticketTiers.length) return;
+
+    const before = evt.price;
+    syncEventPrice(evt);
+    if (evt.price === before) return;
+
+    await Event.updateOne({ _id: eventId, price: before }, { $set: { price: evt.price } });
+  } catch (e) {
+    console.error('[stock] no se pudo sincronizar price del evento', String(eventId), e.message);
+  }
 }
 
 /**
@@ -251,6 +275,8 @@ async function commitTierStock(eventId, tierId, qty) {
     },
     { arrayFilters: [{ 'tier.tierId': tierId }] }
   );
+  // Si esta venta agota la tanda, el price del evento pasa a la siguiente.
+  await syncPriceFromTiers(eventId);
 }
 
 module.exports = {
