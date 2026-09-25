@@ -10,6 +10,8 @@
     "seed:promos:force": "node scripts/seedPromotionTemplates.js --force",
     "geocode:events": "node scripts/geocodeExistingEvents.js",
     "geocode:events:dry": "node scripts/geocodeExistingEvents.js --dry-run",
+    "reconcile:reservations": "node scripts/reconcileReservations.js",
+    "reconcile:reservations:dry": "node scripts/reconcileReservations.js --dry-run",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
