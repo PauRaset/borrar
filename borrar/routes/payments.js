@@ -67,6 +67,204 @@ const resolveTicketTheme = ({ event, club }) => {
   return 'default';
 };
 
+/* ==================================================================
+   Tandas (ticketTiers) — lógica compartida por /direct y /checkout.
+   Un evento SIN tiers activos no pasa nunca por aquí.
+================================================================== */
+const {
+  availableTiers,
+  tierRemaining,
+  reserveTierStock,
+  releaseTierStock,
+} = require('../utils/stock');
+
+function hasActiveTiers(event) {
+  return (event.ticketTiers || []).some((t) => t.active !== false);
+}
+
+/** Motivo por el que un tier concreto no se puede comprar ahora. */
+function tierUnavailableReason(tier, now = new Date()) {
+  if (!tier) return 'tier_not_found';
+  if (tier.active === false) return 'tier_inactive';
+  if (tier.salesStart && now < new Date(tier.salesStart)) return 'not_on_sale_yet';
+  if (tier.salesEnd && now > new Date(tier.salesEnd)) return 'sales_ended';
+  return 'tier_sold_out';
+}
+
+function publicTier(t) {
+  if (!t) return null;
+  const rem = tierRemaining(t);
+  return {
+    tierId: t.tierId,
+    name: t.name,
+    description: t.description || '',
+    priceEUR: t.priceEUR,
+    remaining: rem === Infinity ? null : rem,
+  };
+}
+
+/** Siguiente tanda comprable con el mismo nombre (orden posterior), o null. */
+function nextTierOf(event, tier) {
+  if (!event || !tier) return null;
+  const next = availableTiers(event).find(
+    (t) => t.tierId !== tier.tierId && t.name === tier.name && (t.order ?? 0) > (tier.order ?? 0)
+  );
+  return publicTier(next);
+}
+
+/** Tanda comprable más barata (a igual precio, la de menor order), o null. */
+function cheapestPurchasableTier(event) {
+  return availableTiers(event).reduce(
+    (best, t) => (!best || t.priceEUR < best.priceEUR ? t : best),
+    null
+  );
+}
+
+/**
+ * Paso 1 de 2: elige la tanda a vender. No reserva nada.
+ * - requestedTierId comprable -> esa tanda.
+ * - requestedTierId no comprable -> fallbackToCheapest ? la más barata : error.
+ * - sin requestedTierId -> la más barata.
+ * El precio sale SIEMPRE del tier en Mongo.
+ * Devuelve { tier, unit } o { error: 'tier_unavailable' | 'sold_out', reason, remaining?, nextTier }.
+ */
+function resolveTierForSale(event, requestedTierId, { fallbackToCheapest = false } = {}) {
+  const purchasable = availableTiers(event);
+  let tier = null;
+
+  if (requestedTierId) {
+    const requested = (event.ticketTiers || []).find((t) => t.tierId === requestedTierId) || null;
+    if (requested && purchasable.some((t) => t.tierId === requested.tierId)) {
+      tier = requested;
+    } else if (!fallbackToCheapest) {
+      return {
+        error: 'tier_unavailable',
+        reason: tierUnavailableReason(requested),
+        nextTier: nextTierOf(event, requested),
+      };
+    }
+  }
+
+  if (!tier) tier = cheapestPurchasableTier(event);
+  if (!tier) {
+    return { error: 'sold_out', reason: 'event_sold_out', remaining: 0, nextTier: null };
+  }
+  return { tier, unit: parsePrice(tier.priceEUR) };
+}
+
+/**
+ * Paso 2 de 2: reserva qty unidades de la tanda elegida (atómico).
+ * Va separado del paso 1 para que cada ruta reserve DESPUÉS de sus
+ * validaciones (precio, club/Stripe) y ningún return temprano deje una
+ * reserva sin orden que la libere.
+ * Devuelve { ok: true, release } o { ok: false, reason, remaining, nextTier, event }.
+ */
+async function reserveResolvedTier(event, tier, qty) {
+  const r = await reserveTierStock(event._id, tier.tierId, qty);
+  if (!r.ok) {
+    const fresh = await Event.findById(event._id).lean();
+    return {
+      ok: false,
+      reason: r.reason,
+      remaining: r.remaining,
+      nextTier: nextTierOf(fresh || event, tier),
+      event: fresh || event,
+    };
+  }
+  return { ok: true, release: () => releaseTierStock(event._id, tier.tierId, qty) };
+}
+
+/** Campos de la orden cuando se vende por tanda. */
+function tierOrderFields(tier, unitCents, qty, fallbackName) {
+  return {
+    tierId: tier.tierId,
+    tierName: tier.name,
+    items: [
+      {
+        ticketTypeId: tier.tierId,
+        name: tier.name || fallbackName || 'Entrada',
+        unitAmount: unitCents,
+        qty,
+        currency: 'eur',
+      },
+    ],
+  };
+}
+
+/** tierId/tierName para metadata de Stripe (valores string, cortos). */
+function tierStripeMeta(tier) {
+  return tier ? { tierId: tier.tierId, tierName: String(tier.name).slice(0, 100) } : {};
+}
+
+/** Nombre del producto en Stripe: "<título> · <tanda>", o el título a secas. */
+function stripeProductName(event, tier) {
+  const baseTitle = event.title || 'Entrada NightVibe';
+  return tier ? `${baseTitle} · ${tier.name}` : baseTitle;
+}
+
+/* ---------- Página "Entradas agotadas" para /direct (navegador) ---------- */
+
+function escapeHtml(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatEUR(n) {
+  try {
+    return new Intl.NumberFormat('es-ES', { style: 'currency', currency: 'EUR' }).format(n);
+  } catch (_) {
+    return `${Number(n).toFixed(2).replace('.', ',')} €`;
+  }
+}
+
+/**
+ * Tanda posterior comprable a la que enlazar desde la página de agotado:
+ * primero la siguiente del mismo nombre; si no hay, cualquier tanda
+ * comprable con orden posterior.
+ */
+function laterPurchasableTier(event, tier) {
+  if (!event || !tier) return null;
+  const sameName = nextTierOf(event, tier);
+  if (sameName) return sameName;
+  const later = availableTiers(event).find(
+    (t) => t.tierId !== tier.tierId && (t.order ?? 0) > (tier.order ?? 0)
+  );
+  return publicTier(later);
+}
+
+function sendSoldOutPage(res, { event, nextTier, query }) {
+  let linkHtml = '';
+  if (nextTier) {
+    // Conservamos qty y la atribución (ref/ch) del enlace original.
+    const params = new URLSearchParams();
+    params.set('tier', nextTier.tierId);
+    ['qty', 'q', 'ref', 'ch'].forEach((k) => {
+      if (typeof query[k] === 'string' && query[k]) params.set(k, query[k]);
+    });
+    const href = `/api/payments/direct/${encodeURIComponent(String(event._id))}?${params.toString()}`;
+    linkHtml = `<a href="${escapeHtml(href)}" style="display:inline-block;margin-top:24px;padding:14px 22px;border-radius:12px;background:#a855f7;color:#fff;text-decoration:none;font-weight:600">Quedan entradas a ${escapeHtml(formatEUR(nextTier.priceEUR))}</a>`;
+  }
+
+  const title = event && event.title
+    ? `<p style="margin:8px 0 0;color:#a1a1aa">${escapeHtml(event.title)}</p>`
+    : '';
+  const html = `<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Entradas agotadas · NightVibe</title></head>
+<body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0b0b10;color:#f4f4f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;text-align:center;padding:24px;box-sizing:border-box">
+<main style="max-width:420px">
+<h1 style="margin:0;font-size:28px">Entradas agotadas</h1>
+${title}
+${linkHtml}
+</main></body></html>`;
+
+  return res.status(409).type('html').send(html);
+}
+
 
   // GET /api/payments/direct/:eventId
 // Enlace estable que puedes compartir (no caduca).
@@ -103,13 +301,27 @@ router.get('/direct/:eventId', async (req, res) => {
         return res.status(400).send('La venta ya ha finalizado');
       }
   
+      // === Tandas: solo si el evento tiene ticketTiers activos ===
+      // (?tier=<tierId>). Enlace viejo o tanda agotada -> la más barata comprable.
+      // Sin tiers, tierSale es null y todo lo de abajo funciona como siempre.
+      let tierSale = null;
+      if (hasActiveTiers(event)) {
+        const tierParam = typeof req.query.tier === 'string' ? req.query.tier.trim() : '';
+        const sel = resolveTierForSale(event, tierParam, { fallbackToCheapest: true });
+        if (sel.error) {
+          return sendSoldOutPage(res, { event, nextTier: null, query: req.query });
+        }
+        tierSale = sel;
+      }
+
       // --- Precio: soporta decimales con punto o coma ("12,50", "12.50", etc.) ---
       const rawPrice =
         event.price !== undefined && event.price !== null && event.price !== ''
           ? event.price
           : event.priceEUR;
 
-      const unit = parsePrice(rawPrice);
+      // Con tanda, el precio sale del tier en Mongo (nunca de la query).
+      const unit = tierSale ? tierSale.unit : parsePrice(rawPrice);
 
       if (unit === null || !Number.isFinite(unit) || unit <= 0) {
         console.error('[direct] Precio inválido en /direct:', {
@@ -125,11 +337,6 @@ router.get('/direct/:eventId', async (req, res) => {
       let qty = Math.floor(Number(qtyParam || 1));
       if (!Number.isFinite(qty) || qty < 1) qty = 1;
       if (qty > 20) qty = 20;
-
-      const reserved = await reserveStock(event._id, qty);
-      if (!reserved) {
-        return res.status(409).send('Sin stock suficiente');
-      }
 
       // === Stripe Connect (robusto y retrocompatible) ===
       // IMPORTANTE: en algunos eventos `clubId` puede ser el USER (owner) y `club` puede ser el documento Club.
@@ -229,7 +436,30 @@ router.get('/direct/:eventId', async (req, res) => {
       });
   
       // Order "guest": sin userId ni email (Stripe nos dará el email)
-      const order = await Order.create({
+      // Reserva de stock: aquí, ya validados evento, precio, club y Stripe, y
+      // justo antes de crear la orden. Ningún return anterior puede dejar una
+      // reserva sin orden (que el sweep no sabría encontrar ni liberar).
+      let releaseTier = null;
+      if (tierSale) {
+        const r = await reserveResolvedTier(event, tierSale.tier, qty);
+        if (!r.ok) {
+          const nextTier =
+            r.reason === 'event_sold_out' ? null : laterPurchasableTier(r.event, tierSale.tier);
+          return sendSoldOutPage(res, { event, nextTier, query: req.query });
+        }
+        releaseTier = r.release;
+      } else {
+        const reserved = await reserveStock(event._id, qty);
+        if (!reserved) {
+          return sendSoldOutPage(res, { event, nextTier: null, query: req.query });
+        }
+      }
+      const releaseReservation = () => (releaseTier ? releaseTier() : releaseStock(event._id, qty));
+
+      // Si la orden no llega a crearse, la reserva tampoco puede quedarse.
+      let order;
+      try {
+        order = await Order.create({
         userId: null,
         eventId,
         clubId,
@@ -241,7 +471,12 @@ router.get('/direct/:eventId', async (req, res) => {
         reservedQty: qty,
         reservationActive: true,
         expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+        ...(tierSale ? tierOrderFields(tierSale.tier, toCents(unit), qty, event.title) : {}),
       });
+      } catch (orderErr) {
+        await releaseReservation();
+        throw orderErr;   // lo recoge el catch general (500), como antes
+      }
   
       // ==== Cartel / imagen del evento para Stripe Checkout ====
       // ==== Cartel / imagen del evento para Stripe Checkout ====
@@ -303,7 +538,7 @@ router.get('/direct/:eventId', async (req, res) => {
                 currency: 'eur',
                 unit_amount: toCents(unit),
                 product_data: {
-                  name: event.title || 'Entrada NightVibe',
+                  name: tierSale ? stripeProductName(event, tierSale.tier) : event.title || 'Entrada NightVibe',
                   description: productDescription,
                   // 👇 solo añadimos images si tenemos una URL válida
                   ...(eventImageUrl ? { images: [eventImageUrl] } : {}),
@@ -333,6 +568,7 @@ router.get('/direct/:eventId', async (req, res) => {
             ...(shareChannel ? { shareChannel } : {}),
             perTicketFeeCents: String(PLATFORM_FEE_CENTS),
             feeLineAdded: feeLineItem ? '1' : '0',
+            ...(tierSale ? tierStripeMeta(tierSale.tier) : {}),
           },
           allow_promotion_codes: true,
           expires_at: Math.floor(Date.now() / 1000) + 30 * 60,
@@ -344,7 +580,7 @@ router.get('/direct/:eventId', async (req, res) => {
           },
         });
       } catch (stripeErr) {
-        await releaseStock(event._id, qty);
+        await releaseReservation();   // una sola liberación
         order.reservationActive = false;
         order.status = 'failed';
         await order.save().catch(() => {});
@@ -383,12 +619,6 @@ router.get('/direct/:eventId', async (req, res) => {
 ================================================================== */
 const mongoose = require('mongoose');
 const { anyAuth: anyAuthMw } = require('../middlewares/authMiddleware');
-const {
-  availableTiers,
-  tierRemaining,
-  reserveTierStock,
-  releaseTierStock,
-} = require('../utils/stock');
 
 const MAX_QTY_APP = 10;
 
@@ -465,36 +695,6 @@ async function resolveStripeClub(event) {
   return { club, clubId };
 }
 
-/** Motivo por el que un tier concreto no se puede comprar ahora. */
-function tierUnavailableReason(tier, now = new Date()) {
-  if (!tier) return 'tier_not_found';
-  if (tier.active === false) return 'tier_inactive';
-  if (tier.salesStart && now < new Date(tier.salesStart)) return 'not_on_sale_yet';
-  if (tier.salesEnd && now > new Date(tier.salesEnd)) return 'sales_ended';
-  return 'tier_sold_out';
-}
-
-function publicTier(t) {
-  if (!t) return null;
-  const rem = tierRemaining(t);
-  return {
-    tierId: t.tierId,
-    name: t.name,
-    description: t.description || '',
-    priceEUR: t.priceEUR,
-    remaining: rem === Infinity ? null : rem,
-  };
-}
-
-/** Siguiente tanda comprable con el mismo nombre (orden posterior), o null. */
-function nextTierOf(event, tier) {
-  if (!event || !tier) return null;
-  const next = availableTiers(event).find(
-    (t) => t.tierId !== tier.tierId && t.name === tier.name && (t.order ?? 0) > (tier.order ?? 0)
-  );
-  return publicTier(next);
-}
-
 /** Añade status/sid a una URL (también deep links), respetando ? y #. */
 function withParams(url, params) {
   const [base, hash] = url.split('#');
@@ -565,36 +765,18 @@ router.post('/checkout', anyAuthMw, resolveAppUser, async (req, res) => {
     const { club, clubId } = resolved;
 
     // 5) Precio y tanda. ⚠️ El precio sale SIEMPRE de Mongo, nunca del body.
-    const hasTiers = (event.ticketTiers || []).some((t) => t.active !== false);
     let tier = null;
     let unit;
 
-    if (hasTiers) {
-      const purchasable = availableTiers(event);
-      if (requestedTierId) {
-        tier = event.ticketTiers.find((t) => t.tierId === requestedTierId) || null;
-        if (!tier || !purchasable.some((t) => t.tierId === tier.tierId)) {
-          return res.status(409).json({
-            error: 'tier_unavailable',
-            reason: tierUnavailableReason(tier, now),
-            nextTier: nextTierOf(event, tier),
-          });
-        }
-      } else {
-        tier = purchasable.reduce(
-          (best, t) => (!best || t.priceEUR < best.priceEUR ? t : best),
-          null
-        );
-        if (!tier) {
-          return res.status(409).json({
-            error: 'sold_out',
-            reason: 'event_sold_out',
-            remaining: 0,
-            nextTier: null,
-          });
-        }
+    if (hasActiveTiers(event)) {
+      // La app pide una tanda concreta: si no es comprable, se lo decimos (409).
+      const sel = resolveTierForSale(event, requestedTierId, { fallbackToCheapest: false });
+      if (sel.error) {
+        const { error, ...rest } = sel;
+        return res.status(409).json({ error, ...rest });
       }
-      unit = parsePrice(tier.priceEUR);
+      tier = sel.tier;
+      unit = sel.unit;
     } else {
       const rawPrice =
         event.price !== undefined && event.price !== null && event.price !== ''
@@ -616,17 +798,18 @@ router.post('/checkout', anyAuthMw, resolveAppUser, async (req, res) => {
     const tierName = tier ? tier.name : null;
 
     // 5b/6) Reserva de stock
+    let releaseTier = null;
     if (tier) {
-      const r = await reserveTierStock(event._id, tier.tierId, qty);
+      const r = await reserveResolvedTier(event, tier, qty);
       if (!r.ok) {
-        const fresh = await Event.findById(event._id).lean();
         return res.status(409).json({
           error: 'sold_out',
           reason: r.reason,
           remaining: r.remaining,
-          nextTier: nextTierOf(fresh || event, tier),
+          nextTier: r.nextTier,
         });
       }
+      releaseTier = r.release;
     } else {
       const ok = await reserveStock(event._id, qty);
       if (!ok) {
@@ -647,8 +830,7 @@ router.post('/checkout', anyAuthMw, resolveAppUser, async (req, res) => {
     }
 
     // A partir de aquí hay una reserva: cualquier fallo debe liberarla UNA vez.
-    const release = () =>
-      tier ? releaseTierStock(event._id, tier.tierId, qty) : releaseStock(event._id, qty);
+    const release = () => (releaseTier ? releaseTier() : releaseStock(event._id, qty));
 
     const ticketTheme = resolveTicketTheme({ event, club });
 
@@ -683,17 +865,21 @@ router.post('/checkout', anyAuthMw, resolveAppUser, async (req, res) => {
         qty,
         amountEUR: unit * qty,
         currency: 'eur',
-        tierId,
-        tierName: tierName || '',
-        items: [
-          {
-            ticketTypeId: tierId,
-            name: tierName || event.title || 'Entrada',
-            unitAmount: unitCents,
-            qty,
-            currency: 'eur',
-          },
-        ],
+        ...(tier
+          ? tierOrderFields(tier, unitCents, qty, event.title)
+          : {
+              tierId: null,
+              tierName: '',
+              items: [
+                {
+                  ticketTypeId: null,
+                  name: event.title || 'Entrada',
+                  unitAmount: unitCents,
+                  qty,
+                  currency: 'eur',
+                },
+              ],
+            }),
         status: 'pending',
         reservedQty: qty,
         reservationActive: true,
@@ -723,8 +909,7 @@ router.post('/checkout', anyAuthMw, resolveAppUser, async (req, res) => {
     const productDescription =
       descriptionParts.length > 0 ? descriptionParts.join(' • ') : 'Entrada para evento NightVibe';
 
-    const baseTitle = event.title || 'Entrada NightVibe';
-    const productName = tierName ? `${baseTitle} · ${tierName}` : baseTitle;
+    const productName = stripeProductName(event, tier);
 
     const returnUrl = returnUrlParsed.value;
     const successUrl = returnUrl
@@ -734,9 +919,7 @@ router.post('/checkout', anyAuthMw, resolveAppUser, async (req, res) => {
       ? withParams(returnUrl, `status=cancelled&eventId=${String(event._id)}`)
       : `${process.env.APP_BASE_URL}/event/${String(event._id)}?cancelled=1`;
 
-    const tierMeta = tierId
-      ? { tierId, tierName: String(tierName).slice(0, 100) }
-      : {};
+    const tierMeta = tierStripeMeta(tier);
 
     // 9) Sesión de Stripe (misma estructura que /direct)
     let session;
