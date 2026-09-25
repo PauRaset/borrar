@@ -375,4 +375,462 @@ router.get('/direct/:eventId', async (req, res) => {
     }
   });
 
+/* ==================================================================
+   POST /api/payments/checkout  — compra desde la app (autenticada)
+   Soporta tandas (ticketTiers). Responde JSON con la URL de Stripe.
+   /direct queda intacto: la lógica de club, comisión y sesión está
+   replicada aquí a propósito para no tocar el enlace web.
+================================================================== */
+const mongoose = require('mongoose');
+const { anyAuth: anyAuthMw } = require('../middlewares/authMiddleware');
+const {
+  availableTiers,
+  tierRemaining,
+  reserveTierStock,
+  releaseTierStock,
+} = require('../utils/stock');
+
+const MAX_QTY_APP = 10;
+
+// Deja req.user.id con el _id de Mongo, igual que ensureUserId de eventRoutes.js
+// (el anyAuth de authMiddleware deja el UID de Firebase en req.user.id).
+async function resolveAppUser(req, res, next) {
+  try {
+    let user = null;
+    if (req.firebaseUser && req.firebaseUser.uid) {
+      user = await User.findOrCreateFromFirebase({
+        uid: req.firebaseUser.uid,
+        phoneNumber: req.firebaseUser.phone_number || req.firebaseUser.phone || null,
+      });
+    } else if (req.user && req.user.id) {
+      user = await User.findById(req.user.id).select('_id email').lean();
+    }
+    if (!user) return res.status(401).json({ error: 'unauthorized', message: 'Usuario no autenticado' });
+
+    req.user = { id: String(user._id) };
+    req.appUserEmail = user.email || null;
+    return next();
+  } catch (err) {
+    console.error('[checkout] fallo resolviendo usuario:', err?.message || err);
+    return res.status(401).json({ error: 'unauthorized', message: 'No autorizado' });
+  }
+}
+
+/** Email utilizable para Stripe. Descarta los placeholder `<uid>@firebase.local`. */
+function usableEmail(email) {
+  if (typeof email !== 'string') return null;
+  const e = email.trim();
+  if (!e || /@firebase\.local$/i.test(e)) return null;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) ? e : null;
+}
+
+/** Mismo orden de resolución que /direct. Devuelve { club, clubId } o { error }. */
+async function resolveStripeClub(event) {
+  let club = null;
+  let clubId = null;
+
+  if (event.club) {
+    club = await Club.findById(event.club).lean();
+    if (club) clubId = club._id;
+  }
+  if (!club && event.clubId) {
+    club = await Club.findById(event.clubId).lean();
+    if (club) clubId = club._id;
+  }
+  if (!club) {
+    const ownerUserId = event.createdBy || event.clubId || event.organizerId || null;
+    if (!ownerUserId) return { error: 'El evento no tiene club asociado.' };
+    club = await Club.findOne({ ownerUserId }).lean();
+    if (club) clubId = club._id;
+  }
+  if (!club || !club.stripeAccountId) {
+    const ownerUserId = event.createdBy || event.clubId || event.organizerId || null;
+    if (ownerUserId) {
+      const user = await User.findById(ownerUserId).lean();
+      if (user && user.stripeAccountId) {
+        club = { _id: user._id, stripeAccountId: user.stripeAccountId };
+        clubId = user._id;
+      }
+    }
+  }
+  if (!club || !club.stripeAccountId) {
+    console.error('[checkout] No se pudo resolver stripeAccountId (LIVE):', {
+      eventId: String(event._id),
+      eventClub: event.club ? String(event.club) : null,
+      eventClubId: event.clubId ? String(event.clubId) : null,
+      eventCreatedBy: event.createdBy ? String(event.createdBy) : null,
+    });
+    return { error: 'El club no tiene cuenta conectada en Stripe (LIVE).' };
+  }
+  return { club, clubId };
+}
+
+/** Motivo por el que un tier concreto no se puede comprar ahora. */
+function tierUnavailableReason(tier, now = new Date()) {
+  if (!tier) return 'tier_not_found';
+  if (tier.active === false) return 'tier_inactive';
+  if (tier.salesStart && now < new Date(tier.salesStart)) return 'not_on_sale_yet';
+  if (tier.salesEnd && now > new Date(tier.salesEnd)) return 'sales_ended';
+  return 'tier_sold_out';
+}
+
+function publicTier(t) {
+  if (!t) return null;
+  const rem = tierRemaining(t);
+  return {
+    tierId: t.tierId,
+    name: t.name,
+    description: t.description || '',
+    priceEUR: t.priceEUR,
+    remaining: rem === Infinity ? null : rem,
+  };
+}
+
+/** Siguiente tanda comprable con el mismo nombre (orden posterior), o null. */
+function nextTierOf(event, tier) {
+  if (!event || !tier) return null;
+  const next = availableTiers(event).find(
+    (t) => t.tierId !== tier.tierId && t.name === tier.name && (t.order ?? 0) > (tier.order ?? 0)
+  );
+  return publicTier(next);
+}
+
+/** Añade status/sid a una URL (también deep links), respetando ? y #. */
+function withParams(url, params) {
+  const [base, hash] = url.split('#');
+  const sep = base.includes('?') ? '&' : '?';
+  return `${base}${sep}${params}${hash !== undefined ? `#${hash}` : ''}`;
+}
+
+function parseReturnUrl(raw) {
+  if (raw === undefined || raw === null || raw === '') return { value: null };
+  if (typeof raw !== 'string' || raw.length > 2000) return { error: 'returnUrl inválida' };
+  try {
+    const u = new URL(raw);
+    if (['javascript:', 'data:', 'file:', 'vbscript:'].includes(u.protocol)) {
+      return { error: 'returnUrl inválida' };
+    }
+    return { value: raw };
+  } catch (_) {
+    return { error: 'returnUrl inválida' };
+  }
+}
+
+router.post('/checkout', anyAuthMw, resolveAppUser, async (req, res) => {
+  // 1) Limpieza perezosa de reservas caducadas (no bloqueante)
+  sweepExpiredReservations().catch(() => {});
+
+  try {
+    const body = req.body || {};
+    const eventId = typeof body.eventId === 'string' ? body.eventId.trim() : '';
+    if (!mongoose.isValidObjectId(eventId)) {
+      return res.status(400).json({ error: 'invalid_event', message: 'eventId inválido' });
+    }
+
+    const qty = body.qty === undefined || body.qty === null || body.qty === '' ? 1 : Number(body.qty);
+    if (!Number.isInteger(qty) || qty < 1 || qty > MAX_QTY_APP) {
+      return res.status(400).json({
+        error: 'invalid_qty',
+        message: `La cantidad debe ser un entero entre 1 y ${MAX_QTY_APP}`,
+      });
+    }
+
+    const returnUrlParsed = parseReturnUrl(body.returnUrl);
+    if (returnUrlParsed.error) {
+      return res.status(400).json({ error: 'invalid_return_url', message: returnUrlParsed.error });
+    }
+    const requestedTierId = typeof body.tierId === 'string' ? body.tierId.trim() : '';
+
+    // 2) Evento
+    const event = await Event.findById(eventId).lean();
+    if (!event) return res.status(404).json({ error: 'event_not_found', message: 'Evento no encontrado' });
+
+    // 3) Publicado y a la venta: mismo criterio que /direct
+    const now = new Date();
+    if (event.isPublished === false) {
+      return res.status(400).json({ error: 'not_published', message: 'Evento no publicado' });
+    }
+    if (event.salesStart && now < new Date(event.salesStart)) {
+      return res.status(400).json({ error: 'sales_not_started', message: 'La venta todavía no ha empezado' });
+    }
+    if (event.salesEnd && now > new Date(event.salesEnd)) {
+      return res.status(400).json({ error: 'sales_ended', message: 'La venta ya ha finalizado' });
+    }
+
+    // 4) Club y cuenta de Stripe (igual que /direct)
+    const resolved = await resolveStripeClub(event);
+    if (resolved.error) {
+      return res.status(400).json({ error: 'club_not_ready', message: resolved.error });
+    }
+    const { club, clubId } = resolved;
+
+    // 5) Precio y tanda. ⚠️ El precio sale SIEMPRE de Mongo, nunca del body.
+    const hasTiers = (event.ticketTiers || []).some((t) => t.active !== false);
+    let tier = null;
+    let unit;
+
+    if (hasTiers) {
+      const purchasable = availableTiers(event);
+      if (requestedTierId) {
+        tier = event.ticketTiers.find((t) => t.tierId === requestedTierId) || null;
+        if (!tier || !purchasable.some((t) => t.tierId === tier.tierId)) {
+          return res.status(409).json({
+            error: 'tier_unavailable',
+            reason: tierUnavailableReason(tier, now),
+            nextTier: nextTierOf(event, tier),
+          });
+        }
+      } else {
+        tier = purchasable.reduce(
+          (best, t) => (!best || t.priceEUR < best.priceEUR ? t : best),
+          null
+        );
+        if (!tier) {
+          return res.status(409).json({
+            error: 'sold_out',
+            reason: 'event_sold_out',
+            remaining: 0,
+            nextTier: null,
+          });
+        }
+      }
+      unit = parsePrice(tier.priceEUR);
+    } else {
+      const rawPrice =
+        event.price !== undefined && event.price !== null && event.price !== ''
+          ? event.price
+          : event.priceEUR;
+      unit = parsePrice(rawPrice);
+    }
+
+    // Misma regla de precio que /direct
+    if (unit === null || !Number.isFinite(unit) || unit <= 0) {
+      console.error('[checkout] Precio inválido:', {
+        eventId: String(event._id),
+        tierId: tier ? tier.tierId : null,
+      });
+      return res.status(400).json({ error: 'invalid_price', message: 'Precio inválido' });
+    }
+
+    const tierId = tier ? tier.tierId : null;
+    const tierName = tier ? tier.name : null;
+
+    // 5b/6) Reserva de stock
+    if (tier) {
+      const r = await reserveTierStock(event._id, tier.tierId, qty);
+      if (!r.ok) {
+        const fresh = await Event.findById(event._id).lean();
+        return res.status(409).json({
+          error: 'sold_out',
+          reason: r.reason,
+          remaining: r.remaining,
+          nextTier: nextTierOf(fresh || event, tier),
+        });
+      }
+    } else {
+      const ok = await reserveStock(event._id, qty);
+      if (!ok) {
+        const fresh = await Event.findById(event._id)
+          .select('capacity ticketsSold ticketsReserved')
+          .lean();
+        const remaining =
+          fresh && fresh.capacity > 0
+            ? Math.max(0, fresh.capacity - (fresh.ticketsSold || 0) - (fresh.ticketsReserved || 0))
+            : 0;
+        return res.status(409).json({
+          error: 'sold_out',
+          reason: 'event_sold_out',
+          remaining,
+          nextTier: null,
+        });
+      }
+    }
+
+    // A partir de aquí hay una reserva: cualquier fallo debe liberarla UNA vez.
+    const release = () =>
+      tier ? releaseTierStock(event._id, tier.tierId, qty) : releaseStock(event._id, qty);
+
+    const ticketTheme = resolveTicketTheme({ event, club });
+
+    // Comisión: idéntica a /direct
+    const platformFeeEUR =
+      parsePrice(event.platformFeeEUR) !== null ? parsePrice(event.platformFeeEUR) : 1.5;
+    const PLATFORM_FEE_CENTS = Math.max(0, Math.round(platformFeeEUR * 100));
+    const applicationFee = PLATFORM_FEE_CENTS * qty;
+    const feeLineItem =
+      PLATFORM_FEE_CENTS > 0
+        ? {
+            price_data: {
+              currency: 'eur',
+              unit_amount: PLATFORM_FEE_CENTS,
+              product_data: { name: 'Gastos de gestión · NightVibe' },
+            },
+            quantity: qty,
+          }
+        : null;
+
+    const unitCents = toCents(unit);
+    const email = usableEmail(req.appUserEmail);
+
+    // 8) Orden
+    let order;
+    try {
+      order = await Order.create({
+        userId: req.user.id,
+        email,
+        eventId: String(event._id),
+        clubId,
+        qty,
+        amountEUR: unit * qty,
+        currency: 'eur',
+        tierId,
+        tierName: tierName || '',
+        items: [
+          {
+            ticketTypeId: tierId,
+            name: tierName || event.title || 'Entrada',
+            unitAmount: unitCents,
+            qty,
+            currency: 'eur',
+          },
+        ],
+        status: 'pending',
+        reservedQty: qty,
+        reservationActive: true,
+        expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+      });
+    } catch (orderErr) {
+      await release();
+      throw orderErr;
+    }
+
+    // Imagen y descripción: igual que /direct
+    const buildAbsoluteImageUrl = (relativePath) => {
+      if (!relativePath) return null;
+      if (/^https?:\/\//.test(relativePath)) return relativePath;
+      const cleanPath = relativePath.startsWith('/') ? relativePath : `/${relativePath}`;
+      const base = process.env.PUBLIC_UPLOADS_BASE_URL || `${req.protocol}://${req.get('host')}`;
+      return `${base}${cleanPath}`;
+    };
+    let eventImageUrl = event.image ? buildAbsoluteImageUrl(event.image) : null;
+    if (!eventImageUrl && Array.isArray(event.photos) && event.photos.length > 0 && event.photos[0]) {
+      eventImageUrl = buildAbsoluteImageUrl(event.photos[0]);
+    }
+
+    const descriptionParts = [];
+    if (event.city) descriptionParts.push(event.city);
+    if (event.date) descriptionParts.push(new Date(event.date).toLocaleDateString('es-ES'));
+    const productDescription =
+      descriptionParts.length > 0 ? descriptionParts.join(' • ') : 'Entrada para evento NightVibe';
+
+    const baseTitle = event.title || 'Entrada NightVibe';
+    const productName = tierName ? `${baseTitle} · ${tierName}` : baseTitle;
+
+    const returnUrl = returnUrlParsed.value;
+    const successUrl = returnUrl
+      ? withParams(returnUrl, 'status=success&sid={CHECKOUT_SESSION_ID}')
+      : `${process.env.APP_BASE_URL}/purchase/success?sid={CHECKOUT_SESSION_ID}`;
+    const cancelUrl = returnUrl
+      ? withParams(returnUrl, `status=cancelled&eventId=${String(event._id)}`)
+      : `${process.env.APP_BASE_URL}/event/${String(event._id)}?cancelled=1`;
+
+    const tierMeta = tierId
+      ? { tierId, tierName: String(tierName).slice(0, 100) }
+      : {};
+
+    // 9) Sesión de Stripe (misma estructura que /direct)
+    let session;
+    try {
+      session = await stripe.checkout.sessions.create({
+        mode: 'payment',
+        locale: 'es',
+        line_items: [
+          {
+            price_data: {
+              currency: 'eur',
+              unit_amount: unitCents,
+              product_data: {
+                name: productName,
+                description: productDescription,
+                ...(eventImageUrl ? { images: [eventImageUrl] } : {}),
+                metadata: {
+                  eventId: String(event._id),
+                  ticketTheme,
+                  ...tierMeta,
+                },
+              },
+            },
+            quantity: qty,
+          },
+          ...(feeLineItem ? [feeLineItem] : []),
+        ],
+        success_url: successUrl,
+        cancel_url: cancelUrl,
+        ...(email ? { customer_email: email } : {}),
+        metadata: {
+          eventId: String(event._id),
+          orderId: String(order._id),
+          userId: String(req.user.id),
+          clubId: String(clubId),
+          ticketTheme,
+          ...tierMeta,
+          perTicketFeeCents: String(PLATFORM_FEE_CENTS),
+          feeLineAdded: feeLineItem ? '1' : '0',
+        },
+        allow_promotion_codes: true,
+        expires_at: Math.floor(Date.now() / 1000) + 30 * 60,
+        automatic_tax: { enabled: false },
+        payment_intent_data: {
+          application_fee_amount: applicationFee,
+          transfer_data: { destination: club.stripeAccountId },
+          on_behalf_of: club.stripeAccountId,
+        },
+      });
+    } catch (stripeErr) {
+      // 10) Una sola liberación
+      await release();
+      order.reservationActive = false;
+      order.status = 'failed';
+      await order.save().catch(() => {});
+      console.error('[checkout] error Stripe:', stripeErr?.raw || stripeErr);
+      return res.status(500).json({
+        error: 'stripe_error',
+        message: stripeErr?.raw?.message || 'No se pudo iniciar el pago',
+      });
+    }
+
+    order.stripeSessionId = session.id;
+    order.sessionMetadata = { ...(session.metadata || {}) };
+    await order.save();
+
+    console.log('◆ [checkout] Created Checkout Session:', {
+      orderId: String(order._id),
+      sessionId: session.id,
+      tierId,
+      qty,
+    });
+
+    // 11) Respuesta JSON para la app
+    const subtotalCents = unitCents * qty;
+    const feeCents = feeLineItem ? PLATFORM_FEE_CENTS * qty : 0;
+    return res.json({
+      ok: true,
+      url: session.url,
+      sessionId: session.id,
+      orderId: String(order._id),
+      tier: { tierId, name: tierName, priceEUR: unit },
+      qty,
+      subtotalEUR: subtotalCents / 100,
+      feeEUR: feeCents / 100,
+      totalEUR: (subtotalCents + feeCents) / 100,
+    });
+  } catch (err) {
+    console.error('[checkout] error:', err?.raw || err);
+    return res.status(500).json({
+      error: 'checkout_error',
+      message: err?.raw?.message || 'No se pudo iniciar el pago',
+    });
+  }
+});
+
 module.exports = router;
