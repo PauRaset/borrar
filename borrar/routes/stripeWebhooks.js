@@ -207,10 +207,24 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
       }
 
       // --- Actualizar contador ticketsSold ---
-      const { commitStock } = require('../utils/stock');
+      const {
+        commitStock,
+        commitTierStock,
+        addTierSoldWithoutReservation,
+      } = require('../utils/stock');
       if (order.reservationActive) {
-        await commitStock(eventId, usedQty);   // suma venta y libera reserva
+        if (order.tierId) {
+          await commitTierStock(eventId, order.tierId, usedQty);   // tier: sold+, reserved-
+        } else {
+          await commitStock(eventId, usedQty);   // suma venta y libera reserva
+        }
         order.reservationActive = false;
+        // Persistimos ya: si la emisión falla y Stripe reintenta, no volvemos a sumar.
+        await order.save();
+      } else if (order.tierId) {
+        // Orden de tanda cuya reserva ya se liberó (caducó justo antes del pago):
+        // la venta cuenta igualmente en la tanda.
+        await addTierSoldWithoutReservation(eventId, order.tierId, usedQty);
       } else {
         // Orden sin reserva (compras antiguas o creadas al vuelo)
         await Event2.updateOne({ _id: eventId }, { $inc: { ticketsSold: usedQty } });
@@ -236,6 +250,7 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
           orderId: order._id,
           ownerUserId: userId,
           email: order.email || stripeEmail,
+          ticketTypeId: order.tierId || null,
           serial,
           tokenHash,
           status: 'issued',
@@ -322,13 +337,18 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
 
     if (event.type === 'checkout.session.expired') {
       const session = event.data.object;
-      const order = await Order2.findOne({ stripeSessionId: session.id });
-      if (order && order.reservationActive) {
-        const { releaseStock } = require('../utils/stock');
-        await releaseStock(order.eventId, order.reservedQty || 0);
-        order.reservationActive = false;
-        order.status = 'expired';
-        await order.save();
+      // Reclamación atómica: si el sweep ya la liberó, no liberamos dos veces.
+      const order = await Order2.findOneAndUpdate(
+        { stripeSessionId: session.id, reservationActive: true },
+        { $set: { reservationActive: false, status: 'expired' } }
+      );
+      if (order) {
+        const { releaseStock, releaseTierStock } = require('../utils/stock');
+        if (order.tierId) {
+          await releaseTierStock(order.eventId, order.tierId, order.reservedQty || 0);
+        } else {
+          await releaseStock(order.eventId, order.reservedQty || 0);
+        }
         console.log('[stripe webhook] reserva liberada por expiración:', String(order._id));
       }
     }
